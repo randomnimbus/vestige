@@ -42,6 +42,13 @@ nomic-v2 = ["embeddings", "fastembed/nomic-v2-moe"]
 # Qwen3 Reranker (Candle backend, high-precision cross-encoder)
 qwen3-reranker = ["embeddings", "fastembed/qwen3"]
 
+# Qwen3 Embedding 0.6B (Candle backend, 1024d, 32K context, +8.8 MTEB retrieval pts vs nomic v1.5)
+# Uses fastembed's standalone Qwen3TextEmbedding (parallel to the ONNX TextEmbedding enum path).
+# Query/document asymmetry: queries MUST use the instruct prefix via qwen3_format_query().
+# Enable with `--features qwen3-embed` (+ `metal` for Apple Silicon GPU acceleration).
+# Requires candle-core as a direct dep so we can name `Device` and `DType` at the call site.
+qwen3-embed = ["embeddings", "fastembed/qwen3", "dep:candle-core"]
+
 # Metal GPU acceleration on Apple Silicon (significantly faster inference)
 metal = ["fastembed/metal"]
 
@@ -86,6 +93,17 @@ notify = "8"
 # nomic-embed-text-v1.5: 768 dimensions, 8192 token context, Matryoshka support
 # v5.11: Adds Nomic v2 MoE (nomic-v2-moe feature) + Qwen3 reranker (qwen3 feature)
 fastembed = { version = "5.11", default-features = false, features = ["hf-hub-native-tls", "image-models"], optional = true }
+
+# candle-core is already pulled in transitively by fastembed's `qwen3` feature,
+# but it is NOT re-exported, so we declare it as a direct optional dep so the
+# Qwen3 backend can name `candle_core::Device` and `candle_core::DType` when
+# calling `Qwen3TextEmbedding::from_hf(...)`.
+#
+# Version tightened to `=0.10.2` (not `^0.10`) so a compromised crates.io push
+# of 0.10.3 can't sneak into a `cargo update`. Cargo.lock pins the exact hash
+# for reproducible builds regardless, but the direct-dep specifier is the
+# secondary defence. Bump in lockstep with fastembed whenever it moves.
+candle-core = { version = "=0.10.2", default-features = false, optional = true }
 
 # ============================================================================
 # OPTIONAL: Vector Search (USearch - HNSW, 20x faster than FAISS)

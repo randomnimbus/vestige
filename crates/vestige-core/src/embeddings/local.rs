@@ -1,12 +1,22 @@
 //! Local Semantic Embeddings
 //!
-//! Uses fastembed v5.11 for local inference.
+//! Uses fastembed v5.13 for local inference.
 //!
 //! ## Models
 //!
-//! - **Default**: Nomic Embed Text v1.5 (ONNX, 768d → 256d Matryoshka, 8192 context)
-//! - **Optional**: Nomic Embed Text v2 MoE (Candle, 475M params, 305M active, 8 experts)
-//!   Enable with `nomic-v2` feature flag + `metal` for Apple Silicon acceleration.
+//! - **Default (nomic)**: Nomic Embed Text v1.5 (ONNX via `TextEmbedding`, 768d → 256d
+//!   Matryoshka, 8192 token context). Single binary, no GPU required.
+//! - **Optional (qwen3)**: Qwen3 Embedding 0.6B (Candle via `Qwen3TextEmbedding`, 1024d,
+//!   32K token context). Enable with `qwen3-embed` feature flag; combine with `metal`
+//!   for Apple Silicon GPU acceleration. Asymmetric: queries MUST use the Instruct
+//!   prefix via [`qwen3_format_query`], documents get no prefix.
+//!
+//! ## Dual-backend architecture
+//!
+//! The `Backend` enum routes to either fastembed's ONNX `TextEmbedding` path
+//! (nomic, default) or the standalone Candle `Qwen3TextEmbedding` path
+//! (Qwen3, feature-gated). Both are held behind the same global `OnceLock<Mutex<...>>`
+//! so the rest of Vestige calls `EmbeddingService::embed()` unchanged.
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use std::sync::{Mutex, OnceLock};
@@ -15,23 +25,166 @@ use std::sync::{Mutex, OnceLock};
 // CONSTANTS
 // ============================================================================
 
-/// Embedding dimensions after Matryoshka truncation
+/// Nomic Embed Text v1.5 output dimensions after Matryoshka truncation.
 /// Truncated from 768 → 256 for 3x storage savings with only ~2% quality loss
-/// (Matryoshka Representation Learning — the first N dims ARE the N-dim representation)
-pub const EMBEDDING_DIMENSIONS: usize = 256;
+/// (Matryoshka Representation Learning — the first N dims ARE the N-dim representation).
+pub const NOMIC_EMBEDDING_DIMENSIONS: usize = 256;
 
-/// Maximum text length for embedding (truncated if longer)
-pub const MAX_TEXT_LENGTH: usize = 8192;
+/// Qwen3-Embedding-0.6B native output dimensions.
+/// Supports Matryoshka truncation to 32-1024; we keep the full 1024 by default
+/// so the ~+8-9 point MTEB retrieval lift over the nomic baseline isn't eroded
+/// by truncation (Qwen3-Embedding-0.6B scores 61.83 on MTEB-Eng-v2 retrieval
+/// per its HF model card; nomic-v1.5 is around 52-53 on the comparable bench —
+/// cross-version so delta is ballpark, not precision).
+/// Index storage cost at int8 = 1 KB/vec vs nomic's 256 B/vec (4x).
+pub const QWEN3_EMBEDDING_DIMENSIONS: usize = 1024;
+
+/// Back-compat alias: default embedding dimensions used by downstream code that
+/// predates the dual-backend split. Always returns the active backend's native
+/// dimension count. Callers that need a specific backend's dim should use the
+/// explicit constants above.
+pub const EMBEDDING_DIMENSIONS: usize = {
+    #[cfg(feature = "qwen3-embed")]
+    {
+        QWEN3_EMBEDDING_DIMENSIONS
+    }
+    #[cfg(not(feature = "qwen3-embed"))]
+    {
+        NOMIC_EMBEDDING_DIMENSIONS
+    }
+};
+
+/// Maximum text length for embedding (truncated if longer).
+/// Nomic caps at 8K; Qwen3 allows 32K. Use the active backend's limit.
+pub const MAX_TEXT_LENGTH: usize = {
+    #[cfg(feature = "qwen3-embed")]
+    {
+        32_768
+    }
+    #[cfg(not(feature = "qwen3-embed"))]
+    {
+        8192
+    }
+};
 
 /// Batch size for efficient embedding generation
 pub const BATCH_SIZE: usize = 32;
 
+/// Qwen3 instruct prefix template for retrieval queries.
+/// Qwen3-Embedding is asymmetric: queries get the instruct-wrapped format,
+/// documents are embedded raw. Missing this drops retrieval NDCG by ~3 points
+/// per the Qwen3 model card.
+pub const QWEN3_QUERY_INSTRUCTION: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
+
+/// Format a query string with the Qwen3 instruct prefix. No-op under the nomic
+/// backend (nomic is symmetric — query and document embeddings share an embedding
+/// function). Call this on QUERY text at search time, never on document text
+/// at ingest time.
+///
+/// The exact template (no space after `Query:`) matches the canonical
+/// `get_detailed_instruct` function in the Qwen3-Embedding-0.6B model card —
+/// the TEI docs happen to include a space but the Python reference function
+/// does not, so we match the Python reference.
+#[inline]
+pub fn qwen3_format_query(query: &str) -> String {
+    #[cfg(feature = "qwen3-embed")]
+    {
+        format!(
+            "Instruct: {instruction}\nQuery:{query}",
+            instruction = QWEN3_QUERY_INSTRUCTION,
+            query = query,
+        )
+    }
+    #[cfg(not(feature = "qwen3-embed"))]
+    {
+        query.to_string()
+    }
+}
+
 // ============================================================================
-// GLOBAL MODEL (with Mutex for fastembed v5 API)
+// BACKEND ENUM
 // ============================================================================
 
-/// Result type for model initialization
-static EMBEDDING_MODEL_RESULT: OnceLock<Result<Mutex<TextEmbedding>, String>> = OnceLock::new();
+/// Internal embedding backend. Held inside a `Mutex` to serialise access
+/// across callers — the Nomic ONNX path needs `&mut self` for `embed`, and
+/// the Qwen3 Candle path takes `&self` but the `Mutex` still keeps the API
+/// uniform and gives us a single mutation-safe story under both cfgs without
+/// a `Backend`-specific lock type.
+///
+/// The enum is private — callers go through `EmbeddingService` which hides
+/// the branch. This lets us add new backends (e.g. ONNX Qwen3 for lower memory,
+/// binary-quantized variants) without breaking downstream code.
+enum Backend {
+    /// fastembed ONNX path — Nomic Embed Text v1.5 (768d → 256d Matryoshka).
+    ///
+    /// This variant is constructed only under the default (non-Qwen3) build.
+    /// When `qwen3-embed` is enabled `init_backend` selects [`Self::Qwen3`]
+    /// exclusively, so the Nomic variant is dead code under that cfg. The
+    /// match arms on this enum still handle both variants so the codebase
+    /// can be audited feature-agnostically without `#[cfg]` noise.
+    #[cfg_attr(feature = "qwen3-embed", allow(dead_code))]
+    Nomic(TextEmbedding),
+    /// fastembed Candle path — Qwen3-Embedding-0.6B (1024d, 32K context).
+    #[cfg(feature = "qwen3-embed")]
+    Qwen3(fastembed::Qwen3TextEmbedding),
+}
+
+impl Backend {
+    /// Embed a batch of texts. The Nomic path truncates to Matryoshka dims
+    /// internally; the Qwen3 path returns full-dim L2-normalized vectors.
+    fn embed_batch(&mut self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        match self {
+            Self::Nomic(model) => model
+                .embed(texts, None)
+                .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string())),
+            #[cfg(feature = "qwen3-embed")]
+            Self::Qwen3(model) => model
+                .embed(&texts)
+                .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string())),
+        }
+    }
+
+    /// Post-process a raw embedding before handing it back to callers.
+    /// Nomic: Matryoshka-truncate to 256d + L2-normalize.
+    /// Qwen3: pass through (already last-token pooled and L2-normalized by the model).
+    #[inline]
+    fn post_process(&self, raw: Vec<f32>) -> Vec<f32> {
+        match self {
+            Self::Nomic(_) => matryoshka_truncate(raw),
+            #[cfg(feature = "qwen3-embed")]
+            Self::Qwen3(_) => raw,
+        }
+    }
+
+    /// HuggingFace repo ID for this backend's model. Written to the
+    /// `embedding_model` column on every knowledge-node row so dual-index
+    /// search can route queries to the matching USearch index at retrieval time.
+    fn model_name(&self) -> &'static str {
+        match self {
+            Self::Nomic(_) => "nomic-ai/nomic-embed-text-v1.5",
+            #[cfg(feature = "qwen3-embed")]
+            Self::Qwen3(_) => "Qwen/Qwen3-Embedding-0.6B",
+        }
+    }
+
+    /// Output vector dimensions after post-processing.
+    fn dimensions(&self) -> usize {
+        match self {
+            Self::Nomic(_) => NOMIC_EMBEDDING_DIMENSIONS,
+            #[cfg(feature = "qwen3-embed")]
+            Self::Qwen3(_) => QWEN3_EMBEDDING_DIMENSIONS,
+        }
+    }
+}
+
+// ============================================================================
+// GLOBAL MODEL (with Mutex for fastembed's &mut self API)
+// ============================================================================
+
+/// Global backend, initialised on first use. Held as a `Mutex` because both
+/// underlying embedding models require exclusive access for `embed()`.
+static EMBEDDING_BACKEND: OnceLock<Result<Mutex<Backend>, String>> = OnceLock::new();
 
 /// Get the default cache directory for fastembed models.
 ///
@@ -65,37 +218,93 @@ pub(crate) fn get_cache_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(".fastembed_cache")
 }
 
-/// Initialize the global embedding model
-/// Using nomic-embed-text-v1.5 (768d) - 8192 token context, Matryoshka support
-fn get_model() -> Result<std::sync::MutexGuard<'static, TextEmbedding>, EmbeddingError> {
-    let result = EMBEDDING_MODEL_RESULT.get_or_init(|| {
-        // Get cache directory (respects FASTEMBED_CACHE_PATH env var)
-        let cache_dir = get_cache_dir();
+/// Initialise the Nomic ONNX backend. Downloads the model on first use.
+///
+/// Called by [`init_backend`] only when `qwen3-embed` is NOT enabled.
+/// Kept compiled under both cfgs so that a future runtime-selectable backend
+/// can reuse it without a cross-feature refactor; silenced as dead code when
+/// the Qwen3 feature is on.
+#[cfg_attr(feature = "qwen3-embed", allow(dead_code))]
+fn init_nomic(cache_dir: std::path::PathBuf) -> Result<Backend, String> {
+    // nomic-embed-text-v1.5: 768 dimensions, 8192 token context, Matryoshka
+    let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15)
+        .with_show_download_progress(true)
+        .with_cache_dir(cache_dir);
 
-        // Create cache directory if it doesn't exist
-        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-            tracing::warn!("Failed to create cache directory {:?}: {}", cache_dir, e);
-        }
+    TextEmbedding::try_new(options).map(Backend::Nomic).map_err(|e| {
+        format!(
+            "Failed to initialize nomic-embed-text-v1.5 embedding model: {}. \
+             Ensure ONNX runtime is available and model files can be downloaded.",
+            e
+        )
+    })
+}
 
-        // nomic-embed-text-v1.5: 768 dimensions, 8192 token context
-        // Matryoshka representation learning, fully open source
-        let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15)
-            .with_show_download_progress(true)
-            .with_cache_dir(cache_dir);
-
-        TextEmbedding::try_new(options)
-            .map(Mutex::new)
-            .map_err(|e| {
-                format!(
-                    "Failed to initialize nomic-embed-text-v1.5 embedding model: {}. \
-                    Ensure ONNX runtime is available and model files can be downloaded.",
-                    e
-                )
-            })
+/// Initialise the Qwen3 Candle backend. Downloads ~1.2 GB model weights on first
+/// use (same cache dir as the ONNX path). Uses Metal GPU on Apple Silicon when
+/// `metal` feature is on; CPU otherwise. CUDA auto-selection is a Day-3+ follow
+/// (candle-core 0.10 exposes `Device::new_cuda(0)` but we ship the CPU fallback
+/// first to keep Linux users working out of the box).
+#[cfg(feature = "qwen3-embed")]
+fn init_qwen3(_cache_dir: std::path::PathBuf) -> Result<Backend, String> {
+    // Device selection is caller-side in candle-core 0.10: fastembed does NOT
+    // auto-select from its own `metal` / `cuda` feature. We gate on vestige-core's
+    // `metal` feature and fall back to CPU if Metal init fails (e.g. x86 macOS
+    // or a broken Apple Silicon Metal stack) so the feature flag is always safe
+    // to combine with qwen3-embed.
+    #[cfg(feature = "metal")]
+    let device = candle_core::Device::new_metal(0).unwrap_or_else(|e| {
+        tracing::warn!("Metal device init failed ({}); falling back to CPU", e);
+        candle_core::Device::Cpu
     });
+    #[cfg(not(feature = "metal"))]
+    let device = candle_core::Device::Cpu;
+
+    let dtype = candle_core::DType::F32;
+
+    fastembed::Qwen3TextEmbedding::from_hf(
+        "Qwen/Qwen3-Embedding-0.6B",
+        &device,
+        dtype,
+        MAX_TEXT_LENGTH,
+    )
+    .map(Backend::Qwen3)
+    .map_err(|e| {
+        format!(
+            "Failed to initialize Qwen3-Embedding-0.6B: {}. \
+             First-run requires ~1.2 GB download to ~/.cache/vestige/fastembed; \
+             subsequent runs load from cache.",
+            e
+        )
+    })
+}
+
+/// Initialise the active backend based on compiled features. Qwen3 wins when
+/// both features are enabled (it's strictly newer and more capable).
+fn init_backend() -> Result<Backend, String> {
+    let cache_dir = get_cache_dir();
+
+    // Create cache directory if it doesn't exist
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        tracing::warn!("Failed to create cache directory {:?}: {}", cache_dir, e);
+    }
+
+    #[cfg(feature = "qwen3-embed")]
+    {
+        init_qwen3(cache_dir)
+    }
+    #[cfg(not(feature = "qwen3-embed"))]
+    {
+        init_nomic(cache_dir)
+    }
+}
+
+/// Lock and return the global embedding backend. Initialises on first call.
+fn get_backend() -> Result<std::sync::MutexGuard<'static, Backend>, EmbeddingError> {
+    let result = EMBEDDING_BACKEND.get_or_init(|| init_backend().map(Mutex::new));
 
     match result {
-        Ok(model) => model
+        Ok(backend) => backend
             .lock()
             .map_err(|e| EmbeddingError::ModelInit(format!("Lock poisoned: {}", e))),
         Err(err) => Err(EmbeddingError::ModelInit(err.clone())),
@@ -223,7 +432,7 @@ impl EmbeddingService {
 
     /// Check if the model is ready
     pub fn is_ready(&self) -> bool {
-        match get_model() {
+        match get_backend() {
             Ok(_) => true,
             Err(e) => {
                 tracing::warn!("Embedding model not ready: {}", e);
@@ -234,33 +443,44 @@ impl EmbeddingService {
 
     /// Check if the model is ready and return the error if not
     pub fn check_ready(&self) -> Result<(), EmbeddingError> {
-        get_model().map(|_| ())
+        get_backend().map(|_| ())
     }
 
     /// Initialize the model (downloads if necessary)
     pub fn init(&self) -> Result<(), EmbeddingError> {
-        let _model = get_model()?; // Ensures model is loaded and returns any init errors
+        let _model = get_backend()?; // Ensures model is loaded and returns any init errors
         Ok(())
     }
 
-    /// Get the model name
+    /// HuggingFace repo ID of the active backend. Used by storage to tag every
+    /// embedded row with its source model so dual-index search can route at
+    /// retrieval time without re-embedding the query against every index.
     pub fn model_name(&self) -> &'static str {
-        #[cfg(feature = "nomic-v2")]
-        {
-            "nomic-ai/nomic-embed-text-v2-moe"
-        }
-        #[cfg(not(feature = "nomic-v2"))]
-        {
-            "nomic-ai/nomic-embed-text-v1.5"
+        // Acquire the lock only to read a const — cheap, and avoids duplicating
+        // the cfg branch at the call site.
+        match get_backend() {
+            Ok(guard) => guard.model_name(),
+            #[cfg(feature = "qwen3-embed")]
+            Err(_) => "Qwen/Qwen3-Embedding-0.6B",
+            #[cfg(not(feature = "qwen3-embed"))]
+            Err(_) => "nomic-ai/nomic-embed-text-v1.5",
         }
     }
 
-    /// Get the embedding dimensions
+    /// Output vector dimensions for the active backend.
     pub fn dimensions(&self) -> usize {
-        EMBEDDING_DIMENSIONS
+        match get_backend() {
+            Ok(guard) => guard.dimensions(),
+            Err(_) => EMBEDDING_DIMENSIONS,
+        }
     }
 
-    /// Generate embedding for a single text
+    /// Generate embedding for a single text.
+    ///
+    /// Documents go in raw. For QUERY text under the Qwen3 backend, the caller
+    /// is responsible for wrapping with [`qwen3_format_query`] before calling
+    /// this method — the asymmetric query/document format is intentional and
+    /// handled at the search layer, not the embedding layer.
     pub fn embed(&self, text: &str) -> Result<Embedding, EmbeddingError> {
         if text.is_empty() {
             return Err(EmbeddingError::InvalidInput(
@@ -268,7 +488,7 @@ impl EmbeddingService {
             ));
         }
 
-        let mut model = get_model()?;
+        let mut backend = get_backend()?;
 
         // Truncate if too long (char-boundary safe)
         let text = if text.len() > MAX_TEXT_LENGTH {
@@ -281,26 +501,36 @@ impl EmbeddingService {
             text
         };
 
-        let embeddings = model
-            .embed(vec![text], None)
-            .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?;
+        let raw = backend.embed_batch(vec![text])?;
 
-        if embeddings.is_empty() {
+        // Shape contract: both backends must return at least one vector of
+        // non-zero length for a non-empty input. An empty outer or inner vec
+        // means the backend misbehaved (e.g. fastembed regression, malformed
+        // ONNX output). Guard both so a silent zero-dim vector never lands in
+        // the USearch index where it would later blow up with an opaque
+        // InvalidDimensions error deep in the search path.
+        let first = raw.into_iter().next().ok_or_else(|| {
+            EmbeddingError::EmbeddingFailed("No embedding generated".to_string())
+        })?;
+        if first.is_empty() {
             return Err(EmbeddingError::EmbeddingFailed(
-                "No embedding generated".to_string(),
+                "Backend returned an empty embedding vector".to_string(),
             ));
         }
 
-        Ok(Embedding::new(matryoshka_truncate(embeddings[0].clone())))
+        Ok(Embedding::new(backend.post_process(first)))
     }
 
-    /// Generate embeddings for multiple texts (batch processing)
+    /// Generate embeddings for multiple texts (batch processing).
+    ///
+    /// As with [`Self::embed`], query/document asymmetry is the caller's
+    /// responsibility: wrap query texts with [`qwen3_format_query`] upstream.
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Embedding>, EmbeddingError> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut model = get_model()?;
+        let mut backend = get_backend()?;
         let mut all_embeddings = Vec::with_capacity(texts.len());
 
         // Process in batches for efficiency
@@ -320,12 +550,10 @@ impl EmbeddingService {
                 })
                 .collect();
 
-            let embeddings = model
-                .embed(truncated, None)
-                .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?;
+            let raw = backend.embed_batch(truncated)?;
 
-            for emb in embeddings {
-                all_embeddings.push(Embedding::new(matryoshka_truncate(emb)));
+            for emb in raw {
+                all_embeddings.push(Embedding::new(backend.post_process(emb)));
             }
         }
 
@@ -356,15 +584,19 @@ impl EmbeddingService {
 // SIMILARITY FUNCTIONS
 // ============================================================================
 
-/// Apply Matryoshka truncation: truncate to EMBEDDING_DIMENSIONS and L2-normalize
+/// Apply Matryoshka truncation: truncate to [`NOMIC_EMBEDDING_DIMENSIONS`] and L2-normalize.
 ///
 /// Nomic Embed v1.5 supports Matryoshka Representation Learning,
 /// meaning the first N dimensions of the 768-dim output ARE a valid
 /// N-dimensional embedding with minimal quality loss (~2% on MTEB for 256-dim).
+///
+/// Not applied to the Qwen3 backend — Qwen3 output is already last-token pooled
+/// and L2-normalized by the Candle model internals, and we keep full 1024-dim
+/// by default so the retrieval quality gain over nomic isn't Matryoshka-capped.
 #[inline]
 pub fn matryoshka_truncate(mut vector: Vec<f32>) -> Vec<f32> {
-    if vector.len() > EMBEDDING_DIMENSIONS {
-        vector.truncate(EMBEDDING_DIMENSIONS);
+    if vector.len() > NOMIC_EMBEDDING_DIMENSIONS {
+        vector.truncate(NOMIC_EMBEDDING_DIMENSIONS);
     }
     // L2-normalize the truncated vector
     let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -511,5 +743,51 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 0); // First candidate should be most similar
         assert!((results[0].1 - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_qwen3_format_query_feature_gated() {
+        let wrapped = qwen3_format_query("cats are cute");
+
+        #[cfg(feature = "qwen3-embed")]
+        {
+            // With Qwen3 active, queries get wrapped in the Instruct template.
+            // No space between `Query:` and the user text — this matches the
+            // canonical `get_detailed_instruct` function in the Qwen3 model
+            // card's Python example, even though the TEI curl example has a
+            // space. We follow the Python reference.
+            assert!(wrapped.starts_with("Instruct: "));
+            assert!(wrapped.ends_with("\nQuery:cats are cute"));
+        }
+        #[cfg(not(feature = "qwen3-embed"))]
+        {
+            // Under the nomic backend the wrapper is a no-op.
+            assert_eq!(wrapped, "cats are cute");
+        }
+    }
+
+    #[test]
+    fn test_backend_dimensions_match_feature_flag() {
+        #[cfg(feature = "qwen3-embed")]
+        assert_eq!(EMBEDDING_DIMENSIONS, QWEN3_EMBEDDING_DIMENSIONS);
+        #[cfg(not(feature = "qwen3-embed"))]
+        assert_eq!(EMBEDDING_DIMENSIONS, NOMIC_EMBEDDING_DIMENSIONS);
+    }
+
+    /// Integration: load the Qwen3 backend and verify it produces a 1024-dim
+    /// L2-normalized vector on CPU. Ignored by default because it downloads
+    /// ~1.2 GB of model weights on first run.
+    ///
+    /// Run with: `cargo test --features qwen3-embed -- --ignored test_qwen3_embed_live`
+    #[cfg(feature = "qwen3-embed")]
+    #[test]
+    #[ignore]
+    fn test_qwen3_embed_live() {
+        let service = EmbeddingService::new();
+        service.init().expect("Qwen3 backend init");
+
+        let emb = service.embed("hello world").expect("embed succeeds");
+        assert_eq!(emb.dimensions, QWEN3_EMBEDDING_DIMENSIONS);
+        assert!(emb.is_normalized(), "Qwen3 output must be L2-normalized");
     }
 }

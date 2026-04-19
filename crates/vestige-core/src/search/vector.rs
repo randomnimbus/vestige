@@ -17,9 +17,25 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 // CONSTANTS
 // ============================================================================
 
-/// Default embedding dimensions after Matryoshka truncation (768 → 256)
-/// 3x storage savings with only ~2% quality loss on MTEB benchmarks
-pub const DEFAULT_DIMENSIONS: usize = 256;
+/// Default embedding dimensions for the active backend.
+///
+/// - Nomic backend (default): 256 after Matryoshka truncation from 768.
+///   3x storage savings with ~2% quality loss on MTEB benchmarks.
+/// - Qwen3 backend (`qwen3-embed` feature): 1024 native, no truncation.
+///
+/// Must track `embeddings::local::EMBEDDING_DIMENSIONS` so the USearch index
+/// dimension matches what `EmbeddingService::embed()` produces. Mismatches
+/// surface as `VectorSearchError::InvalidDimensions` at insert time.
+pub const DEFAULT_DIMENSIONS: usize = {
+    #[cfg(feature = "qwen3-embed")]
+    {
+        1024
+    }
+    #[cfg(not(feature = "qwen3-embed"))]
+    {
+        256
+    }
+};
 
 /// HNSW connectivity parameter (higher = better recall, more memory)
 pub const DEFAULT_CONNECTIVITY: usize = 16;

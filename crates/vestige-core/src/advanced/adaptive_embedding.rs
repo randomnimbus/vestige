@@ -31,11 +31,34 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Default embedding dimensions after Matryoshka truncation (768 → 256)
-pub const DEFAULT_DIMENSIONS: usize = 256;
+/// Default embedding dimensions for the active backend.
+/// Tracks `embeddings::local::EMBEDDING_DIMENSIONS` — must match at compile time
+/// or the adaptive strategy layer ends up sizing buffers against the wrong
+/// backend. 256 for nomic (Matryoshka 768→256), 1024 for Qwen3 native.
+pub const DEFAULT_DIMENSIONS: usize = {
+    #[cfg(feature = "qwen3-embed")]
+    {
+        1024
+    }
+    #[cfg(not(feature = "qwen3-embed"))]
+    {
+        256
+    }
+};
 
-/// Code embedding dimensions (matches default after Matryoshka truncation)
-pub const CODE_DIMENSIONS: usize = 256;
+/// Code embedding dimensions (matches default after Matryoshka truncation).
+/// Same-shape gating as `DEFAULT_DIMENSIONS` so code embeddings flow through
+/// the same index when the backend is swapped.
+pub const CODE_DIMENSIONS: usize = {
+    #[cfg(feature = "qwen3-embed")]
+    {
+        1024
+    }
+    #[cfg(not(feature = "qwen3-embed"))]
+    {
+        256
+    }
+};
 
 /// Supported programming languages for code embeddings
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

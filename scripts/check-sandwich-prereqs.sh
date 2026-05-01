@@ -5,21 +5,50 @@ set -u
 ok()   { printf '  \033[1;32m[ OK ]\033[0m %s\n' "$*"; }
 warn() { printf '  \033[1;33m[WARN]\033[0m %s\n' "$*"; FAIL=1; }
 miss() { printf '  \033[1;31m[MISS]\033[0m %s\n' "$*"; FAIL=1; }
+info() { printf '  \033[1;36m[INFO]\033[0m %s\n' "$*"; }
 
 FAIL=0
+CHECK_SANHEDRIN=0
 DASHBOARD_PORT="${VESTIGE_DASHBOARD_PORT:-3927}"
-MLX_ENDPOINT="${MLX_ENDPOINT:-http://127.0.0.1:8080/v1/chat/completions}"
-MLX_ENDPOINT="${MLX_ENDPOINT%/}"
-MLX_MODELS_URL="${MLX_ENDPOINT%/chat/completions}/models"
+SANHEDRIN_ENV="${VESTIGE_SANHEDRIN_ENV:-$HOME/.claude/hooks/vestige-sanhedrin.env}"
+
+for arg in "$@"; do
+  case "$arg" in
+    --sanhedrin|--enable-sanhedrin) CHECK_SANHEDRIN=1 ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: scripts/check-sandwich-prereqs.sh [--sanhedrin]
+
+Without flags, checks the lightweight Cognitive Sandwich hooks.
+With --sanhedrin, also checks the optional OpenAI-compatible verifier endpoint.
+EOF
+      exit 0
+      ;;
+  esac
+done
+
+if [ -f "$SANHEDRIN_ENV" ]; then
+  set +u
+  set -a
+  # shellcheck disable=SC1090
+  . "$SANHEDRIN_ENV" 2>/dev/null || true
+  set +a
+  set -u
+fi
+
+SANHEDRIN_ENDPOINT="${VESTIGE_SANHEDRIN_ENDPOINT:-${MLX_ENDPOINT:-http://127.0.0.1:8080/v1/chat/completions}}"
+SANHEDRIN_ENDPOINT="${SANHEDRIN_ENDPOINT%/}"
+SANHEDRIN_MODELS_URL="${SANHEDRIN_ENDPOINT%/chat/completions}/models"
 
 echo "Vestige Cognitive Sandwich — Prereq Check"
 echo
 
 # Platform
-if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
-  ok "Apple Silicon macOS ($(sw_vers -productVersion 2>/dev/null || echo darwin))"
-else
-  miss "Apple Silicon Mac required (M1+). Detected $(uname -s) $(uname -m)."
+OS_NAME="$(uname -s)"
+ARCH_NAME="$(uname -m)"
+ok "Platform: $OS_NAME $ARCH_NAME"
+if [ "$OS_NAME" != "Darwin" ] || [ "$ARCH_NAME" != "arm64" ]; then
+  info "Local MLX launchd is Apple Silicon-only; base hooks and endpoint-backed Sanhedrin can run on x86."
 fi
 
 # Python
@@ -35,43 +64,14 @@ fi
 
 # CLI tools
 command -v jq            >/dev/null && ok "jq"            || miss "jq missing — brew install jq"
-command -v uv            >/dev/null && ok "uv"            || miss "uv missing — brew install uv"
-command -v mlx_lm.server >/dev/null && ok "mlx-lm"        || miss "mlx-lm — uv tool install mlx-lm"
-command -v hf            >/dev/null && ok "huggingface_hub CLI" || miss "hf — uv tool install 'huggingface_hub[cli]'"
 command -v claude        >/dev/null && ok "claude CLI"    || miss "claude CLI — install Claude Code"
 command -v vestige-mcp   >/dev/null && ok "vestige-mcp"   || miss "vestige-mcp — cargo install vestige-mcp"
-
-# Model on disk — HF cache uses `models--<org>--<name>` (double-dash separators).
-MODEL="${VESTIGE_SANDWICH_MODEL:-mlx-community/Qwen3.6-35B-A3B-4bit}"
-HF_HOME_DEFAULT="${HF_HOME:-$HOME/.cache/huggingface}"
-ENC_MODEL="models--$(printf '%s' "$MODEL" | sed 's|/|--|g')"
-if [ -d "$HF_HOME_DEFAULT/hub/$ENC_MODEL" ]; then
-  ok "Model cached: $MODEL"
-else
-  printf '  \033[1;33m[INFO]\033[0m Model not yet downloaded — first run will fetch ~19GB\n'
-  printf '         hf download %s\n' "$MODEL"
-  # NOT a failure — first-run download is expected.
-fi
 
 # Vestige MCP HTTP API
 if curl -fsS -m 2 "http://127.0.0.1:${DASHBOARD_PORT}/api/health" >/dev/null 2>&1; then
   ok "vestige-mcp dashboard responding on :$DASHBOARD_PORT"
 else
   warn "vestige-mcp dashboard not responding on :$DASHBOARD_PORT"
-fi
-
-# OpenAI-compatible local/remote model endpoint
-if curl -fsS -m 2 "$MLX_MODELS_URL" >/dev/null 2>&1; then
-  ok "model endpoint responding at $MLX_MODELS_URL"
-else
-  warn "model endpoint not responding at $MLX_MODELS_URL — install + load launchd plist or set MLX_ENDPOINT"
-fi
-
-# launchd plist
-if [ -f "$HOME/Library/LaunchAgents/com.vestige.mlx-server.plist" ]; then
-  ok "launchd plist installed"
-else
-  warn "launchd plist missing — run: install-sandwich.sh"
 fi
 
 # Settings hook wiring
@@ -82,9 +82,59 @@ else
   warn "settings.json missing hooks block — run: install-sandwich.sh"
 fi
 
+if [ "$CHECK_SANHEDRIN" -eq 1 ]; then
+  echo
+  echo "Optional Sanhedrin"
+
+  if [ -f "$SANHEDRIN_ENV" ]; then
+    ok "Sanhedrin env file present"
+  else
+    warn "Sanhedrin env file missing — run: install-sandwich.sh --enable-sanhedrin"
+  fi
+
+  if [ "$OS_NAME" = "Darwin" ] && [ "$ARCH_NAME" = "arm64" ]; then
+    command -v uv            >/dev/null && ok "uv"            || warn "uv missing — brew install uv"
+    command -v mlx_lm.server >/dev/null && ok "mlx-lm"        || warn "mlx-lm — uv tool install mlx-lm"
+    command -v hf            >/dev/null && ok "huggingface_hub CLI" || warn "hf — uv tool install 'huggingface_hub[cli]'"
+
+    MODEL="${VESTIGE_SANHEDRIN_MODEL:-${VESTIGE_SANDWICH_MODEL:-mlx-community/Qwen3.6-35B-A3B-4bit}}"
+    HF_HOME_DEFAULT="${HF_HOME:-$HOME/.cache/huggingface}"
+    ENC_MODEL="models--$(printf '%s' "$MODEL" | sed 's|/|--|g')"
+    if [ -d "$HF_HOME_DEFAULT/hub/$ENC_MODEL" ]; then
+      ok "Model cached: $MODEL"
+    else
+      info "Model not cached: $MODEL (local MLX path downloads ~19GB)"
+    fi
+
+    if [ -f "$HOME/Library/LaunchAgents/com.vestige.mlx-server.plist" ]; then
+      ok "launchd plist installed"
+    else
+      info "launchd plist not installed; endpoint-backed Sanhedrin can still run"
+    fi
+  else
+    info "Skipping MLX/launchd checks on $OS_NAME $ARCH_NAME"
+  fi
+
+  if curl -fsS -m 2 "$SANHEDRIN_MODELS_URL" >/dev/null 2>&1; then
+    ok "Sanhedrin model endpoint responding at $SANHEDRIN_MODELS_URL"
+  else
+    warn "Sanhedrin endpoint not responding at $SANHEDRIN_MODELS_URL"
+  fi
+
+  if [ -f "$HOME/.claude/settings.json" ] && \
+     jq -e '.hooks.Stop[]?.hooks[]?.command | contains("sanhedrin.sh")' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+    ok "Sanhedrin Stop hook wired"
+  else
+    warn "Sanhedrin Stop hook not wired — run: install-sandwich.sh --enable-sanhedrin"
+  fi
+else
+  echo
+  info "Sanhedrin is optional and not checked. Use --sanhedrin to verify an enabled endpoint."
+fi
+
 echo
 if [ $FAIL -eq 0 ]; then
-  echo "  Ready. Cognitive Sandwich will fire on next Claude Code prompt."
+  echo "  Ready. Lightweight Cognitive Sandwich hooks will fire on next Claude Code prompt."
   exit 0
 else
   echo "  Fix the items above, then re-run."

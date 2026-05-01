@@ -7,13 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.1.0] - 2026-04-27 — "Cognitive Sandwich Goes Local"
 
-The Sanhedrin Executioner — Vestige's veto layer for Claude Code responses — now runs entirely on a local MLX model (`mlx-community/Qwen3.6-35B-A3B-4bit`). Zero API cost per Claude turn, fully offline, no Anthropic round-trip on the critical path. Combined with four pre-cognitive UserPromptSubmit hooks (synthesis-preflight, cwd-state-injector, vestige-pulse-daemon, preflight-swarm), Vestige now ships a complete "Cognitive Sandwich" — Vestige memories injected before the model thinks, local Sanhedrin veto after the model speaks — installable in one command on a MacBook.
+The Sanhedrin Executioner — Vestige's veto layer for Claude Code responses — can run against a local MLX model (`mlx-community/Qwen3.6-35B-A3B-4bit`) when explicitly enabled. Combined with four pre-cognitive UserPromptSubmit hooks (synthesis-preflight, cwd-state-injector, vestige-pulse-daemon, preflight-swarm), Vestige now ships a complete "Cognitive Sandwich" — Vestige memories injected before the model thinks, optional Sanhedrin veto after the model speaks.
+
+> 2026-05-01 hotfix: Sanhedrin is optional by default. The default installer no longer wires the Sanhedrin Stop hook, no longer starts MLX, and removes the old v2.1.0 MLX launchd job on reinstall. Users who want Sanhedrin can opt in with `--enable-sanhedrin`; Apple Silicon local MLX autostart is a separate `--with-launchd` flag, and x86 users can point `--sanhedrin-endpoint` at any OpenAI-compatible `/v1/chat/completions` endpoint.
 
 ### Added
 
 - **`hooks/`** — first-class harness-side companion to the Vestige MCP server. 9 production hooks designed for `~/.claude/hooks/`:
-  - `sanhedrin.sh` — Stop hook that invokes the local Qwen Executioner via the Python bridge.
-  - `sanhedrin-local.py` — local backend that POSTs to `mlx_lm.server` (`localhost:8080`) with Vestige evidence injected via the dashboard `/api/deep_reference` HTTP endpoint. TRUST_FLOOR=0.55 evidence filter + topical-relevance gate + inference-verb ban + 8 worked few-shots covering true positives AND false-positive guards.
+  - `sanhedrin.sh` — optional Stop hook that invokes the Sanhedrin Executioner via the Python bridge only when `VESTIGE_SANHEDRIN_ENABLED=1`.
+  - `sanhedrin-local.py` — OpenAI-compatible backend that POSTs to the configured Sanhedrin endpoint with Vestige evidence injected via the dashboard `/api/deep_reference` HTTP endpoint. TRUST_FLOOR=0.55 evidence filter + topical-relevance gate + inference-verb ban + 8 worked few-shots covering true positives AND false-positive guards.
   - `synthesis-preflight.sh` — UserPromptSubmit hook that POSTs the user prompt to `/api/deep_reference` and injects the trust-scored reasoning chain into context.
   - `cwd-state-injector.sh` — captures git status, branch, modified files, open PRs/issues.
   - `vestige-pulse-daemon.sh` — surfaces fresh Vestige dream insights from the past 20 min.
@@ -21,18 +23,20 @@ The Sanhedrin Executioner — Vestige's veto layer for Claude Code responses —
   - `synthesis-stop-validator.sh` — Stop hook regex against forbidden hedging patterns.
   - `veto-detector.sh` — fast 50ms regex pre-screen against `veto`-tagged Vestige memories.
   - `synthesis-gate.sh` — legacy v1 trigger (kept for backward compat).
-  - `settings.fragment.json` — JSON snippet merged into `~/.claude/settings.json` by the installer.
+  - `settings.fragment.json` — lightweight JSON snippet merged into `~/.claude/settings.json` by the default installer.
+  - `settings.sanhedrin.fragment.json` — opt-in JSON snippet used only with `--enable-sanhedrin`.
 - **Dashboard `/api/changelog` endpoint** — bounded REST event feed for recent `DreamCompleted` and `ConnectionDiscovered` events, used by the Pulse hook to inject fresh synthesis into Claude Code context.
 - **`agents/`** — `executioner.md` (legacy/fallback Haiku 4.5 path), `lateral-thinker.md`, `synthesis-composer.md`.
-- **`launchd/com.vestige.mlx-server.plist.template`** — auto-start `mlx_lm.server` with the Qwen3.6-35B-A3B-4bit model on login. Templated with `__HOME__` and `__MODEL__` placeholders.
-- **`scripts/install-sandwich.sh`** — one-command installer that stages hooks, agents, plist, jq-merges the settings fragment, and `launchctl load`s the plist. Backs up `settings.json` to `.bak.pre-sandwich`. Supports `--force`, `--no-launchd`, `--include-memory-loader`, `--src=PATH`.
-- **`scripts/check-sandwich-prereqs.sh`** — comprehensive prereq verifier (Apple Silicon, Python 3.10+, jq, uv, mlx-lm, hf, claude, vestige-mcp, model on disk, MCP HTTP up, server up, plist installed, settings wired).
+- **`launchd/com.vestige.mlx-server.plist.template`** — optional Apple Silicon helper that auto-starts `mlx_lm.server` with the Qwen3.6-35B-A3B-4bit model on login. Templated with `__HOME__` and `__MODEL__` placeholders.
+- **`scripts/install-sandwich.sh`** — one-command installer that stages hooks, agents, jq-merges the settings fragment, and backs up `settings.json` to `.bak.pre-sandwich`. Supports `--force`, `--enable-sanhedrin`, `--with-launchd`, `--sanhedrin-endpoint`, `--sanhedrin-model`, `--include-memory-loader`, `--src=PATH`.
+- **`scripts/check-sandwich-prereqs.sh`** — prereq verifier for lightweight hooks by default, with `--sanhedrin` for the optional endpoint / MLX checks.
 - **`docs/COGNITIVE_SANDWICH.md`** — architecture diagram, install guide, performance notes (82 tok/s on M3 Max), uninstall, configuration env vars.
 - **PR #48** — `VESTIGE_DATA_DIR` env-var support + tilde expansion + secure unix perms (thanks @Jelloeater) — directly addresses the ghost env-vars exposed by v2.0.9 cleanup.
 
 ### Changed
 
-- **Sanhedrin Executioner default backend swapped from Anthropic Haiku 4.5 → local `mlx_lm.server` + Qwen3.6-35B-A3B-4bit.** Anthropic API key no longer required for the post-cognitive layer. The `executioner.md` agent definition is retained as manual/fallback only when invoked explicitly via `Task(subagent_type='executioner')`.
+- **Sanhedrin is optional by default.** Default installs run on x86 and low-memory machines without downloading or starting the 19 GB MLX model. Reinstalling the default v2.1.0 hotfix removes the old mandatory `com.vestige.mlx-server` launchd job if it exists.
+- **Sanhedrin Executioner backend swapped from Anthropic Haiku 4.5 → OpenAI-compatible endpoint, with local `mlx_lm.server` + Qwen3.6-35B-A3B-4bit as the Apple Silicon opt-in path.** Anthropic API key no longer required for the post-cognitive layer. The `executioner.md` agent definition is retained as manual/fallback only when invoked explicitly via `Task(subagent_type='executioner')`.
 - **All hooks sanitized for public release** — replaced hardcoded personal absolute paths with `$HOME` / `$VESTIGE_*` env vars; removed personal regex tokens.
 - **NPM binary installer now follows package version** — `vestige-mcp-server@2.1.0` downloads release assets from `v2.1.0` instead of a stale hardcoded binary tag, while local workspace installs skip the release-asset download before the tag exists.
 
@@ -41,6 +45,7 @@ The Sanhedrin Executioner — Vestige's veto layer for Claude Code responses —
 - `cargo test --workspace --release --no-fail-fast`: **1,229 passing, 0 failed** (366 vestige-core + 358 vestige-mcp lib + 4 vestige-mcp bin + 497 e2e + 4 doctests).
 - Sanhedrin bridge smoke checks: Python bytecode compilation passes, fail-open bridge invocation returns `yes`, and public hook settings validate as JSON.
 - 8-day Sandwich dogfood: **84% pass rate, 16% legitimate vetoes** caught real hallucinations.
+- 2026-05-01 hotfix checks: `cargo test --workspace --no-fail-fast`, `cargo build --release --workspace`, shell/Python/JSON validation, and default/opt-in installer dry-runs all pass.
 
 ### Closes
 
@@ -48,8 +53,14 @@ The Sanhedrin Executioner — Vestige's veto layer for Claude Code responses —
 
 ### Prerequisites for the Cognitive Sandwich
 
-- macOS Apple Silicon (M1+) — required for MLX
 - Python 3.10+
+- `jq`
+- `vestige-mcp`
+- Claude Code
+
+Optional local MLX Sanhedrin backend:
+
+- macOS Apple Silicon (M1+) — required for the launchd MLX helper only
 - ~22 GB free RAM (Qwen3.6-35B-A3B-4bit at runtime)
 - First-run model download: ~19 GB from Hugging Face (cached locally thereafter)
 

@@ -17,24 +17,36 @@
 #   sanhedrin.sh (2-8s Haiku subagent, may block) →
 #   synthesis-stop-validator.sh (existing regex hedge check, may block)
 #
-# Opt-in: set VESTIGE_SANHEDRIN_ENABLED=1 in parent shell.
+# Opt-in: set VESTIGE_SANHEDRIN_ENABLED=1 in parent shell, or install with
+# scripts/install-sandwich.sh --enable-sanhedrin.
 # Re-entrancy lock: VESTIGE_EXECUTIONER_ACTIVE=1 inside the subagent.
 #
 # Ship date 2026-04-20.
 
 set -u
 
-# === OPT-OUT GATE ===
-# Post-Cognitive Sanhedrin is ON by default as of 2026-04-21 (birthday
-# launch day). To disable, set VESTIGE_SANHEDRIN_ENABLED=0 in your
-# environment. Default-on guarantees the Cognitive Sandwich fires on
-# fresh machines, Docker containers, GUI-launched Claude Code, and
-# shells without .zshrc — any case where the Claude Code process lacks
-# a sourced profile. The re-entrancy guard (VESTIGE_EXECUTIONER_ACTIVE)
-# below still prevents fork-bombs from the subagent's own Stop hook.
-if [ "${VESTIGE_SANHEDRIN_ENABLED:-1}" = "0" ]; then
-  exit 0
+# === OPT-IN GATE ===
+# Sanhedrin is heavyweight: the default local backend is a ~19 GB model and
+# needs roughly 20+ GB of free RAM. Keep it disabled unless the user explicitly
+# opts in. The installer writes this env file only for --enable-sanhedrin.
+SANHEDRIN_ENV="${VESTIGE_SANHEDRIN_ENV:-$HOME/.claude/hooks/vestige-sanhedrin.env}"
+if [ -f "$SANHEDRIN_ENV" ]; then
+  set +u
+  set -a
+  # shellcheck disable=SC1090
+  . "$SANHEDRIN_ENV" 2>/dev/null || {
+    set +a
+    set -u
+    exit 0
+  }
+  set +a
+  set -u
 fi
+
+case "${VESTIGE_SANHEDRIN_ENABLED:-0}" in
+  1|true|TRUE|yes|YES|on|ON) ;;
+  *) exit 0 ;;
+esac
 
 # === RE-ENTRANCY GUARD ===
 # The Executioner's own Stop hook will fire when it returns — prevent
@@ -114,11 +126,11 @@ if [ -z "$DRAFT" ]; then
 fi
 
 # === VERIFY local executioner bridge available ===
-# 2026-04-25: switched from Haiku 4.5 subagent to local Qwen3.6-35B-A3B
-# via mlx_lm.server (launchd com.vestige.mlx-server). Bridge script
-# fetches Vestige evidence via HTTP API (VESTIGE_DASHBOARD_PORT, default 3927)
-# then judges via MLX_ENDPOINT (default port 8080). Zero per-token cost, fully offline,
-# sub-second-to-15s verdict latency. Fail-open if mlx-server unreachable.
+# 2026-04-25: switched from Haiku 4.5 subagent to an OpenAI-compatible
+# local/remote endpoint. On Apple Silicon the optional launchd path starts
+# mlx_lm.server; on x86 users can point VESTIGE_SANHEDRIN_ENDPOINT at vLLM,
+# Ollama, llama.cpp, or any compatible /v1/chat/completions endpoint.
+# Fail-open if the endpoint is unreachable.
 BRIDGE="$HOME/.claude/hooks/sanhedrin-local.py"
 if [ ! -x "$BRIDGE" ] && [ ! -f "$BRIDGE" ]; then
   exit 0
@@ -191,15 +203,15 @@ case "$TRIMMED" in
 
 $REASON
 
-The Executioner (local Qwen3.6-35B-A3B via mlx_lm.server, fresh context,
-fed Vestige deep_reference evidence over HTTP) judged your draft and
+The Executioner (Sanhedrin endpoint, fresh context, fed Vestige
+deep_reference evidence over HTTP) judged your draft and
 found a contradiction against a high-trust memory.
 
 You may NOT stop. Rewrite WITHOUT the contradicted claim. Use
 mcp__vestige__deep_reference to inspect the cited memory and cite the
 correct replacement pattern from its \`recommended\` field.
 
-Local-only, zero API cost, fully offline. Bridge script:
+Bridge script:
 ~/.claude/hooks/sanhedrin-local.py
 SANHEDRIN_MSG
     exit 2

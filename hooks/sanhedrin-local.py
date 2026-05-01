@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# sanhedrin-local.py — Local Qwen3.6-35B-A3B Sanhedrin Executioner.
+# sanhedrin-local.py — OpenAI-compatible Sanhedrin Executioner bridge.
 # Drop-in replacement for the Haiku 4.5 subagent that sanhedrin.sh used to spawn.
 #
 # Reads draft from stdin, prints single-line verdict to stdout:
@@ -8,10 +8,10 @@
 #
 # Architecture:
 #   stdin (draft) -> Vestige /api/deep_reference (single semantic query)
-#                 -> mlx_lm.server localhost:8080 (one-shot judgment)
+#                 -> OpenAI-compatible chat endpoint (one-shot judgment)
 #                 -> stdout (single-line verdict)
 #
-# Fail-open: if mlx-server unreachable, print "yes" and exit 0 (don't break
+# Fail-open: if the endpoint is unreachable, print "yes" and exit 0 (don't break
 # the Cognitive Sandwich on infra errors). The wrapping sanhedrin.sh maps
 # "yes" to exit 0, so this preserves existing fail-open semantics.
 
@@ -35,7 +35,11 @@ VESTIGE_BASE_URL = (
     os.environ.get("VESTIGE_BASE_URL") or f"http://127.0.0.1:{DASHBOARD_PORT}"
 ).rstrip("/")
 
-MLX_ENDPOINT = os.environ.get("MLX_ENDPOINT") or "http://127.0.0.1:8080/v1/chat/completions"
+SANHEDRIN_ENDPOINT = (
+    os.environ.get("VESTIGE_SANHEDRIN_ENDPOINT")
+    or os.environ.get("MLX_ENDPOINT")
+    or "http://127.0.0.1:8080/v1/chat/completions"
+)
 VESTIGE_ENDPOINT = (
     os.environ.get("VESTIGE_DEEP_REFERENCE_ENDPOINT")
     or f"{VESTIGE_BASE_URL}/api/deep_reference"
@@ -43,8 +47,12 @@ VESTIGE_ENDPOINT = (
 VESTIGE_HEALTH = (
     os.environ.get("VESTIGE_HEALTH_ENDPOINT") or f"{VESTIGE_BASE_URL}/api/health"
 )
-MODEL = os.environ.get("VESTIGE_SANDWICH_MODEL") or "mlx-community/Qwen3.6-35B-A3B-4bit"
-MLX_TIMEOUT = env_int("MLX_TIMEOUT", 45)
+MODEL = (
+    os.environ.get("VESTIGE_SANHEDRIN_MODEL")
+    or os.environ.get("VESTIGE_SANDWICH_MODEL")
+    or "mlx-community/Qwen3.6-35B-A3B-4bit"
+)
+SANHEDRIN_TIMEOUT = env_int("VESTIGE_SANHEDRIN_TIMEOUT", env_int("MLX_TIMEOUT", 45))
 VESTIGE_TIMEOUT = env_int("VESTIGE_TIMEOUT", 5)
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
@@ -289,7 +297,7 @@ def judge(draft: str, evidence: str) -> str:
             "\n\nOn second thought", "\n\nOh wait",
         ],
     }
-    resp = post_json(MLX_ENDPOINT, body, MLX_TIMEOUT)
+    resp = post_json(SANHEDRIN_ENDPOINT, body, SANHEDRIN_TIMEOUT)
     if not isinstance(resp, dict):
         return ""
     try:

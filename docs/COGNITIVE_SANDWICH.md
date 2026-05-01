@@ -2,7 +2,7 @@
 
 **Vestige's defense-in-depth safety architecture for Claude Code.**
 
-The Cognitive Sandwich wraps every Claude Code response in two layers of cognitive scaffolding:
+The default Cognitive Sandwich installs the preflight layer only. The Stop-hook layer is explicit opt-in:
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -15,14 +15,13 @@ The Cognitive Sandwich wraps every Claude Code response in two layers of cogniti
 ├────────────────────────────────────────────────┤
 │  🥩 MEAT       — Claude Code reasons            │
 ├────────────────────────────────────────────────┤
-│  🥪 BOTTOM BREAD — Stop hooks                   │
-│   • Veto-detector (fast 50ms regex pre-screen)  │
-│   • Sanhedrin Executioner (optional verifier)   │
-│   • Synthesis stop validator (hedge detector)   │
+│  🥪 OPTIONAL BOTTOM BREAD — Stop hooks          │
+│   • Veto-detector / synthesis validator         │
+│   • Sanhedrin Executioner verifier              │
 └────────────────────────────────────────────────┘
 ```
 
-Sanhedrin is optional. The default installer wires the lightweight preflight and stop hooks only; it does not start MLX, require a 19 GB model download, or require 20+ GB of RAM. Users who want the post-response semantic verifier can opt in and point it at any OpenAI-compatible `/v1/chat/completions` endpoint. On Apple Silicon, an additional `--with-launchd` flag can auto-start the local MLX Qwen backend.
+Sanhedrin and all Vestige Stop hooks are optional. The default installer wires UserPromptSubmit preflight hooks only; it does not install any Vestige Stop hook, start MLX, require a 19 GB model download, or require 20+ GB of RAM. Users who want the post-response verifier can opt in and point it at any OpenAI-compatible `/v1/chat/completions` endpoint. On Apple Silicon, an additional `--with-launchd` flag can auto-start the local MLX Qwen backend.
 
 ---
 
@@ -36,7 +35,7 @@ Sanhedrin is optional. The default installer wires the lightweight preflight and
    - `vestige-pulse-daemon.sh` — injects fresh Vestige dream insights from the past 20 min into the next prompt context
    - `preflight-swarm.sh` — spawns the `lateral-thinker` subagent in fresh context to surface cross-disciplinary structural parallels
 3. **Claude reads the assembled context and generates a draft.**
-4. **Stop hooks fire serially** (any can VETO with `exit 2`, forcing a rewrite):
+4. **By default, no Vestige Stop hooks are installed.** If explicitly enabled, Stop hooks fire serially (any can VETO with `exit 2`, forcing a rewrite):
    - `veto-detector.sh` — fast regex against `veto`-tagged Vestige memories (~50ms)
    - `sanhedrin.sh` → `sanhedrin-local.py` — optional single-shot semantic verdict
    - `synthesis-stop-validator.sh` — regex against forbidden patterns (hedging, summary-instead-of-composition)
@@ -126,7 +125,7 @@ Optional Apple Silicon local Sanhedrin backend:
 
 1. Verifies prereqs (warnings for missing tools, fatal only on jq/python3).
 2. Copies hooks to `~/.claude/hooks/`, agents to `~/.claude/agents/`.
-3. Backs up existing `~/.claude/settings.json` to `.bak.pre-sandwich`, then `jq`-merges the lightweight hooks block.
+3. Backs up existing `~/.claude/settings.json` to `.bak.pre-sandwich`, then `jq`-merges the default UserPromptSubmit hooks block and removes old Vestige Stop hooks from previous v2.1.0 installs.
 4. With `--enable-sanhedrin`, writes `~/.claude/hooks/vestige-sanhedrin.env` and merges a Sanhedrin-enabled hooks block.
 5. With `--enable-sanhedrin --with-launchd` on Apple Silicon, renders and loads `launchd/com.vestige.mlx-server.plist.template`.
 
@@ -180,7 +179,7 @@ Full architecture memory: search Vestige for `god-tier-plan` or `cognitive-sandw
 The base hook harness runs on x86. The launchd MLX helper is macOS-arm64-only.
 
 On Linux, Windows under WSL, or Intel Mac:
-- Run `scripts/install-sandwich.sh` normally for lightweight hooks.
+- Run `scripts/install-sandwich.sh` normally for default preflight hooks with no Vestige Stop hooks.
 - If you want Sanhedrin, run an OpenAI-compatible endpoint such as vLLM, Ollama, llama.cpp server, or a remote MLX/vLLM box.
 - Install with `--enable-sanhedrin --sanhedrin-endpoint=<url> --sanhedrin-model=<model>`.
 - If the endpoint is unreachable, Sanhedrin fails open and does not block Claude Code.

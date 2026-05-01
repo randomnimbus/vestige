@@ -11,7 +11,7 @@
 #   1. Verifies required local tools
 #   2. Stages ~/.claude/hooks/ and ~/.claude/agents/
 #   3. Copies sanitized hooks + agents
-#   4. Merges the lightweight hooks block into ~/.claude/settings.json
+#   4. Merges the default UserPromptSubmit hooks into ~/.claude/settings.json
 #   5. Optionally enables Sanhedrin and, only with --with-launchd on Apple Silicon,
 #      auto-starts mlx_lm.server with Qwen3.6-35B-A3B
 
@@ -195,19 +195,42 @@ SETTINGS_FRAGMENT="$SCRIPT_DIR/hooks/settings.fragment.json"
 if [ "$ENABLE_SANHEDRIN" -eq 1 ]; then
   SETTINGS_FRAGMENT="$SCRIPT_DIR/hooks/settings.sanhedrin.fragment.json"
 fi
-jq -s '.[0] * .[1]' "$SETTINGS" "$SETTINGS_FRAGMENT" > "$TMP_MERGE"
+jq -s --arg enable_sanhedrin "$ENABLE_SANHEDRIN" '
+  def is_vestige_stop:
+    (.command? // "") as $cmd
+    | ($cmd | contains("/.claude/hooks/veto-detector.sh"))
+      or ($cmd | contains("/.claude/hooks/sanhedrin.sh"))
+      or ($cmd | contains("/.claude/hooks/synthesis-stop-validator.sh"));
+
+  .[0] * .[1]
+  | if $enable_sanhedrin == "1" then
+      .
+    else
+      .hooks.Stop = (
+        (.hooks.Stop // [])
+        | map(.hooks = ((.hooks // []) | map(select((is_vestige_stop | not)))))
+        | map(select(((.hooks // []) | length) > 0))
+      )
+      | if ((.hooks.Stop // []) | length) == 0 then del(.hooks.Stop) else . end
+    end
+' "$SETTINGS" "$SETTINGS_FRAGMENT" > "$TMP_MERGE"
 mv "$TMP_MERGE" "$SETTINGS"
-say "merged hooks block into $SETTINGS (backup at .bak.pre-sandwich)"
+if [ "$ENABLE_SANHEDRIN" -eq 1 ]; then
+  say "merged hooks block into $SETTINGS with Sanhedrin Stop hook enabled (backup at .bak.pre-sandwich)"
+else
+  say "merged default preflight hooks into $SETTINGS; no Vestige Stop hooks are installed (backup at .bak.pre-sandwich)"
+fi
 
 # --- Next steps ---
 cat <<EOF
 
   ┌──────────────────────────────────────────────────────────────┐
-  │  Cognitive Sandwich hooks installed.                          │
+  │  Cognitive Sandwich preflight hooks installed.                 │
   └──────────────────────────────────────────────────────────────┘
 
   Next steps:
     1. Restart Claude Code so it picks up the new hooks.
+       Default installs include no Vestige Stop hooks.
     2. Verify the install:
          vestige health                 # if vestige CLI installed
          curl http://127.0.0.1:$DASHBOARD_PORT/api/health

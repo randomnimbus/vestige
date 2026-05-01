@@ -19,7 +19,7 @@ for arg in "$@"; do
       cat <<'EOF'
 Usage: scripts/check-sandwich-prereqs.sh [--sanhedrin]
 
-Without flags, checks the lightweight Cognitive Sandwich hooks.
+Without flags, checks the default Cognitive Sandwich preflight hooks.
 With --sanhedrin, also checks the optional OpenAI-compatible verifier endpoint.
 EOF
       exit 0
@@ -76,10 +76,19 @@ fi
 
 # Settings hook wiring
 if [ -f "$HOME/.claude/settings.json" ] && \
-   jq -e '.hooks.UserPromptSubmit and .hooks.Stop' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
-  ok "settings.json hooks block present"
+   jq -e '.hooks.UserPromptSubmit' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+  ok "settings.json UserPromptSubmit hooks present"
 else
-  warn "settings.json missing hooks block — run: install-sandwich.sh"
+  warn "settings.json missing UserPromptSubmit hooks — run: install-sandwich.sh"
+fi
+
+if [ "$CHECK_SANHEDRIN" -eq 0 ]; then
+  if [ -f "$HOME/.claude/settings.json" ] && \
+     jq -e 'any(.hooks.Stop[]?.hooks[]?; ((.command? // "") | contains("/.claude/hooks/veto-detector.sh") or contains("/.claude/hooks/sanhedrin.sh") or contains("/.claude/hooks/synthesis-stop-validator.sh")))' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+    warn "Vestige Stop hooks are still wired; run: install-sandwich.sh --force"
+  else
+    ok "no Vestige Stop hooks wired by default"
+  fi
 fi
 
 if [ "$CHECK_SANHEDRIN" -eq 1 ]; then
@@ -134,7 +143,7 @@ fi
 
 echo
 if [ $FAIL -eq 0 ]; then
-  echo "  Ready. Lightweight Cognitive Sandwich hooks will fire on next Claude Code prompt."
+  echo "  Ready. Default preflight hooks will fire on next Claude Code prompt; no Vestige Stop hooks are wired."
   exit 0
 else
   echo "  Fix the items above, then re-run."

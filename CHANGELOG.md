@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The Sanhedrin Executioner — Vestige's veto layer for Claude Code responses — can run against a local MLX model (`mlx-community/Qwen3.6-35B-A3B-4bit`) when explicitly enabled. Combined with four pre-cognitive UserPromptSubmit hooks (synthesis-preflight, cwd-state-injector, vestige-pulse-daemon, preflight-swarm), Vestige now ships a complete "Cognitive Sandwich" — Vestige memories injected before the model thinks, optional Sanhedrin veto after the model speaks.
 
-> 2026-05-01 hotfix: Sanhedrin is optional by default. The default installer no longer wires the Sanhedrin Stop hook, no longer starts MLX, and removes the old v2.1.0 MLX launchd job on reinstall. Users who want Sanhedrin can opt in with `--enable-sanhedrin`; Apple Silicon local MLX autostart is a separate `--with-launchd` flag, and x86 users can point `--sanhedrin-endpoint` at any OpenAI-compatible `/v1/chat/completions` endpoint.
+> 2026-05-01 hotfix: Sanhedrin and all Vestige Stop hooks are optional by default. The default installer wires UserPromptSubmit preflight hooks only, removes old Vestige Stop hooks from previous v2.1.0 installs, no longer starts MLX, and removes the old v2.1.0 MLX launchd job on reinstall. Users who want Sanhedrin can opt in with `--enable-sanhedrin`; Apple Silicon local MLX autostart is a separate `--with-launchd` flag, and x86 users can point `--sanhedrin-endpoint` at any OpenAI-compatible `/v1/chat/completions` endpoint.
 
 ### Added
 
@@ -23,7 +23,7 @@ The Sanhedrin Executioner — Vestige's veto layer for Claude Code responses —
   - `synthesis-stop-validator.sh` — Stop hook regex against forbidden hedging patterns.
   - `veto-detector.sh` — fast 50ms regex pre-screen against `veto`-tagged Vestige memories.
   - `synthesis-gate.sh` — legacy v1 trigger (kept for backward compat).
-  - `settings.fragment.json` — lightweight JSON snippet merged into `~/.claude/settings.json` by the default installer.
+  - `settings.fragment.json` — default UserPromptSubmit-only JSON snippet merged into `~/.claude/settings.json` by the installer.
   - `settings.sanhedrin.fragment.json` — opt-in JSON snippet used only with `--enable-sanhedrin`.
 - **Dashboard `/api/changelog` endpoint** — bounded REST event feed for recent `DreamCompleted` and `ConnectionDiscovered` events, used by the Pulse hook to inject fresh synthesis into Claude Code context.
 - **`agents/`** — `executioner.md` (legacy/fallback Haiku 4.5 path), `lateral-thinker.md`, `synthesis-composer.md`.
@@ -35,7 +35,7 @@ The Sanhedrin Executioner — Vestige's veto layer for Claude Code responses —
 
 ### Changed
 
-- **Sanhedrin is optional by default.** Default installs run on x86 and low-memory machines without downloading or starting the 19 GB MLX model. Reinstalling the default v2.1.0 hotfix removes the old mandatory `com.vestige.mlx-server` launchd job if it exists.
+- **Sanhedrin and all Vestige Stop hooks are optional by default.** Default installs run on x86 and low-memory machines without wiring any Vestige Stop hook, downloading the 19 GB MLX model, or starting MLX. Reinstalling the default v2.1.0 hotfix removes the old Vestige Stop hooks and the old mandatory `com.vestige.mlx-server` launchd job if they exist.
 - **Sanhedrin Executioner backend swapped from Anthropic Haiku 4.5 → OpenAI-compatible endpoint, with local `mlx_lm.server` + Qwen3.6-35B-A3B-4bit as the Apple Silicon opt-in path.** Anthropic API key no longer required for the post-cognitive layer. The `executioner.md` agent definition is retained as manual/fallback only when invoked explicitly via `Task(subagent_type='executioner')`.
 - **All hooks sanitized for public release** — replaced hardcoded personal absolute paths with `$HOME` / `$VESTIGE_*` env vars; removed personal regex tokens.
 - **NPM binary installer now follows package version** — `vestige-mcp-server@2.1.0` downloads release assets from `v2.1.0` instead of a stale hardcoded binary tag, while local workspace installs skip the release-asset download before the tag exists.

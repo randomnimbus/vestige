@@ -9,14 +9,6 @@
           { "type": "command", "command": "$HOME/.claude/hooks/preflight-swarm.sh", "timeout": 45 }
         ]
       }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "$HOME/.claude/hooks/veto-detector.sh", "timeout": 6 },
-          { "type": "command", "command": "$HOME/.claude/hooks/synthesis-stop-validator.sh", "timeout": 6 }
-        ]
-      }
     ]
   }
 }

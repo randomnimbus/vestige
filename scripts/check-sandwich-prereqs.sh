@@ -8,19 +8,22 @@ miss() { printf '  \033[1;31m[MISS]\033[0m %s\n' "$*"; FAIL=1; }
 info() { printf '  \033[1;36m[INFO]\033[0m %s\n' "$*"; }
 
 FAIL=0
+CHECK_PREFLIGHT=0
 CHECK_SANHEDRIN=0
 DASHBOARD_PORT="${VESTIGE_DASHBOARD_PORT:-3927}"
 SANHEDRIN_ENV="${VESTIGE_SANHEDRIN_ENV:-$HOME/.claude/hooks/vestige-sanhedrin.env}"
 
 for arg in "$@"; do
   case "$arg" in
+    --preflight|--enable-preflight) CHECK_PREFLIGHT=1 ;;
     --sanhedrin|--enable-sanhedrin) CHECK_SANHEDRIN=1 ;;
     -h|--help)
       cat <<'EOF'
-Usage: scripts/check-sandwich-prereqs.sh [--sanhedrin]
+Usage: scripts/check-sandwich-prereqs.sh [--preflight] [--sanhedrin]
 
-Without flags, checks the default Cognitive Sandwich preflight hooks.
-With --sanhedrin, also checks the optional OpenAI-compatible verifier endpoint.
+Without flags, verifies that the default install has no Vestige hooks wired.
+With --preflight, checks the optional UserPromptSubmit hook layer.
+With --sanhedrin, checks the optional OpenAI-compatible verifier endpoint.
 EOF
       exit 0
       ;;
@@ -64,31 +67,40 @@ fi
 
 # CLI tools
 command -v jq            >/dev/null && ok "jq"            || miss "jq missing — brew install jq"
-command -v claude        >/dev/null && ok "claude CLI"    || miss "claude CLI — install Claude Code"
-command -v vestige-mcp   >/dev/null && ok "vestige-mcp"   || miss "vestige-mcp — cargo install vestige-mcp"
+if [ "$CHECK_PREFLIGHT" -eq 1 ]; then
+  command -v claude        >/dev/null && ok "claude CLI"    || miss "claude CLI — install Claude Code"
+  command -v vestige-mcp   >/dev/null && ok "vestige-mcp"   || miss "vestige-mcp — cargo install vestige-mcp"
 
-# Vestige MCP HTTP API
-if curl -fsS -m 2 "http://127.0.0.1:${DASHBOARD_PORT}/api/health" >/dev/null 2>&1; then
-  ok "vestige-mcp dashboard responding on :$DASHBOARD_PORT"
-else
-  warn "vestige-mcp dashboard not responding on :$DASHBOARD_PORT"
+  # Vestige MCP HTTP API
+  if curl -fsS -m 2 "http://127.0.0.1:${DASHBOARD_PORT}/api/health" >/dev/null 2>&1; then
+    ok "vestige-mcp dashboard responding on :$DASHBOARD_PORT"
+  else
+    warn "vestige-mcp dashboard not responding on :$DASHBOARD_PORT"
+  fi
 fi
 
 # Settings hook wiring
-if [ -f "$HOME/.claude/settings.json" ] && \
-   jq -e '.hooks.UserPromptSubmit' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
-  ok "settings.json UserPromptSubmit hooks present"
-else
-  warn "settings.json missing UserPromptSubmit hooks — run: install-sandwich.sh"
+if [ "$CHECK_PREFLIGHT" -eq 0 ] && [ "$CHECK_SANHEDRIN" -eq 0 ]; then
+  if [ -f "$HOME/.claude/settings.json" ] && \
+     jq -e 'any((.hooks.UserPromptSubmit[]?.hooks[]?, .hooks.Stop[]?.hooks[]?); ((.command? // "") | test("synthesis-preflight\\.sh|cwd-state-injector\\.sh|vestige-pulse-daemon\\.sh|preflight-swarm\\.sh|load-all-memory\\.sh|veto-detector\\.sh|sanhedrin\\.sh|synthesis-stop-validator\\.sh|synthesis-gate\\.sh")))' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+    warn "Vestige hooks are still wired; run: install-sandwich.sh --force"
+  else
+    ok "no Vestige Claude Code hooks wired by default"
+  fi
 fi
 
-if [ "$CHECK_SANHEDRIN" -eq 0 ]; then
+if [ "$CHECK_PREFLIGHT" -eq 1 ]; then
+  echo
+  echo "Optional Preflight"
+
   if [ -f "$HOME/.claude/settings.json" ] && \
-     jq -e 'any(.hooks.Stop[]?.hooks[]?; ((.command? // "") | contains("/.claude/hooks/veto-detector.sh") or contains("/.claude/hooks/sanhedrin.sh") or contains("/.claude/hooks/synthesis-stop-validator.sh")))' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
-    warn "Vestige Stop hooks are still wired; run: install-sandwich.sh --force"
+     jq -e 'any(.hooks.UserPromptSubmit[]?.hooks[]?; ((.command? // "") | contains("synthesis-preflight.sh"))) and any(.hooks.UserPromptSubmit[]?.hooks[]?; ((.command? // "") | contains("preflight-swarm.sh")))' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+    ok "preflight UserPromptSubmit hooks wired"
   else
-    ok "no Vestige Stop hooks wired by default"
+    warn "preflight hooks not wired — run: install-sandwich.sh --enable-preflight"
   fi
+
+  info "preflight-swarm.sh uses claude -p with Haiku when enabled; default installs do not wire it."
 fi
 
 if [ "$CHECK_SANHEDRIN" -eq 1 ]; then
@@ -143,7 +155,7 @@ fi
 
 echo
 if [ $FAIL -eq 0 ]; then
-  echo "  Ready. Default preflight hooks will fire on next Claude Code prompt; no Vestige Stop hooks are wired."
+  echo "  Ready. Default install has no Vestige Claude Code hooks wired and makes no automatic model calls."
   exit 0
 else
   echo "  Fix the items above, then re-run."

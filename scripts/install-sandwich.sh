@@ -4,15 +4,15 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/v2.1.0/scripts/install-sandwich.sh | sh
 #   # or, from a checkout:
-#   ./scripts/install-sandwich.sh [--force] [--enable-sanhedrin] [--with-launchd] [--include-memory-loader]
+#   ./scripts/install-sandwich.sh [--force] [--enable-preflight] [--enable-sanhedrin] [--with-launchd] [--include-memory-loader]
 #   ./scripts/install-sandwich.sh --enable-sanhedrin --sanhedrin-endpoint=http://127.0.0.1:11434/v1/chat/completions --sanhedrin-model=qwen2.5:14b
 #
 # What it does:
 #   1. Verifies required local tools
 #   2. Stages ~/.claude/hooks/ and ~/.claude/agents/
 #   3. Copies sanitized hooks + agents
-#   4. Merges the default UserPromptSubmit hooks into ~/.claude/settings.json
-#   5. Optionally enables Sanhedrin and, only with --with-launchd on Apple Silicon,
+#   4. Removes old Vestige hook wiring from ~/.claude/settings.json by default
+#   5. Optionally enables preflight hooks and/or Sanhedrin. Only with --with-launchd on Apple Silicon,
 #      auto-starts mlx_lm.server with Qwen3.6-35B-A3B
 
 set -euo pipefail
@@ -31,6 +31,7 @@ LAUNCHD_DIR="$HOME/Library/LaunchAgents"
 SETTINGS="$HOME/.claude/settings.json"
 
 FORCE=0
+ENABLE_PREFLIGHT=0
 ENABLE_SANHEDRIN=0
 WITH_LAUNCHD=0
 INCLUDE_MEMORY_LOADER=0
@@ -39,6 +40,8 @@ SRC=""
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
+    --enable-preflight) ENABLE_PREFLIGHT=1 ;;
+    --enable-sandwich) ENABLE_PREFLIGHT=1; ENABLE_SANHEDRIN=1 ;;
     --enable-sanhedrin) ENABLE_SANHEDRIN=1 ;;
     --with-launchd) WITH_LAUNCHD=1 ;;
     --no-launchd) WITH_LAUNCHD=0 ;;
@@ -83,8 +86,10 @@ fi
 # --- Prereqs (warnings only, install proceeds) ---
 command -v jq      >/dev/null || die "jq required: brew install jq"
 command -v python3 >/dev/null || die "python3 required (3.10+)"
-command -v claude  >/dev/null || warn "'claude' CLI not found — install Claude Code first."
-command -v vestige-mcp >/dev/null || warn "'vestige-mcp' not found — install with: cargo install vestige-mcp"
+if [ "$ENABLE_PREFLIGHT" -eq 1 ]; then
+  command -v claude  >/dev/null || warn "'claude' CLI not found — preflight-swarm.sh will fail open."
+  command -v vestige-mcp >/dev/null || warn "'vestige-mcp' not found — Vestige preflight hooks will fail open."
+fi
 if [ "$WITH_LAUNCHD" -eq 1 ]; then
   command -v uv      >/dev/null || warn "'uv' not found — install with: brew install uv"
   command -v mlx_lm.server >/dev/null || warn "mlx-lm not installed — run: uv tool install mlx-lm"
@@ -191,51 +196,72 @@ else
   cp "$SETTINGS" "$HOME/.claude/settings.json.bak.pre-sandwich"
 fi
 TMP_MERGE="$(mktemp)"
-SETTINGS_FRAGMENT="$SCRIPT_DIR/hooks/settings.fragment.json"
-if [ "$ENABLE_SANHEDRIN" -eq 1 ]; then
-  SETTINGS_FRAGMENT="$SCRIPT_DIR/hooks/settings.sanhedrin.fragment.json"
+PREFLIGHT_FRAGMENT="$SCRIPT_DIR/hooks/settings.fragment.json"
+SANHEDRIN_FRAGMENT="$SCRIPT_DIR/hooks/settings.fragment.json"
+if [ "$ENABLE_PREFLIGHT" -eq 1 ]; then
+  PREFLIGHT_FRAGMENT="$SCRIPT_DIR/hooks/settings.preflight.fragment.json"
 fi
-jq -s --arg enable_sanhedrin "$ENABLE_SANHEDRIN" '
-  def is_vestige_stop:
-    (.command? // "") as $cmd
-    | ($cmd | contains("/.claude/hooks/veto-detector.sh"))
-      or ($cmd | contains("/.claude/hooks/sanhedrin.sh"))
-      or ($cmd | contains("/.claude/hooks/synthesis-stop-validator.sh"));
-
-  .[0] * .[1]
-  | if $enable_sanhedrin == "1" then
-      .
-    else
-      .hooks.Stop = (
-        (.hooks.Stop // [])
-        | map(.hooks = ((.hooks // []) | map(select((is_vestige_stop | not)))))
-        | map(select(((.hooks // []) | length) > 0))
-      )
-      | if ((.hooks.Stop // []) | length) == 0 then del(.hooks.Stop) else . end
-    end
-' "$SETTINGS" "$SETTINGS_FRAGMENT" > "$TMP_MERGE"
-mv "$TMP_MERGE" "$SETTINGS"
 if [ "$ENABLE_SANHEDRIN" -eq 1 ]; then
-  say "merged hooks block into $SETTINGS with Sanhedrin Stop hook enabled (backup at .bak.pre-sandwich)"
+  SANHEDRIN_FRAGMENT="$SCRIPT_DIR/hooks/settings.sanhedrin.fragment.json"
+fi
+jq -s '
+  def is_vestige_hook:
+    (.command? // "") as $cmd
+    | [
+        "synthesis-preflight.sh",
+        "cwd-state-injector.sh",
+        "vestige-pulse-daemon.sh",
+        "preflight-swarm.sh",
+        "load-all-memory.sh",
+        "veto-detector.sh",
+        "sanhedrin.sh",
+        "synthesis-stop-validator.sh",
+        "synthesis-gate.sh"
+      ] | any(. as $needle | $cmd | contains($needle));
+
+  def scrub_vestige_hooks:
+    .hooks.UserPromptSubmit = (
+      (.hooks.UserPromptSubmit // [])
+      | map(.hooks = ((.hooks // []) | map(select((is_vestige_hook | not)))))
+      | map(select(((.hooks // []) | length) > 0))
+    )
+    | if ((.hooks.UserPromptSubmit // []) | length) == 0 then del(.hooks.UserPromptSubmit) else . end
+    | .hooks.Stop = (
+      (.hooks.Stop // [])
+      | map(.hooks = ((.hooks // []) | map(select((is_vestige_hook | not)))))
+      | map(select(((.hooks // []) | length) > 0))
+    )
+    | if ((.hooks.Stop // []) | length) == 0 then del(.hooks.Stop) else . end
+    | if ((.hooks // {}) | length) == 0 then del(.hooks) else . end;
+
+  (.[0] | scrub_vestige_hooks) * .[1] * .[2]
+' "$SETTINGS" "$PREFLIGHT_FRAGMENT" "$SANHEDRIN_FRAGMENT" > "$TMP_MERGE"
+mv "$TMP_MERGE" "$SETTINGS"
+if [ "$ENABLE_PREFLIGHT" -eq 1 ] || [ "$ENABLE_SANHEDRIN" -eq 1 ]; then
+  enabled_layers=""
+  [ "$ENABLE_PREFLIGHT" -eq 1 ] && enabled_layers="${enabled_layers} preflight"
+  [ "$ENABLE_SANHEDRIN" -eq 1 ] && enabled_layers="${enabled_layers} sanhedrin"
+  say "merged optional hook layer(s) into $SETTINGS:${enabled_layers} (backup at .bak.pre-sandwich)"
 else
-  say "merged default preflight hooks into $SETTINGS; no Vestige Stop hooks are installed (backup at .bak.pre-sandwich)"
+  say "removed Vestige hook wiring from $SETTINGS; default install activates no Claude Code hooks (backup at .bak.pre-sandwich)"
 fi
 
 # --- Next steps ---
 cat <<EOF
 
   ┌──────────────────────────────────────────────────────────────┐
-  │  Cognitive Sandwich preflight hooks installed.                 │
+  │  Cognitive Sandwich files installed. No hooks enabled by default. │
   └──────────────────────────────────────────────────────────────┘
 
   Next steps:
-    1. Restart Claude Code so it picks up the new hooks.
-       Default installs include no Vestige Stop hooks.
+    1. Restart Claude Code if you enabled optional hooks.
+       Default installs activate no Vestige Claude Code hooks and make no model calls.
     2. Verify the install:
          vestige health                 # if vestige CLI installed
          curl http://127.0.0.1:$DASHBOARD_PORT/api/health
          scripts/check-sandwich-prereqs.sh   # from a checkout
-    3. Optional Sanhedrin verifier:
+    3. Optional hook layers:
+         ./scripts/install-sandwich.sh --enable-preflight
          ./scripts/install-sandwich.sh --enable-sanhedrin --sanhedrin-endpoint=$SANHEDRIN_ENDPOINT --sanhedrin-model=$MODEL_ID
        On Apple Silicon with >20 GB free RAM, add --with-launchd to auto-start
        the local MLX Qwen server. On x86, point --sanhedrin-endpoint at vLLM,

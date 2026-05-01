@@ -2,7 +2,7 @@
 
 **Vestige's defense-in-depth safety architecture for Claude Code.**
 
-The default Cognitive Sandwich installs the preflight layer only. The Stop-hook layer is explicit opt-in:
+The default Cognitive Sandwich installer only stages files and removes old v2.1.0 hook wiring. It activates no Claude Code hooks and makes no automatic model calls. Both the preflight layer and the Stop-hook layer are explicit opt-ins:
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -21,14 +21,14 @@ The default Cognitive Sandwich installs the preflight layer only. The Stop-hook 
 └────────────────────────────────────────────────┘
 ```
 
-Sanhedrin and all Vestige Stop hooks are optional. The default installer wires UserPromptSubmit preflight hooks only; it does not install any Vestige Stop hook, start MLX, require a 19 GB model download, or require 20+ GB of RAM. Users who want the post-response verifier can opt in and point it at any OpenAI-compatible `/v1/chat/completions` endpoint. On Apple Silicon, an additional `--with-launchd` flag can auto-start the local MLX Qwen backend.
+Sanhedrin, preflight, and all Vestige Claude Code hooks are optional. The default installer wires none of them; it does not call Claude, start MLX, require a 19 GB model download, or require 20+ GB of RAM. Users who want preflight context can opt in with `--enable-preflight`. Users who want the post-response verifier can opt in with `--enable-sanhedrin` and point it at any OpenAI-compatible `/v1/chat/completions` endpoint. On Apple Silicon, an additional `--with-launchd` flag can auto-start the local MLX Qwen backend.
 
 ---
 
 ## How a single response flows through the Sandwich
 
 1. **You type a prompt in Claude Code.**
-2. **UserPromptSubmit hooks fire in parallel** (none can block — all fail-open):
+2. **If explicitly enabled, UserPromptSubmit hooks fire in parallel** (none can block — all fail-open):
    - `load-all-memory.sh` (opt-in) — dumps every memory MD into context
    - `synthesis-preflight.sh` — POSTs your prompt to `vestige-mcp` `/api/deep_reference`, injects the trust-scored reasoning chain
    - `cwd-state-injector.sh` — captures git status, branch, open PRs/issues, modified files
@@ -81,7 +81,18 @@ curl -fsSL https://raw.githubusercontent.com/samvallad33/vestige/v2.1.0/scripts/
 git clone https://github.com/samvallad33/vestige
 cd vestige
 ./scripts/install-sandwich.sh           # add --force to overwrite existing hooks
-./scripts/check-sandwich-prereqs.sh     # verify everything's wired
+./scripts/check-sandwich-prereqs.sh     # verify no Vestige hooks are wired by default
+```
+
+The default command does not activate any Claude Code hook. It removes old v2.1.0 Vestige hook wiring from `~/.claude/settings.json` while preserving unrelated user hooks.
+
+### Optional Preflight
+
+Preflight is a separate opt-in layer. It includes `preflight-swarm.sh`, which uses `claude -p --model claude-haiku-4-5-20251001`; it is not wired by default.
+
+```bash
+./scripts/install-sandwich.sh --enable-preflight
+./scripts/check-sandwich-prereqs.sh --preflight
 ```
 
 ### Optional Sanhedrin
@@ -125,9 +136,10 @@ Optional Apple Silicon local Sanhedrin backend:
 
 1. Verifies prereqs (warnings for missing tools, fatal only on jq/python3).
 2. Copies hooks to `~/.claude/hooks/`, agents to `~/.claude/agents/`.
-3. Backs up existing `~/.claude/settings.json` to `.bak.pre-sandwich`, then `jq`-merges the default UserPromptSubmit hooks block and removes old Vestige Stop hooks from previous v2.1.0 installs.
-4. With `--enable-sanhedrin`, writes `~/.claude/hooks/vestige-sanhedrin.env` and merges a Sanhedrin-enabled hooks block.
-5. With `--enable-sanhedrin --with-launchd` on Apple Silicon, renders and loads `launchd/com.vestige.mlx-server.plist.template`.
+3. Backs up existing `~/.claude/settings.json` to `.bak.pre-sandwich`, then removes old Vestige hook wiring from previous v2.1.0 installs.
+4. With `--enable-preflight`, merges the UserPromptSubmit hooks block.
+5. With `--enable-sanhedrin`, writes `~/.claude/hooks/vestige-sanhedrin.env` and merges a Sanhedrin-enabled Stop hooks block.
+6. With `--enable-sanhedrin --with-launchd` on Apple Silicon, renders and loads `launchd/com.vestige.mlx-server.plist.template`.
 
 ### Uninstall
 
@@ -179,7 +191,7 @@ Full architecture memory: search Vestige for `god-tier-plan` or `cognitive-sandw
 The base hook harness runs on x86. The launchd MLX helper is macOS-arm64-only.
 
 On Linux, Windows under WSL, or Intel Mac:
-- Run `scripts/install-sandwich.sh` normally for default preflight hooks with no Vestige Stop hooks.
+- Run `scripts/install-sandwich.sh` normally to stage files and remove old Vestige hook wiring. No hooks are activated.
 - If you want Sanhedrin, run an OpenAI-compatible endpoint such as vLLM, Ollama, llama.cpp server, or a remote MLX/vLLM box.
 - Install with `--enable-sanhedrin --sanhedrin-endpoint=<url> --sanhedrin-model=<model>`.
 - If the endpoint is unreachable, Sanhedrin fails open and does not block Claude Code.

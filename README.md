@@ -22,10 +22,10 @@ Built on 130 years of memory research — FSRS-6 spaced repetition, prediction e
 
 ## What's New in v2.1.0 "Cognitive Sandwich Goes Local"
 
-v2.1.0 adds an opt-in Claude Code hook harness around the existing Vestige MCP server. The MCP tool surface and database schema stay backward compatible, while the new local Sanhedrin verifier and preflight hooks can inject trusted memory context before Claude answers and check drafts against high-trust Vestige evidence before delivery.
+v2.1.0 adds an opt-in Claude Code hook harness around the existing Vestige MCP server. The MCP tool surface and database schema stay backward compatible, while optional preflight hooks can inject trusted memory context before Claude answers and optional Sanhedrin hooks can check drafts against high-trust Vestige evidence before delivery.
 
-- **Local Sanhedrin Executioner.** The post-response verifier now runs through `mlx_lm.server` with `mlx-community/Qwen3.6-35B-A3B-4bit` by default, so the veto layer can run offline on Apple Silicon without Anthropic API calls.
-- **One-command Cognitive Sandwich installer.** `scripts/install-sandwich.sh` stages hooks, agents, and a launchd plist, merges the Claude Code hooks block, and prints real verification commands.
+- **Optional Sanhedrin Executioner.** The post-response verifier can run through `mlx_lm.server` with `mlx-community/Qwen3.6-35B-A3B-4bit` on Apple Silicon, or through any OpenAI-compatible endpoint on x86, but it is never enabled by default.
+- **One-command Cognitive Sandwich installer.** `scripts/install-sandwich.sh` stages hook files and agents, removes old v2.1.0 hook wiring by default, and only activates Claude Code hooks with explicit `--enable-preflight`, `--enable-sanhedrin`, or `--enable-sandwich`.
 - **Pulse hook backed by `/api/changelog`.** Fresh dream and connection events can be injected into the next Claude Code prompt context without blocking the prompt.
 - **`VESTIGE_DATA_DIR` support.** `--data-dir` now has an env-var fallback, tilde expansion, secure directory creation, and clear precedence docs.
 - **NPM release wrapper fixed.** `vestige-mcp-server@2.1.0` now downloads binaries from the matching `v2.1.0` GitHub release tag instead of an old hardcoded release.

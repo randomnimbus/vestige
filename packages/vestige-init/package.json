@@ -1,6 +1,6 @@
 {
   "name": "@vestige/init",
-  "version": "2.1.0",
+  "version": "2.1.2",
   "description": "Give your AI a brain in 10 seconds — zero-config Vestige installer with 3D dashboard",
   "bin": {
     "vestige-init": "bin/init.js"

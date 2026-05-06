@@ -64,6 +64,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "v2.1.1 Sync: tombstones for merge-capable portable storage",
         up: MIGRATION_V12_UP,
     },
+    Migration {
+        version: 13,
+        description: "v2.1.2 Honest Memory: non-content purge tombstones",
+        up: MIGRATION_V13_UP,
+    },
 ];
 
 /// A database migration
@@ -706,6 +711,30 @@ ON sync_tombstones(deleted_at);
 UPDATE schema_version SET version = 12, applied_at = datetime('now');
 "#;
 
+/// V13: non-content purge tombstones.
+///
+/// `memory(action="purge")` permanently removes memory content and embeddings,
+/// but keeps a content-free audit/sync record so users can verify that a memory
+/// was removed without Vestige retaining the text it was told to forget.
+const MIGRATION_V13_UP: &str = r#"
+CREATE TABLE IF NOT EXISTS deletion_tombstones (
+    memory_id TEXT PRIMARY KEY,
+    deleted_at TEXT NOT NULL,
+    reason TEXT,
+    node_type TEXT NOT NULL,
+    tags TEXT NOT NULL DEFAULT '[]',
+    edges_pruned INTEGER NOT NULL DEFAULT 0,
+    insights_rewritten INTEGER NOT NULL DEFAULT 0,
+    insights_deleted INTEGER NOT NULL DEFAULT 0,
+    children_orphaned INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_deletion_tombstones_deleted_at
+ON deletion_tombstones(deleted_at);
+
+UPDATE schema_version SET version = 13, applied_at = datetime('now');
+"#;
+
 /// Get current schema version from database
 pub fn get_current_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
     conn.query_row(
@@ -755,17 +784,17 @@ mod tests {
     /// version after `apply_migrations` runs all migrations end-to-end, and
     /// neither of the dead tables V11 drops must exist afterwards.
     #[test]
-    fn test_apply_migrations_advances_to_v12_and_drops_dead_tables() {
+    fn test_apply_migrations_advances_to_v13_and_drops_dead_tables() {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
 
         // Pre-requisite: schema_version must be bootstrapped by V1.
         apply_migrations(&conn).expect("apply_migrations succeeds");
 
-        // 1. schema_version advanced to V12
+        // 1. schema_version advanced to V13
         let version = get_current_version(&conn).expect("read schema_version");
         assert_eq!(
-            version, 12,
-            "schema_version must be 12 after all migrations"
+            version, 13,
+            "schema_version must be 13 after all migrations"
         );
 
         // 2. knowledge_edges is gone (V11 drops it)
@@ -806,6 +835,19 @@ mod tests {
             sync_tombstone_rows, 1,
             "sync_tombstones table must be created by V12"
         );
+
+        // 5. deletion_tombstones exists (V13 creates it)
+        let deletion_tombstone_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='deletion_tombstones'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(
+            deletion_tombstone_rows, 1,
+            "deletion_tombstones table must be created by V13"
+        );
     }
 
     /// V11 must be idempotent on replay — if the tables were already dropped
@@ -827,6 +869,6 @@ mod tests {
         apply_migrations(&conn).expect("V11 replay must be idempotent");
 
         let version = get_current_version(&conn).expect("read schema_version");
-        assert_eq!(version, 12, "schema_version back at 12 after replay");
+        assert_eq!(version, 13, "schema_version back at 13 after replay");
     }
 }

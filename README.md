@@ -20,6 +20,16 @@ Built on 130 years of memory research — FSRS-6 spaced repetition, prediction e
 
 ---
 
+## What's New in v2.1.2 "Honest Memory"
+
+v2.1.2 makes Vestige easier to trust in everyday work: literal lookups stay literal, purge really removes content, contradictions are inspectable, and updates no longer require a curl reinstall flow.
+
+- **Concrete search mode.** Quoted strings, env vars, UUIDs, paths, and code identifiers now take a keyword/literal path that skips HyDE, semantic fusion, FSRS reweighting, competition, and spreading activation. Exact things like `OPENAI_API_KEY`, `mlx_lm.server`, and migration IDs land first.
+- **Irreversible purge.** `memory(action="purge", confirm=true)` permanently removes memory content and embeddings, scrubs insight JSON references, detaches temporal-summary children, prunes graph edges, and keeps only a non-content deletion tombstone for sync/audit.
+- **First-class contradiction inspection.** New `contradictions` MCP tool surfaces trust-weighted disagreements directly instead of hiding them inside `deep_reference`.
+- **Simple update flow.** `vestige update` and `vestige sandwich install` refresh binaries and companion files without making users paste curl commands.
+- **Pro waitlist preview.** `/dashboard/waitlist` adds a local-first Solo Pro and Team Pro early-access surface. `VITE_WAITLIST_ENDPOINT` and `VITE_SUPPORT_BOT_ENDPOINT` are opt-in dashboard env vars, so no signup data is captured unless endpoints are configured.
+
 ## What's New in v2.1.1 "Portable Sync"
 
 v2.1.1 focuses on the biggest post-launch ask: move memories between machines without losing cognitive state. It also adds opt-in Qwen3 embeddings for higher-recall local retrieval.
@@ -83,7 +93,7 @@ v2.0.6 is a polish release that makes the existing cognitive stack finally *feel
 
 Ebbinghaus 1885 models what happens to memories you don't touch. Anderson 2025 models what happens when you actively want to stop thinking about one. Every other AI memory system implements the first. Vestige is the first to ship the second.
 
-Based on [Anderson et al. 2025](https://www.nature.com/articles/s41583-025-00929-y) (Suppression-Induced Forgetting, *Nat Rev Neurosci*) and [Cervantes-Sandoval et al. 2020](https://pmc.ncbi.nlm.nih.gov/articles/PMC7477079/) (Rac1 synaptic cascade). **24 tools · 30 cognitive modules · 1,223 tests.**
+Based on [Anderson et al. 2025](https://www.nature.com/articles/s41583-025-00929-y) (Suppression-Induced Forgetting, *Nat Rev Neurosci*) and [Cervantes-Sandoval et al. 2020](https://pmc.ncbi.nlm.nih.gov/articles/PMC7477079/) (Rac1 synaptic cascade).
 
 <details>
 <summary>Earlier releases (v2.0 "Cognitive Leap" → v2.0.4 "Deep Reference")</summary>
@@ -241,7 +251,7 @@ Run `vestige dashboard` to open `http://localhost:3927/dashboard`, or set `VESTI
 │  15 REST endpoints · WS event broadcast              │
 ├─────────────────────────────────────────────────────┤
 │  MCP Server (stdio JSON-RPC)                         │
-│  24 tools · 30 cognitive modules                     │
+│  25 tools · 30 cognitive modules                     │
 ├─────────────────────────────────────────────────────┤
 │  Cognitive Engine                                    │
 │  ┌──────────┐ ┌──────────┐ ┌───────────────┐       │
@@ -308,7 +318,7 @@ This isn't a key-value store with an embedding model bolted on. Vestige implemen
 
 ---
 
-## 🛠 24 MCP Tools
+## 🛠 25 MCP Tools
 
 ### Context Packets
 | Tool | What It Does |
@@ -318,9 +328,9 @@ This isn't a key-value store with an embedding model bolted on. Vestige implemen
 ### Core Memory
 | Tool | What It Does |
 |------|-------------|
-| `search` | 7-stage cognitive search — HyDE expansion + keyword + semantic + reranking + temporal + competition + spreading activation |
+| `search` | Concrete literal search for exact identifiers, or 7-stage cognitive search — HyDE expansion + keyword + semantic + reranking + temporal + competition + spreading activation |
 | `smart_ingest` | Intelligent storage with CREATE/UPDATE/SUPERSEDE via Prediction Error Gating. Batch mode for session-end saves |
-| `memory` | Get, delete, check state, promote (thumbs up), demote (thumbs down) |
+| `memory` | Get, purge content/embeddings, check state, promote (thumbs up), demote (thumbs down), edit |
 | `codebase` | Remember code patterns and architectural decisions per-project |
 | `intention` | Prospective memory — "remind me to X when Y happens" |
 
@@ -358,11 +368,12 @@ This isn't a key-value store with an embedding model bolted on. Vestige implemen
 |------|-------------|
 | `deep_reference` | **Cognitive reasoning across memories.** 8-stage pipeline: FSRS-6 trust scoring, intent classification, spreading activation, temporal supersession, contradiction analysis, relation assessment, dream insight integration, and algorithmic reasoning chain generation. Returns trust-scored evidence with a pre-built reasoning scaffold. |
 | `cross_reference` | Backward-compatible alias for `deep_reference`. |
+| `contradictions` | **Honest memory inspection.** Scans a topic or recent memories for trust-weighted disagreements using the same local contradiction logic as `deep_reference`. |
 
 ### Active Forgetting (v2.0.5)
 | Tool | What It Does |
 |------|-------------|
-| `suppress` | **Top-down active forgetting** — neuroscience-grounded inhibitory control over retrieval. Distinct from `memory.delete` (destroys the row) and `memory.demote` (one-shot ranking hit). Each call **compounds** a retrieval-score penalty (Anderson 2025 SIF), and a background Rac1 cascade worker fades co-activated neighbors over 72h (Davis 2020). Reversible within a 24-hour labile window via `reverse: true`. **The memory persists** — it is inhibited, not erased. |
+| `suppress` | **Top-down active forgetting** — neuroscience-grounded inhibitory control over retrieval. Distinct from `memory(action="purge")`, which permanently removes content/embeddings. Each suppression compounds a retrieval-score penalty (Anderson 2025 SIF), and a background Rac1 cascade worker fades co-activated neighbors over 72h (Davis 2020). Reversible within a 24-hour labile window via `reverse: true`. **The memory persists** — it is inhibited, not erased. |
 
 ---
 

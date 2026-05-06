@@ -68,12 +68,12 @@
 
 		const projects = [
 			'vestige',
-			'nullgaze',
-			'injeranet',
-			'nemotron',
-			'orbit-wars',
-			'nightvision',
-			'aimo3'
+			'api-gateway',
+			'desktop-app',
+			'model-runner',
+			'game-sim',
+			'security-dashboard',
+			'benchmark-suite'
 		];
 
 		const patterns: Pattern[] = [
@@ -82,7 +82,7 @@
 				name: 'Result<T, E> with thiserror context',
 				category: 'ErrorHandling',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze', 'injeranet', 'nemotron', 'nightvision'],
+				transferred_to: ['api-gateway', 'desktop-app', 'model-runner', 'security-dashboard'],
 				transfer_count: 4,
 				last_used: '2026-04-18T14:22:00Z',
 				confidence: 0.94
@@ -90,8 +90,8 @@
 			{
 				name: 'Axum error middleware with tower-http',
 				category: 'ErrorHandling',
-				origin_project: 'nullgaze',
-				transferred_to: ['vestige', 'nightvision'],
+				origin_project: 'api-gateway',
+				transferred_to: ['vestige', 'security-dashboard'],
 				transfer_count: 2,
 				last_used: '2026-04-17T09:10:00Z',
 				confidence: 0.88
@@ -100,7 +100,7 @@
 				name: 'Graceful shutdown on SIGINT/SIGTERM',
 				category: 'ErrorHandling',
 				origin_project: 'vestige',
-				transferred_to: ['vestige', 'injeranet', 'nightvision'],
+				transferred_to: ['vestige', 'desktop-app', 'security-dashboard'],
 				transfer_count: 3,
 				last_used: '2026-04-15T22:01:00Z',
 				confidence: 0.82
@@ -108,8 +108,8 @@
 			{
 				name: 'Python try/except with contextual re-raise',
 				category: 'ErrorHandling',
-				origin_project: 'aimo3',
-				transferred_to: ['nemotron'],
+				origin_project: 'benchmark-suite',
+				transferred_to: ['model-runner'],
 				transfer_count: 1,
 				last_used: '2026-04-10T11:30:00Z',
 				confidence: 0.7
@@ -120,7 +120,7 @@
 				name: 'Arc<Mutex<Connection>> reader/writer split',
 				category: 'AsyncConcurrency',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze', 'injeranet'],
+				transferred_to: ['api-gateway', 'desktop-app'],
 				transfer_count: 2,
 				last_used: '2026-04-14T16:42:00Z',
 				confidence: 0.91
@@ -128,8 +128,8 @@
 			{
 				name: 'tokio::select! for cancellation propagation',
 				category: 'AsyncConcurrency',
-				origin_project: 'injeranet',
-				transferred_to: ['vestige', 'nightvision'],
+				origin_project: 'desktop-app',
+				transferred_to: ['vestige', 'security-dashboard'],
 				transfer_count: 2,
 				last_used: '2026-04-19T08:05:00Z',
 				confidence: 0.86
@@ -137,8 +137,8 @@
 			{
 				name: 'Bounded mpsc channel with backpressure',
 				category: 'AsyncConcurrency',
-				origin_project: 'injeranet',
-				transferred_to: ['vestige', 'nullgaze'],
+				origin_project: 'desktop-app',
+				transferred_to: ['vestige', 'api-gateway'],
 				transfer_count: 2,
 				last_used: '2026-04-12T13:18:00Z',
 				confidence: 0.83
@@ -146,8 +146,8 @@
 			{
 				name: 'asyncio.gather with return_exceptions',
 				category: 'AsyncConcurrency',
-				origin_project: 'nemotron',
-				transferred_to: ['aimo3'],
+				origin_project: 'model-runner',
+				transferred_to: ['benchmark-suite'],
 				transfer_count: 1,
 				last_used: '2026-04-08T20:45:00Z',
 				confidence: 0.72
@@ -158,7 +158,7 @@
 				name: 'Property-based tests with proptest',
 				category: 'Testing',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze', 'injeranet'],
+				transferred_to: ['api-gateway', 'desktop-app'],
 				transfer_count: 2,
 				last_used: '2026-04-11T10:22:00Z',
 				confidence: 0.89
@@ -166,7 +166,7 @@
 			{
 				name: 'Snapshot testing with insta',
 				category: 'Testing',
-				origin_project: 'nullgaze',
+				origin_project: 'api-gateway',
 				transferred_to: ['vestige'],
 				transfer_count: 1,
 				last_used: '2026-04-16T14:00:00Z',
@@ -176,7 +176,7 @@
 				name: 'Vitest + Playwright dashboard harness',
 				category: 'Testing',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze', 'injeranet'],
+				transferred_to: ['api-gateway', 'desktop-app'],
 				transfer_count: 2,
 				last_used: '2026-04-19T18:30:00Z',
 				confidence: 0.87
@@ -184,8 +184,8 @@
 			{
 				name: 'One-variable-at-a-time Kaggle submission',
 				category: 'Testing',
-				origin_project: 'aimo3',
-				transferred_to: ['nemotron', 'orbit-wars'],
+				origin_project: 'benchmark-suite',
+				transferred_to: ['model-runner', 'game-sim'],
 				transfer_count: 2,
 				last_used: '2026-04-20T07:15:00Z',
 				confidence: 0.95
@@ -193,8 +193,8 @@
 			{
 				name: 'Kaggle pre-flight Input-panel screenshot',
 				category: 'Testing',
-				origin_project: 'aimo3',
-				transferred_to: ['nemotron', 'orbit-wars'],
+				origin_project: 'benchmark-suite',
+				transferred_to: ['model-runner', 'game-sim'],
 				transfer_count: 2,
 				last_used: '2026-04-20T06:50:00Z',
 				confidence: 0.98
@@ -205,7 +205,7 @@
 				name: 'SvelteKit 2 + Svelte 5 runes dashboard',
 				category: 'Architecture',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze', 'nightvision'],
+				transferred_to: ['api-gateway', 'security-dashboard'],
 				transfer_count: 2,
 				last_used: '2026-04-19T12:10:00Z',
 				confidence: 0.92
@@ -214,7 +214,7 @@
 				name: 'glass-panel + cosmic-dark design system',
 				category: 'Architecture',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze', 'nightvision', 'injeranet'],
+				transferred_to: ['api-gateway', 'security-dashboard', 'desktop-app'],
 				transfer_count: 3,
 				last_used: '2026-04-20T09:00:00Z',
 				confidence: 0.9
@@ -222,8 +222,8 @@
 			{
 				name: 'Tauri 2 + Rust/Axum sidecar',
 				category: 'Architecture',
-				origin_project: 'injeranet',
-				transferred_to: ['nightvision'],
+				origin_project: 'desktop-app',
+				transferred_to: ['security-dashboard'],
 				transfer_count: 1,
 				last_used: '2026-04-13T19:44:00Z',
 				confidence: 0.78
@@ -232,7 +232,7 @@
 				name: 'MCP server with 23 stateful tools',
 				category: 'Architecture',
 				origin_project: 'vestige',
-				transferred_to: ['injeranet'],
+				transferred_to: ['desktop-app'],
 				transfer_count: 1,
 				last_used: '2026-04-17T11:05:00Z',
 				confidence: 0.85
@@ -243,7 +243,7 @@
 				name: 'USearch HNSW index for vector search',
 				category: 'Performance',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze'],
+				transferred_to: ['api-gateway'],
 				transfer_count: 1,
 				last_used: '2026-04-09T15:20:00Z',
 				confidence: 0.88
@@ -252,7 +252,7 @@
 				name: 'SQLite WAL mode for concurrent reads',
 				category: 'Performance',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze', 'injeranet', 'nightvision'],
+				transferred_to: ['api-gateway', 'desktop-app', 'security-dashboard'],
 				transfer_count: 3,
 				last_used: '2026-04-18T21:33:00Z',
 				confidence: 0.93
@@ -260,8 +260,8 @@
 			{
 				name: 'vLLM prefix caching at 0.35 mem util',
 				category: 'Performance',
-				origin_project: 'aimo3',
-				transferred_to: ['nemotron'],
+				origin_project: 'benchmark-suite',
+				transferred_to: ['model-runner'],
 				transfer_count: 1,
 				last_used: '2026-04-11T08:00:00Z',
 				confidence: 0.84
@@ -270,7 +270,7 @@
 				name: 'Cross-encoder rerank at k=30',
 				category: 'Performance',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze'],
+				transferred_to: ['api-gateway'],
 				transfer_count: 1,
 				last_used: '2026-04-14T17:55:00Z',
 				confidence: 0.79
@@ -281,7 +281,7 @@
 				name: 'Rotated auth token in env var',
 				category: 'Security',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze', 'injeranet', 'nightvision'],
+				transferred_to: ['api-gateway', 'desktop-app', 'security-dashboard'],
 				transfer_count: 3,
 				last_used: '2026-04-16T20:12:00Z',
 				confidence: 0.96
@@ -290,7 +290,7 @@
 				name: 'Parameterized SQL via rusqlite params!',
 				category: 'Security',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze'],
+				transferred_to: ['api-gateway'],
 				transfer_count: 1,
 				last_used: '2026-04-10T13:40:00Z',
 				confidence: 0.89
@@ -298,8 +298,8 @@
 			{
 				name: '664-pattern secret scanner',
 				category: 'Security',
-				origin_project: 'nullgaze',
-				transferred_to: ['vestige', 'nightvision', 'injeranet'],
+				origin_project: 'api-gateway',
+				transferred_to: ['vestige', 'security-dashboard', 'desktop-app'],
 				transfer_count: 3,
 				last_used: '2026-04-20T05:30:00Z',
 				confidence: 0.97
@@ -307,8 +307,8 @@
 			{
 				name: 'CSP header with nonce-based script allow',
 				category: 'Security',
-				origin_project: 'nullgaze',
-				transferred_to: ['nightvision'],
+				origin_project: 'api-gateway',
+				transferred_to: ['security-dashboard'],
 				transfer_count: 1,
 				last_used: '2026-04-05T16:08:00Z',
 				confidence: 0.8

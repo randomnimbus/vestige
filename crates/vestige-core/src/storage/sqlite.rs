@@ -8,6 +8,7 @@ use directories::{BaseDirs, ProjectDirs};
 use lru::LruCache;
 use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use std::collections::HashMap;
 use std::io::Write;
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use std::num::NonZeroUsize;
@@ -199,6 +200,26 @@ pub struct PortableSyncReport {
     pub archive_format: String,
 }
 
+/// Report returned by an irreversible content purge.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeReport {
+    /// Memory ID requested for purge.
+    pub memory_id: String,
+    /// Whether a live memory row was found and removed.
+    pub deleted: bool,
+    /// Non-content tombstone timestamp.
+    pub deleted_at: DateTime<Utc>,
+    /// Number of graph edges removed by foreign-key cascade.
+    pub edges_pruned: i64,
+    /// Number of insight rows whose source list was rewritten.
+    pub insights_rewritten: i64,
+    /// Number of insight rows dropped because fewer than two source memories remained.
+    pub insights_deleted: i64,
+    /// Number of temporal-summary children detached from this parent.
+    pub children_orphaned: i64,
+}
+
 // ============================================================================
 // STORAGE
 // ============================================================================
@@ -219,6 +240,7 @@ const PORTABLE_TABLES: &[&str] = &[
     "dream_history",
     "retention_snapshots",
     "sync_tombstones",
+    "deletion_tombstones",
 ];
 
 const PORTABLE_USER_DATA_TABLES: &[&str] = &[
@@ -236,6 +258,7 @@ const PORTABLE_USER_DATA_TABLES: &[&str] = &[
     "dream_history",
     "retention_snapshots",
     "sync_tombstones",
+    "deletion_tombstones",
 ];
 
 const DATA_DIR_ENV: &str = "VESTIGE_DATA_DIR";
@@ -1814,6 +1837,129 @@ impl Storage {
         Ok(rows > 0)
     }
 
+    /// Permanently purge a memory's content and embeddings.
+    ///
+    /// Unlike `delete_node`, purge also scrubs non-FK JSON references in
+    /// `insights.source_memories`, detaches temporal-summary children, and
+    /// writes a content-free deletion tombstone for audit/sync.
+    pub fn purge_node(&self, id: &str, reason: Option<&str>) -> Result<PurgeReport> {
+        let deleted_at = Utc::now();
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        let tx = writer.transaction()?;
+
+        let node = tx
+            .prepare("SELECT * FROM knowledge_nodes WHERE id = ?1")?
+            .query_row(params![id], Self::row_to_node)
+            .optional()?;
+
+        let Some(node) = node else {
+            return Ok(PurgeReport {
+                memory_id: id.to_string(),
+                deleted: false,
+                deleted_at,
+                edges_pruned: 0,
+                insights_rewritten: 0,
+                insights_deleted: 0,
+                children_orphaned: 0,
+            });
+        };
+
+        let edges_pruned: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM memory_connections WHERE source_id = ?1 OR target_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+
+        let insight_refs: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, source_memories FROM insights WHERE source_memories LIKE ?1",
+            )?;
+            let pattern = format!("%{}%", id);
+            stmt.query_map(params![pattern], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|row| row.ok())
+                .collect()
+        };
+
+        let mut insights_rewritten = 0_i64;
+        let mut insights_deleted = 0_i64;
+        for (insight_id, source_json) in insight_refs {
+            let mut sources: Vec<String> = serde_json::from_str(&source_json).unwrap_or_default();
+            let before = sources.len();
+            sources.retain(|source_id| source_id != id);
+
+            if sources.len() == before {
+                continue;
+            }
+
+            if sources.len() < 2 {
+                insights_deleted +=
+                    tx.execute("DELETE FROM insights WHERE id = ?1", params![insight_id])? as i64;
+            } else {
+                let rewritten = serde_json::to_string(&sources).unwrap_or_else(|_| "[]".into());
+                insights_rewritten += tx.execute(
+                    "UPDATE insights SET source_memories = ?1 WHERE id = ?2",
+                    params![rewritten, insight_id],
+                )? as i64;
+            }
+        }
+
+        let children_orphaned = tx.execute(
+            "UPDATE knowledge_nodes SET summary_parent_id = NULL WHERE summary_parent_id = ?1",
+            params![id],
+        )? as i64;
+
+        let tags_json = serde_json::to_string(&node.tags).unwrap_or_else(|_| "[]".to_string());
+        tx.execute(
+            "INSERT INTO deletion_tombstones (
+                memory_id, deleted_at, reason, node_type, tags,
+                edges_pruned, insights_rewritten, insights_deleted, children_orphaned
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                deleted_at = excluded.deleted_at,
+                reason = excluded.reason,
+                node_type = excluded.node_type,
+                tags = excluded.tags,
+                edges_pruned = excluded.edges_pruned,
+                insights_rewritten = excluded.insights_rewritten,
+                insights_deleted = excluded.insights_deleted,
+                children_orphaned = excluded.children_orphaned",
+            params![
+                id,
+                deleted_at.to_rfc3339(),
+                reason,
+                node.node_type,
+                tags_json,
+                edges_pruned,
+                insights_rewritten,
+                insights_deleted,
+                children_orphaned,
+            ],
+        )?;
+
+        Self::record_sync_tombstone(&tx, "knowledge_nodes", id, "purge_node")?;
+        tx.execute("DELETE FROM knowledge_nodes WHERE id = ?1", params![id])?;
+        tx.commit()?;
+
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        if let Ok(mut index) = self.vector_index.lock() {
+            let _ = index.remove(id);
+        }
+
+        Ok(PurgeReport {
+            memory_id: id.to_string(),
+            deleted: true,
+            deleted_at,
+            edges_pruned,
+            insights_rewritten,
+            insights_deleted,
+            children_orphaned,
+        })
+    }
+
     fn node_exists(conn: &Connection, id: &str) -> Result<bool> {
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM knowledge_nodes WHERE id = ?1",
@@ -1895,6 +2041,202 @@ impl Storage {
             result.push(node?);
         }
         Ok(result)
+    }
+
+    /// Concrete keyword/literal search that skips semantic expansion and
+    /// cognitive reranking.
+    ///
+    /// This path is for identifiers, paths, quoted strings, env vars, UUIDs,
+    /// and other exact user intent where "close enough" is wrong.
+    pub fn concrete_search_filtered(
+        &self,
+        query: &str,
+        limit: i32,
+        include_types: Option<&[String]>,
+        exclude_types: Option<&[String]>,
+    ) -> Result<Vec<SearchResult>> {
+        let literal = Self::normalize_literal_query(query);
+        if literal.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let limit = limit.max(1) as usize;
+        let fetch_limit = ((limit * 10).min(500)) as i32;
+        let mut by_id: HashMap<String, SearchResult> = HashMap::new();
+
+        if let Some(terms) = crate::fts::sanitize_fts5_terms(&literal) {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            let mut stmt = reader.prepare(
+                "SELECT n.*, rank AS fts_rank FROM knowledge_nodes n
+                 JOIN knowledge_fts fts ON n.id = fts.id
+                 WHERE knowledge_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2",
+            )?;
+
+            let rows = stmt.query_map(params![terms, fetch_limit], |row| {
+                let node = Self::row_to_node(row)?;
+                let rank = row.get::<_, f64>("fts_rank").unwrap_or(0.0);
+                Ok((node, rank))
+            })?;
+
+            for (idx, row) in rows.enumerate() {
+                let (node, rank) = row?;
+                if !Self::node_matches_type_filters(&node, include_types, exclude_types) {
+                    continue;
+                }
+                let base_score = (1.0 / (idx as f32 + 1.0)).max((-rank as f32).max(0.0));
+                Self::upsert_concrete_result(&mut by_id, node, base_score, Some(base_score));
+            }
+        }
+
+        let escaped = Self::escape_like(&literal.to_lowercase());
+        let pattern = format!("%{}%", escaped);
+        let prefix_pattern = format!("{}%", escaped);
+        {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            let mut stmt = reader.prepare(
+                "SELECT n.* FROM knowledge_nodes n
+                 WHERE lower(n.id) = ?2
+                    OR lower(n.content) LIKE ?1 ESCAPE '\\'
+                    OR lower(COALESCE(n.source, '')) LIKE ?1 ESCAPE '\\'
+                    OR lower(n.tags) LIKE ?1 ESCAPE '\\'
+                 ORDER BY
+                    CASE
+                        WHEN lower(n.id) = ?2 THEN 0
+                        WHEN lower(n.content) = ?2 THEN 1
+                        WHEN lower(n.content) LIKE ?3 ESCAPE '\\' THEN 2
+                        ELSE 3
+                    END,
+                    n.updated_at DESC
+                 LIMIT ?4",
+            )?;
+
+            let rows = stmt.query_map(
+                params![pattern, literal.to_lowercase(), prefix_pattern, fetch_limit],
+                Self::row_to_node,
+            )?;
+
+            for row in rows {
+                let node = row?;
+                if !Self::node_matches_type_filters(&node, include_types, exclude_types) {
+                    continue;
+                }
+                if let Some(score) = Self::literal_match_score(&literal, &node) {
+                    Self::upsert_concrete_result(&mut by_id, node, score, Some(score));
+                }
+            }
+        }
+
+        let mut results: Vec<SearchResult> = by_id.into_values().collect();
+        results.sort_by(|a, b| {
+            b.combined_score
+                .partial_cmp(&a.combined_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.node.updated_at.cmp(&a.node.updated_at))
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    fn upsert_concrete_result(
+        by_id: &mut HashMap<String, SearchResult>,
+        node: KnowledgeNode,
+        score: f32,
+        keyword_score: Option<f32>,
+    ) {
+        by_id
+            .entry(node.id.clone())
+            .and_modify(|existing| {
+                existing.combined_score = existing.combined_score.max(score);
+                existing.keyword_score = match (existing.keyword_score, keyword_score) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (None, Some(b)) => Some(b),
+                    (a, None) => a,
+                };
+            })
+            .or_insert(SearchResult {
+                node,
+                keyword_score,
+                semantic_score: None,
+                combined_score: score,
+                match_type: MatchType::Keyword,
+            });
+    }
+
+    fn normalize_literal_query(query: &str) -> String {
+        let trimmed = query.trim();
+        if trimmed.len() >= 2 {
+            let bytes = trimmed.as_bytes();
+            let quoted = (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+                || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'');
+            if quoted {
+                return trimmed[1..trimmed.len() - 1].trim().to_string();
+            }
+        }
+        trimmed.to_string()
+    }
+
+    fn escape_like(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for ch in value.chars() {
+            match ch {
+                '\\' | '%' | '_' => {
+                    escaped.push('\\');
+                    escaped.push(ch);
+                }
+                _ => escaped.push(ch),
+            }
+        }
+        escaped
+    }
+
+    fn literal_match_score(query: &str, node: &KnowledgeNode) -> Option<f32> {
+        let q = query.to_lowercase();
+        let content = node.content.to_lowercase();
+        let tags = node.tags.join(" ").to_lowercase();
+        let source = node.source.as_deref().unwrap_or("").to_lowercase();
+        let id = node.id.to_lowercase();
+
+        if id == q {
+            Some(3.0)
+        } else if content == q {
+            Some(2.5)
+        } else if content.starts_with(&q) {
+            Some(2.0)
+        } else if content.contains(&q) {
+            Some(1.6)
+        } else if source.contains(&q) {
+            Some(1.4)
+        } else if tags.contains(&q) {
+            Some(1.2)
+        } else {
+            None
+        }
+    }
+
+    fn node_matches_type_filters(
+        node: &KnowledgeNode,
+        include_types: Option<&[String]>,
+        exclude_types: Option<&[String]>,
+    ) -> bool {
+        if let Some(includes) = include_types
+            && !includes.is_empty()
+        {
+            return includes.iter().any(|t| t == &node.node_type);
+        }
+        if let Some(excludes) = exclude_types
+            && !excludes.is_empty()
+        {
+            return !excludes.iter().any(|t| t == &node.node_type);
+        }
+        true
     }
 
     /// Get all nodes (paginated)
@@ -6297,5 +6639,170 @@ mod tests {
         let results = storage.hybrid_search("neurons", 10, 0.3, 0.7).unwrap();
         assert!(!results.is_empty());
         assert!(results[0].node.content.contains("Neurons"));
+    }
+
+    #[test]
+    fn test_concrete_search_literal_identifier_lands_first() {
+        let storage = create_test_storage();
+
+        storage
+            .ingest(IngestInput {
+                content: "General OpenAI API setup notes without the exact env var".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let target = storage
+            .ingest(IngestInput {
+                content: "Set OPENAI_API_KEY before running the release smoke tests".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .ingest(IngestInput {
+                content: "API keys should be handled carefully in shell profiles".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let results = storage
+            .concrete_search_filtered("OPENAI_API_KEY", 10, None, None)
+            .unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node.id, target.id);
+        assert_eq!(results[0].match_type, MatchType::Keyword);
+        assert!(results[0].semantic_score.is_none());
+    }
+
+    #[test]
+    fn test_purge_scrubs_insight_json_orphans_children_and_writes_tombstone() {
+        let storage = create_test_storage();
+        let doomed = storage
+            .ingest(IngestInput {
+                content: "Sensitive purge target memory".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["sensitive".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let other_a = storage
+            .ingest(IngestInput {
+                content: "Other source memory A".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let other_b = storage
+            .ingest(IngestInput {
+                content: "Other source memory B".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = storage
+            .ingest(IngestInput {
+                content: "Temporal summary child".to_string(),
+                node_type: "summary".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        {
+            let writer = storage.writer.lock().unwrap();
+            writer
+                .execute(
+                    "INSERT INTO memory_connections (
+                        source_id, target_id, strength, link_type, created_at, last_activated, activation_count
+                     ) VALUES (?1, ?2, 0.9, 'semantic', ?3, ?3, 0)",
+                    params![doomed.id, other_a.id, Utc::now().to_rfc3339()],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO insights (
+                        id, insight, source_memories, confidence, novelty_score, insight_type, generated_at
+                     ) VALUES (?1, 'drop me', ?2, 0.9, 0.2, 'synthesis', ?3)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        serde_json::to_string(&vec![doomed.id.clone(), other_a.id.clone()]).unwrap(),
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO insights (
+                        id, insight, source_memories, confidence, novelty_score, insight_type, generated_at
+                     ) VALUES (?1, 'rewrite me', ?2, 0.9, 0.2, 'synthesis', ?3)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        serde_json::to_string(&vec![
+                            doomed.id.clone(),
+                            other_a.id.clone(),
+                            other_b.id.clone()
+                        ])
+                        .unwrap(),
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET summary_parent_id = ?1 WHERE id = ?2",
+                    params![doomed.id, child.id],
+                )
+                .unwrap();
+        }
+
+        let report = storage
+            .purge_node(&doomed.id, Some("user requested hard purge"))
+            .unwrap();
+        assert!(report.deleted);
+        assert_eq!(report.edges_pruned, 1);
+        assert_eq!(report.insights_deleted, 1);
+        assert_eq!(report.insights_rewritten, 1);
+        assert_eq!(report.children_orphaned, 1);
+        assert!(storage.get_node(&doomed.id).unwrap().is_none());
+
+        let writer = storage.writer.lock().unwrap();
+        let remaining_refs: Vec<String> = writer
+            .prepare("SELECT source_memories FROM insights")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|row| row.ok())
+            .collect();
+        assert_eq!(remaining_refs.len(), 1);
+        assert!(!remaining_refs[0].contains(&doomed.id));
+
+        let child_parent: Option<String> = writer
+            .query_row(
+                "SELECT summary_parent_id FROM knowledge_nodes WHERE id = ?1",
+                params![child.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(child_parent.is_none());
+
+        let tombstone_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_tombstones WHERE memory_id = ?1 AND reason = ?2",
+                params![doomed.id, "user requested hard purge"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstone_count, 1);
+
+        let has_content_column: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('deletion_tombstones') WHERE name = 'content'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_content_column, 0);
     }
 }

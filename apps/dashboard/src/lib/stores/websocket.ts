@@ -84,7 +84,7 @@ function createWebSocketStore() {
 	/**
 	 * Inject a synthetic event into the feed as if it had arrived over the
 	 * WebSocket. Used by the dev-mode "Preview Birth Ritual" button on the
-	 * Settings page to let Sam trigger a demo of the v2.3 Memory Birth
+	 * Settings page to let developers trigger a demo of the v2.3 Memory Birth
 	 * Ritual without ingesting a real memory. Downstream consumers —
 	 * InsightToast, Graph3D — cannot distinguish synthetic from real.
 	 */

@@ -288,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn test_union_find() {
         let mut uf = UnionFind::new(5);
         uf.union(0, 1);

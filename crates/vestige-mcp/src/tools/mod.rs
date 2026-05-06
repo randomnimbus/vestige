@@ -38,6 +38,7 @@ pub mod graph;
 pub mod health;
 
 // v2.1: Cross-reference (connect the dots)
+pub mod contradictions;
 pub mod cross_reference;
 
 // v2.0.5: Active Forgetting — Anderson 2025 + Davis Rac1

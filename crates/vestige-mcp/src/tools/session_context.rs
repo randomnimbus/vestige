@@ -546,13 +546,13 @@ mod tests {
         let (storage, _dir) = test_storage().await;
         ingest_test_content(
             &storage,
-            "Sam prefers Rust and TypeScript for all projects.",
+            "The user prefers Rust and TypeScript for all projects.",
             vec![],
         )
         .await;
 
         let args = serde_json::json!({
-            "queries": ["Sam preferences", "project context"]
+            "queries": ["user preferences", "project context"]
         });
         let result = execute(&storage, &test_cognitive(), Some(args)).await;
         assert!(result.is_ok());

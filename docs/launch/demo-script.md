@@ -419,7 +419,7 @@ vestige-mcp --version
 > Yes. It speaks MCP — the Model Context Protocol. One config change and it works with Claude Desktop, Cursor, VS Code Copilot, JetBrains, Windsurf, Xcode 26.3. Anything that speaks MCP.
 
 **Q: What about multi-user or team memory?**
-> That's the v3.0 roadmap — "Hivemind." Ed25519 identity, CRDT-based sync, transactive directory (Wegner's "who knows what" routing), federated retrieval with differential privacy. The open source version is single-user, local-first. Team and cloud features will be proprietary.
+> The current Pro plan is more pragmatic: prove portable sync/storage first, then ship Solo and Team workflows around managed sync, backups, onboarding, and support. The open-source core stays local-first; paid team features should stay in the separate Pro/commercial boundary.
 
 **Q: How does Prediction Error Gating prevent duplicate memories?**
 > When you ingest a new memory, it computes embedding similarity against all existing memories. If similarity is above 0.92, it reinforces the existing memory (bumps FSRS stability). Between 0.75 and 0.92, it updates/merges. Below 0.75, it creates a new memory. The thresholds come from computational neuroscience research on prediction error signals — the brain stores what's surprising, reinforces what's familiar, and updates what's partially known. Same principle.

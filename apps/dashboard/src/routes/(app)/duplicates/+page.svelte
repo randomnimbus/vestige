@@ -59,7 +59,7 @@
 						content:
 							'BUG FIX: Harmony parser dropped `final` channel tokens when tool call followed. Root cause: 5-layer fallback missed the final channel marker when channel switched mid-stream. Solution: added final-channel detector before tool-call pop. Files: src/parser/harmony.rs',
 						nodeType: 'fact',
-						tags: ['bug-fix', 'aimo3', 'parser'],
+						tags: ['bug-fix', 'benchmark-suite', 'parser'],
 						retention: 0.91,
 						createdAt: '2026-04-12T14:22:00Z',
 					},
@@ -68,7 +68,7 @@
 						content:
 							'Fixed Harmony parser final-channel bug — 5-layer fallback was missing the final channel marker when a tool call followed. Added detector before tool pop.',
 						nodeType: 'fact',
-						tags: ['bug-fix', 'aimo3'],
+						tags: ['bug-fix', 'benchmark-suite'],
 						retention: 0.64,
 						createdAt: '2026-04-13T09:15:00Z',
 					},
@@ -90,18 +90,18 @@
 					{
 						id: 'm-004',
 						content:
-							'DECISION: Use vLLM prefix caching at 0.35 gpu_memory_utilization for AIMO3 submissions. Alternatives considered: sglang (slower cold start), TensorRT-LLM (deployment friction).',
+							'DECISION: Use vLLM prefix caching at 0.35 gpu_memory_utilization for benchmark suite submissions. Alternatives considered: sglang (slower cold start), TensorRT-LLM (deployment friction).',
 						nodeType: 'decision',
-						tags: ['vllm', 'aimo3', 'inference'],
+						tags: ['vllm', 'benchmark-suite', 'inference'],
 						retention: 0.84,
 						createdAt: '2026-04-05T18:44:00Z',
 					},
 					{
 						id: 'm-005',
 						content:
-							'Chose vLLM with prefix caching (0.35 mem util) over sglang and TensorRT-LLM for AIMO3 inference.',
+							'Chose vLLM with prefix caching (0.35 mem util) over sglang and TensorRT-LLM for benchmark suite inference.',
 						nodeType: 'decision',
-						tags: ['vllm', 'aimo3'],
+						tags: ['vllm', 'benchmark-suite'],
 						retention: 0.72,
 						createdAt: '2026-04-06T10:30:00Z',
 					},
@@ -114,9 +114,9 @@
 					{
 						id: 'm-006',
 						content:
-							'Sam prefers to ship one change per Kaggle submission — stacking changes destroyed signal at AIMO3 (30/50 regression from 12 stacked variables).',
+							'Release process prefers one change per benchmark submission — stacking changes destroyed signal in a prior run.',
 						nodeType: 'pattern',
-						tags: ['kaggle', 'methodology', 'aimo3'],
+						tags: ['methodology', 'benchmark-suite'],
 						retention: 0.88,
 						createdAt: '2026-04-04T22:10:00Z',
 					},
@@ -131,7 +131,7 @@
 					},
 					{
 						id: 'm-008',
-						content: 'Lesson: stacking 12 changes at AIMO3 cost a submission. Always isolate variables.',
+						content: 'Lesson: stacking many changes in one benchmark run hid the causal signal. Always isolate variables.',
 						nodeType: 'note',
 						tags: ['methodology'],
 						retention: 0.42,

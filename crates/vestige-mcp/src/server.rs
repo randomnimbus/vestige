@@ -31,11 +31,9 @@ use vestige_core::Storage;
 /// Vestige without imposing one maintainer's workflow on strangers.
 ///
 /// The "full" variant is the composition mandate that enforces the
-/// Composing / Never-composed / Recommendation response shape, names the
-/// AIMO3 36/50 case study as the origin, and includes the "Vestige is
-/// blocking this:" refusal phrase. It is load-bearing for Sam's own
-/// decision-adjacent work but would misfire on trivial retrievals for a
-/// general audience, so it is opt-in via `VESTIGE_SYSTEM_PROMPT_MODE=full`.
+/// Composing / Never-composed / Recommendation response shape. It can misfire
+/// on trivial retrievals for a general audience, so it is opt-in via
+/// `VESTIGE_SYSTEM_PROMPT_MODE=full`.
 ///
 /// Anything other than `full` falls back to minimal.
 fn build_instructions() -> String {
@@ -209,7 +207,7 @@ impl McpServer {
 
     /// Handle tools/list request
     async fn handle_tools_list(&self) -> Result<serde_json::Value, JsonRpcError> {
-        // v2.0.5+: 24 tools (verified by the `tools.len() == 24` assertion in the
+        // v2.1.2+: 25 tools (verified by the `tools.len() == 25` assertion in the
         // handle_tools_list test below — the `suppress` tool landed in v2.0.5).
         // Deprecated tools still work via redirects in handle_tools_call.
         let tools = vec![
@@ -223,7 +221,7 @@ impl McpServer {
             },
             ToolDescription {
                 name: "memory".to_string(),
-                description: Some("Unified memory management tool. Actions: 'get' (retrieve full node), 'delete' (remove memory), 'state' (get accessibility state), 'promote' (thumbs up — increases retrieval strength), 'demote' (thumbs down — decreases retrieval strength, does NOT delete), 'edit' (update content in-place, preserves FSRS state).".to_string()),
+                description: Some("Unified memory management tool. Actions: 'get' (retrieve full node), 'purge' (irreversibly remove content/embeddings with confirm=true), 'delete' (legacy alias for purge), 'state' (get accessibility state), 'promote' (thumbs up — increases retrieval strength), 'demote' (thumbs down — decreases retrieval strength, does NOT delete), 'edit' (update content in-place, preserves FSRS state).".to_string()),
                 input_schema: tools::memory_unified::schema(),
             },
             ToolDescription {
@@ -357,6 +355,11 @@ impl McpServer {
                 name: "cross_reference".to_string(),
                 description: Some("Alias for deep_reference. Connect the dots across memories with cognitive reasoning.".to_string()),
                 input_schema: tools::cross_reference::schema(),
+            },
+            ToolDescription {
+                name: "contradictions".to_string(),
+                description: Some("Inspect memory disagreements directly. Scans a topic or recent memories for trust-weighted contradiction pairs using the same local logic as deep_reference.".to_string()),
+                input_schema: tools::contradictions::schema(),
             },
             // ================================================================
             // ACTIVE FORGETTING (v2.0.5) — top-down suppression
@@ -832,6 +835,9 @@ impl McpServer {
                 tools::cross_reference::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
             }
+            "contradictions" => {
+                tools::contradictions::execute(&self.storage, request.arguments).await
+            }
 
             // ================================================================
             // ACTIVE FORGETTING (v2.0.5) — top-down suppression
@@ -1164,7 +1170,7 @@ impl McpServer {
                     .unwrap_or("")
                     .to_string();
                 match action {
-                    "delete" => {
+                    "delete" | "purge" => {
                         self.emit(VestigeEvent::MemoryDeleted { id, timestamp: now });
                     }
                     "promote" => {
@@ -1505,8 +1511,8 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        // v2.0.5: 24 tools (4 unified + 1 core + 2 temporal + 5 maintenance + 2 auto-save + 3 cognitive + 1 restore + 1 session_context + 2 autonomic + 1 deep_reference + 1 cross_reference alias + 1 suppress)
-        assert_eq!(tools.len(), 24, "Expected exactly 24 tools in v2.0.5+");
+        // v2.1.2: 25 tools (adds first-class contradictions surface)
+        assert_eq!(tools.len(), 25, "Expected exactly 25 tools in v2.1.2+");
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -1576,6 +1582,7 @@ mod tests {
         // Deep reference + cross_reference alias (v2.0.4)
         assert!(tool_names.contains(&"deep_reference"));
         assert!(tool_names.contains(&"cross_reference"));
+        assert!(tool_names.contains(&"contradictions"));
 
         // Active forgetting (v2.0.5) — Anderson 2025 + Davis Rac1
         assert!(tool_names.contains(&"suppress"));

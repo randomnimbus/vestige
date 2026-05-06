@@ -22,7 +22,8 @@ pub fn sanitize_fts5_terms(query: &str) -> Option<String> {
     sanitized = sanitized
         .chars()
         .map(|c| match c {
-            '*' | ':' | '^' | '-' | '"' | '(' | ')' | '{' | '}' | '[' | ']' => ' ',
+            '*' | ':' | '^' | '-' | '"' | '(' | ')' | '{' | '}' | '[' | ']' | '.' | '/' | '\\'
+            | '=' | '@' => ' ',
             _ => c,
         })
         .collect();
@@ -68,11 +69,13 @@ pub fn sanitize_fts5_query(query: &str) -> String {
     // Remove FTS5 special characters and operators
     let mut sanitized = limited.to_string();
 
-    // Remove special characters: * : ^ - " ( )
+    // Remove special characters: * : ^ - " ( ) and common identifier/path
+    // punctuation that FTS5 otherwise treats as syntax.
     sanitized = sanitized
         .chars()
         .map(|c| match c {
-            '*' | ':' | '^' | '-' | '"' | '(' | ')' | '{' | '}' | '[' | ']' => ' ',
+            '*' | ':' | '^' | '-' | '"' | '(' | ')' | '{' | '}' | '[' | ']' | '.' | '/' | '\\'
+            | '=' | '@' => ' ',
             _ => c,
         })
         .collect();

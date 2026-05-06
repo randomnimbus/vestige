@@ -10,11 +10,11 @@ I've been building Vestige — an MCP memory server that gives Claude persistent
 
 But last week it almost cost me hours of debugging.
 
-Claude confidently told me my AIMO3 competition notebook should use `--enable-prefix-caching` with vLLM. I trusted it. The notebook crashed. Scored 0/50. Burned a daily submission.
+Claude confidently told me a benchmark notebook should use `--enable-prefix-caching` with vLLM. I trusted it. The notebook crashed. Burned a daily submission.
 
 The problem? I had TWO memories:
 - **January**: "prefix caching crashes with our vLLM build"  
-- **March**: "prefix caching works with the new animsamuelk wheels"
+- **March**: "prefix caching works with the newer vLLM build"
 
 Claude found both. Picked the wrong one. Gave me a confident wrong answer based on the January memory. The March memory was correct — but Claude had no way to know they conflicted.
 
@@ -38,11 +38,11 @@ And gets back:
     {
       "newer": {
         "date": "2026-03-18",
-        "preview": "Switched to animsamuelk wheels which support --enable-prefix-caching..."
+        "preview": "Switched to a newer vLLM build that supports --enable-prefix-caching..."
       },
       "older": {
         "date": "2026-01-15", 
-        "preview": "prefix caching crashed with our samvalladares vLLM build..."
+        "preview": "prefix caching crashed with our older local vLLM build..."
       },
       "recommendation": "Trust the newer memory. Consider demoting the older one."
     }

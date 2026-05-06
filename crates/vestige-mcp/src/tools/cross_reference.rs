@@ -58,7 +58,7 @@ struct DeepRefArgs {
 
 /// Compute trust score from FSRS-6 memory state.
 /// Higher = more trustworthy (frequently accessed, high retention, stable, few lapses).
-fn compute_trust(retention: f64, stability: f64, reps: i32, lapses: i32) -> f64 {
+pub(crate) fn compute_trust(retention: f64, stability: f64, reps: i32, lapses: i32) -> f64 {
     let retention_factor = retention * 0.4;
     let stability_factor = (stability / 30.0).min(1.0) * 0.2;
     let reps_factor = (reps as f64 / 10.0).min(1.0) * 0.2;
@@ -384,7 +384,7 @@ const CORRECTION_SIGNALS: &[&str] = &[
     "migrated to",
 ];
 
-fn appears_contradictory(a: &str, b: &str) -> bool {
+pub(crate) fn appears_contradictory(a: &str, b: &str) -> bool {
     let a_lower = a.to_lowercase();
     let b_lower = b.to_lowercase();
 
@@ -435,7 +435,7 @@ fn appears_contradictory(a: &str, b: &str) -> bool {
     false
 }
 
-fn topic_overlap(a: &str, b: &str) -> f32 {
+pub(crate) fn topic_overlap(a: &str, b: &str) -> f32 {
     let a_lower = a.to_lowercase();
     let b_lower = b.to_lowercase();
     let a_words: std::collections::HashSet<&str> =
@@ -689,10 +689,10 @@ pub async fn execute(
     // it contains at least one of these terms. This catches the class of bug
     // where a high-trust, semantically-adjacent memory from an unrelated
     // domain beats the actual topic memory because the cross-encoder reranker
-    // over-weights token-level similarity (e.g. a Nightvision memory about
-    // "true positives + conservative thresholds" winning an "FSRS-6 trust
+    // over-weights token-level similarity (e.g. an unrelated security memory
+    // about "true positives + conservative thresholds" winning an "FSRS-6 trust
     // scoring" query because "trust" + "scoring" + "threshold" cluster in
-    // embedding space — even though the winning memory contains neither
+    // embedding space, even though the winning memory contains neither
     // "FSRS-6" nor anything about spaced repetition).
     const TOPIC_STOPWORDS: &[&str] = &[
         "how", "what", "when", "where", "why", "who", "which", "does", "did", "is", "are", "was",
@@ -1162,7 +1162,7 @@ mod tests {
             QueryIntent::Timeline
         );
         assert_eq!(
-            classify_intent("How has the AIMO3 score evolved over time?"),
+            classify_intent("How has the benchmark score evolved over time?"),
             QueryIntent::Timeline
         );
     }
@@ -1194,7 +1194,7 @@ mod tests {
     #[test]
     fn test_intent_synthesis_default() {
         assert_eq!(
-            classify_intent("Tell me about Sam's projects"),
+            classify_intent("Tell me about the user's projects"),
             QueryIntent::Synthesis
         );
         assert_eq!(classify_intent("What is Vestige?"), QueryIntent::Synthesis);

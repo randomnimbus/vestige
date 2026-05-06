@@ -1,7 +1,7 @@
 #!/bin/bash
 # Load ALL memory MD files on every UserPromptSubmit.
-# Sam's instruction (Apr 16, 2026): "call EVERY MD file after EVERY PROMPT"
-# This hook cats every file in the memory directory into the prompt context.
+# This legacy opt-in hook cats every file in the memory directory into prompt
+# context. It is intentionally not enabled by default.
 
 # Resolve per-user Claude Code project memory dir from $HOME.
 # Claude Code encodes home path as `-Users-<name>`; allow override via env.
@@ -16,8 +16,7 @@ if [ ! -d "$MEM_DIR" ]; then
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "[FULL MEMORY DUMP — EVERY FILE LOADED PER SAM'S INSTRUCTION]"
-echo "Sam said: 'call EVERY MD file after EVERY PROMPT' (Apr 16, 2026)"
+echo "[FULL MEMORY DUMP — EVERY FILE LOADED]"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 

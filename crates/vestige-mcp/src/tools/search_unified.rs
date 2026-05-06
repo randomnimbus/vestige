@@ -87,6 +87,11 @@ pub fn schema() -> Value {
                 "description": "precise: top results only (fast, token-efficient, skips activation/competition). balanced: full 7-stage cognitive pipeline (default). exhaustive: maximum recall with 5x overfetch, deep graph traversal, no competition suppression.",
                 "enum": ["precise", "balanced", "exhaustive"],
                 "default": "balanced"
+            },
+            "concrete": {
+                "type": "boolean",
+                "description": "Force literal/concrete search. Skips semantic expansion, FSRS reweighting, spreading activation, and cognitive side effects. Auto-enabled for quoted strings, env vars, UUIDs, paths, and code identifiers.",
+                "default": false
             }
         },
         "required": ["query"]
@@ -114,6 +119,7 @@ struct SearchArgs {
     token_budget: Option<i32>,
     #[serde(alias = "retrieval_mode")]
     retrieval_mode: Option<String>,
+    concrete: Option<bool>,
 }
 
 /// Execute unified search with 7-stage cognitive pipeline.
@@ -172,6 +178,78 @@ pub async fn execute(
             ));
         }
     };
+
+    let concrete = args
+        .concrete
+        .unwrap_or_else(|| is_literal_query(&args.query));
+    if concrete {
+        let results = storage
+            .concrete_search_filtered(
+                &args.query,
+                limit,
+                args.include_types.as_deref(),
+                args.exclude_types.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
+
+        let ids: Vec<&str> = results.iter().map(|r| r.node.id.as_str()).collect();
+        let _ = storage.strengthen_batch_on_access(&ids);
+
+        let mut formatted: Vec<Value> = results
+            .iter()
+            .filter(|r| r.node.retention_strength >= min_retention)
+            .map(|r| format_search_result(r, detail_level))
+            .collect();
+
+        let mut budget_expandable: Vec<String> = Vec::new();
+        let mut budget_tokens_used: Option<usize> = None;
+        if let Some(budget) = args.token_budget {
+            let budget = budget.clamp(100, 100000) as usize;
+            let budget_chars = budget * 4;
+            let mut used = 0;
+            let mut budgeted = Vec::new();
+
+            for result in &formatted {
+                let size = serde_json::to_string(result).unwrap_or_default().len();
+                if used + size > budget_chars {
+                    if let Some(id) = result.get("id").and_then(|v| v.as_str()) {
+                        budget_expandable.push(id.to_string());
+                    }
+                    continue;
+                }
+                used += size;
+                budgeted.push(result.clone());
+            }
+
+            budget_tokens_used = Some(used / 4);
+            formatted = budgeted;
+        }
+
+        let mut response = serde_json::json!({
+            "query": args.query,
+            "method": "concrete",
+            "retrievalMode": retrieval_mode,
+            "concrete": true,
+            "detailLevel": detail_level,
+            "total": formatted.len(),
+            "results": formatted,
+        });
+
+        if formatted.is_empty() {
+            response["hint"] = serde_json::json!(
+                "No concrete matches found. Try concrete=false or a broader natural-language query."
+            );
+        }
+        if !budget_expandable.is_empty() {
+            response["expandable"] = serde_json::json!(budget_expandable);
+        }
+        if let Some(tokens) = budget_tokens_used {
+            response["tokenBudgetUsed"] = serde_json::json!(tokens);
+            response["tokenBudgetLimit"] = serde_json::json!(args.token_budget.unwrap());
+        }
+
+        return Ok(response);
+    }
 
     // Favor semantic search — research shows 0.3/0.7 outperforms equal weights
     let keyword_weight = 0.3_f32;
@@ -668,6 +746,41 @@ pub async fn execute(
     Ok(response)
 }
 
+fn is_literal_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        if (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+        {
+            return true;
+        }
+    }
+
+    if uuid::Uuid::parse_str(trimmed).is_ok() {
+        return true;
+    }
+
+    let token_count = trimmed.split_whitespace().count();
+    if token_count != 1 {
+        return false;
+    }
+
+    let has_identifier_punctuation = trimmed
+        .chars()
+        .any(|c| matches!(c, '_' | '-' | '/' | '\\' | '.' | ':' | '=' | '@'));
+    if has_identifier_punctuation {
+        return true;
+    }
+
+    let has_alpha = trimmed.chars().any(|c| c.is_ascii_alphabetic());
+    has_alpha
+        && trimmed.contains('_')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 /// Format a search result based on the requested detail level.
 fn format_search_result(r: &vestige_core::SearchResult, detail_level: &str) -> Value {
     match detail_level {
@@ -838,6 +951,97 @@ mod tests {
         let result = execute(&storage, &test_cognitive(), Some(args)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid arguments"));
+    }
+
+    #[test]
+    fn test_literal_query_detection() {
+        assert!(is_literal_query("\"exact phrase\""));
+        assert!(is_literal_query("OPENAI_API_KEY"));
+        assert!(is_literal_query("mlx_lm.server"));
+        assert!(is_literal_query("src/main.rs"));
+        assert!(is_literal_query("4da778e2-1111-4444-8888-123456789abc"));
+        assert!(!is_literal_query("how should memory search work"));
+    }
+
+    #[tokio::test]
+    async fn test_concrete_search_env_var_lands_first() {
+        let (storage, _dir) = test_storage().await;
+        ingest_test_content(
+            &storage,
+            "General OpenAI setup and API key rotation guidance",
+        )
+        .await;
+        let target = ingest_test_content(
+            &storage,
+            "Release smoke test requires OPENAI_API_KEY to be set in the shell",
+        )
+        .await;
+        ingest_test_content(
+            &storage,
+            "Credentials should be stored outside the repository",
+        )
+        .await;
+
+        let args = serde_json::json!({
+            "query": "OPENAI_API_KEY",
+            "limit": 5
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .unwrap();
+
+        assert_eq!(result["method"], "concrete");
+        assert_eq!(result["concrete"], true);
+        assert_eq!(result["results"][0]["id"], target);
+    }
+
+    #[tokio::test]
+    async fn test_concrete_search_uuid_lands_first() {
+        let (storage, _dir) = test_storage().await;
+        let uuid = "4da778e2-1111-4444-8888-123456789abc";
+        ingest_test_content(&storage, "Several memories mention release identifiers").await;
+        let target = ingest_test_content(
+            &storage,
+            &format!("The migration bug is tracked by exact id {}", uuid),
+        )
+        .await;
+
+        let args = serde_json::json!({
+            "query": uuid,
+            "limit": 5
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .unwrap();
+
+        assert_eq!(result["method"], "concrete");
+        assert_eq!(result["results"][0]["id"], target);
+    }
+
+    #[tokio::test]
+    async fn test_concrete_search_process_name_lands_first() {
+        let (storage, _dir) = test_storage().await;
+        ingest_test_content(
+            &storage,
+            "The local MLX server can expose an OpenAI-compatible endpoint",
+        )
+        .await;
+        let target = ingest_test_content(
+            &storage,
+            "If mlx_lm.server is already running, do not start a second Sanhedrin backend",
+        )
+        .await;
+
+        let args = serde_json::json!({
+            "query": "mlx_lm.server",
+            "limit": 5
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .unwrap();
+
+        assert_eq!(result["method"], "concrete");
+        assert_eq!(result["results"][0]["id"], target);
     }
 
     // ========================================================================

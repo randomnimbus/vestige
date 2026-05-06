@@ -54,7 +54,7 @@ vestige portable-import ~/Dropbox/vestige/portable.json --merge
 vestige sync ~/Dropbox/vestige/portable.json
 ```
 
-`vestige sync` uses the same pluggable portable-sync backend interface as the core library. v2.1.1 ships a file backend, which works with Dropbox, iCloud Drive, Syncthing, Git, network shares, or any folder-sync system. The merge algorithm applies delete tombstones, keeps newer local memories on timestamp conflicts, preserves stable IDs, rebuilds FTS after import, and writes the pushed archive atomically when the filesystem supports rename.
+`vestige sync` uses the same pluggable portable-sync backend interface as the core library. v2.1.1 ships a file backend, which works with Dropbox, iCloud Drive, Syncthing, Git, network shares, or any folder-sync system. The merge algorithm applies delete tombstones, keeps newer local memories on timestamp conflicts, preserves stable IDs, rebuilds FTS after import, and writes the pushed archive atomically when the filesystem supports rename. v2.1.2 also carries non-content purge tombstones so a hard purge can sync without retaining the deleted memory text.
 
 When using the MCP `export` tool with `format: "portable"`, Vestige writes the archive under the active data directory's `exports/` folder. The MCP `restore` tool only reads from that `exports/` or `backups/` folder by default; pass `allowAnyPath: true` only for a trusted local file you selected manually.
 

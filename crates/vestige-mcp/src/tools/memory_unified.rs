@@ -43,8 +43,8 @@ pub fn schema() -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["get", "get_batch", "delete", "state", "promote", "demote", "edit"],
-                "description": "Action to perform: 'get' retrieves full memory node, 'get_batch' retrieves multiple memories by IDs (use 'ids' array), 'delete' removes memory, 'state' returns accessibility state, 'promote' increases retrieval strength (thumbs up), 'demote' decreases retrieval strength (thumbs down), 'edit' updates content in-place (preserves FSRS state)"
+                "enum": ["get", "get_batch", "delete", "purge", "state", "promote", "demote", "edit"],
+                "description": "Action to perform: 'get' retrieves full memory node, 'get_batch' retrieves multiple memories by IDs (use 'ids' array), 'purge' permanently removes memory content and embeddings after confirm=true, 'delete' is a backwards-compatible alias for purge, 'state' returns accessibility state, 'promote' increases retrieval strength (thumbs up), 'demote' decreases retrieval strength (thumbs down), 'edit' updates content in-place (preserves FSRS state)"
             },
             "id": {
                 "type": "string",
@@ -57,7 +57,12 @@ pub fn schema() -> Value {
             },
             "reason": {
                 "type": "string",
-                "description": "Why this memory is being promoted/demoted (optional, for logging). Only used with promote/demote actions."
+                "description": "Why this memory is being promoted/demoted/purged (optional, for logging)."
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Required for action='purge'. Purge permanently removes memory content and embeddings; only a non-content tombstone remains.",
+                "default": false
             },
             "content": {
                 "type": "string",
@@ -75,6 +80,7 @@ struct MemoryArgs {
     id: Option<String>,
     ids: Option<Vec<String>>,
     reason: Option<String>,
+    confirm: Option<bool>,
     content: Option<String>,
 }
 
@@ -110,13 +116,23 @@ pub async fn execute(
 
     match args.action.as_str() {
         "get" => execute_get(storage, &id).await,
-        "delete" => execute_delete(storage, &id).await,
+        "delete" => execute_purge(storage, &id, args.reason, true, "delete").await,
+        "purge" => {
+            execute_purge(
+                storage,
+                &id,
+                args.reason,
+                args.confirm.unwrap_or(false),
+                "purge",
+            )
+            .await
+        }
         "state" => execute_state(storage, &id).await,
         "promote" => execute_promote(storage, cognitive, &id, args.reason).await,
         "demote" => execute_demote(storage, cognitive, &id, args.reason).await,
         "edit" => execute_edit(storage, &id, args.content).await,
         _ => Err(format!(
-            "Invalid action '{}'. Must be one of: get, get_batch, delete, state, promote, demote, edit",
+            "Invalid action '{}'. Must be one of: get, get_batch, delete, purge, state, promote, demote, edit",
             args.action
         )),
     }
@@ -205,15 +221,39 @@ async fn execute_get_batch(storage: &Arc<Storage>, ids: &[String]) -> Result<Val
     }))
 }
 
-/// Delete a memory and return success status
-async fn execute_delete(storage: &Arc<Storage>, id: &str) -> Result<Value, String> {
-    let deleted = storage.delete_node(id).map_err(|e| e.to_string())?;
+/// Permanently purge a memory and return cleanup details.
+async fn execute_purge(
+    storage: &Arc<Storage>,
+    id: &str,
+    reason: Option<String>,
+    confirm: bool,
+    action: &str,
+) -> Result<Value, String> {
+    if !confirm {
+        return Err(
+            "Purge is irreversible. Pass confirm=true to permanently remove memory content and embeddings."
+                .to_string(),
+        );
+    }
+
+    let report = storage
+        .purge_node(id, reason.as_deref())
+        .map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({
-        "action": "delete",
-        "success": deleted,
+        "action": action,
+        "success": report.deleted,
         "nodeId": id,
-        "message": if deleted { "Memory deleted successfully" } else { "Memory not found" },
+        "message": if report.deleted {
+            "Memory purged permanently; content and embeddings removed. Non-content tombstone retained for sync/audit."
+        } else {
+            "Memory not found"
+        },
+        "deletedAt": report.deleted_at.to_rfc3339(),
+        "edgesPruned": report.edges_pruned,
+        "insightsRewritten": report.insights_rewritten,
+        "insightsDeleted": report.insights_deleted,
+        "childrenOrphaned": report.children_orphaned,
     }))
 }
 
@@ -469,13 +509,15 @@ mod tests {
         assert!(schema["properties"]["reason"].is_object());
         assert_eq!(schema["required"], serde_json::json!(["action"]));
         assert!(schema["properties"]["ids"].is_object()); // get_batch support
-        // Verify all 7 actions are in enum
+        // Verify all 8 actions are in enum
         let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
-        assert_eq!(actions.len(), 7);
+        assert_eq!(actions.len(), 8);
         assert!(actions.contains(&serde_json::json!("get_batch")));
+        assert!(actions.contains(&serde_json::json!("purge")));
         assert!(actions.contains(&serde_json::json!("edit")));
         assert!(actions.contains(&serde_json::json!("promote")));
         assert!(actions.contains(&serde_json::json!("demote")));
+        assert!(schema["properties"]["confirm"].is_object());
     }
 
     // === INTEGRATION TESTS ===
@@ -607,6 +649,42 @@ mod tests {
         let result = execute(&storage, &test_cognitive(), Some(get_args)).await;
         let value = result.unwrap();
         assert_eq!(value["found"], false);
+    }
+
+    #[tokio::test]
+    async fn test_purge_requires_confirm() {
+        let (storage, _dir) = test_storage().await;
+        let id = ingest_memory(&storage).await;
+        let args = serde_json::json!({ "action": "purge", "id": id.clone() });
+        let result = execute(&storage, &test_cognitive(), Some(args)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("confirm=true"));
+        assert!(storage.get_node(&id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_purge_existing_memory() {
+        let (storage, _dir) = test_storage().await;
+        let id = ingest_memory(&storage).await;
+        let args = serde_json::json!({
+            "action": "purge",
+            "id": id,
+            "confirm": true,
+            "reason": "test cleanup"
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args)).await;
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(value["action"], "purge");
+        assert_eq!(value["success"], true);
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .contains("purged permanently")
+        );
+        assert_eq!(value["edgesPruned"], 0);
+        assert!(storage.get_node(&id).unwrap().is_none());
     }
 
     #[tokio::test]

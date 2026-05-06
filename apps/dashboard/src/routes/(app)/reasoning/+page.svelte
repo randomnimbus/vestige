@@ -235,7 +235,7 @@
 	const exampleQueries = [
 		'What port does the dev server use?',
 		'Should I enable prefix caching with vLLM?',
-		'Why did the AIMO3 submission score 36/50?',
+		'Why did the benchmark score drop after the parser change?',
 		'How does FSRS-6 trust scoring work?'
 	];
 </script>

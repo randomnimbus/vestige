@@ -1,10 +1,8 @@
 #!/bin/bash
 # synthesis-preflight.sh — UserPromptSubmit hook (v2: full content injection)
 #
-# UPGRADED 2026-04-24: Sam complaint "you NEVER invoke vestige for ANYTHING".
-# Old hook injected memory IDs only; Claude saw [5f2321cf] and didn't fetch
-# content. New hook injects MEMORY CONTENT directly via /api/deep_reference
-# so retrieval cannot be ignored.
+# Injects memory content directly via /api/deep_reference so relevant evidence
+# is available before Claude drafts a decision-adjacent response.
 #
 # On every UserPromptSubmit:
 #   1. Read JSON stdin, extract user prompt
@@ -33,7 +31,7 @@ if [ -z "$PROMPT" ]; then
 fi
 
 # Decision-keyword gate (preserved from v1). Mirrors synthesis-gate.sh.
-DECISION_GATE_RE='submit|submission|aimo|nemotron|gemma|kaggle|orbit|final|ship|launch|deploy|commit|decide|decision|recommend|should i|should we|what should|purchase|buy|invest|architect|architecture|strategy|prep|prioriti|compose|tradeoff|trade-off|config|which|pick|choose|audition|dimension|mays|pitch|forecast|target|plan|roadmap|v2\.|v3\.|scale|grow|growth|distrib|brand|position|moat|vs\.|vs\b|instead of'
+DECISION_GATE_RE='submit|submission|benchmark|competition|final|ship|launch|deploy|commit|decide|decision|recommend|should i|should we|what should|purchase|buy|invest|architect|architecture|strategy|prep|prioriti|compose|tradeoff|trade-off|config|which|pick|choose|pitch|forecast|target|plan|roadmap|v2\.|v3\.|scale|grow|growth|distrib|brand|position|moat|vs\.|vs\b|instead of'
 
 if ! printf '%s' "$PROMPT" | LC_ALL=C /usr/bin/grep -iqE "$DECISION_GATE_RE"; then
   exit 0
@@ -144,7 +142,7 @@ if evidence:
 out.append("ENFORCEMENT: Compose these into your response, do NOT summarize.")
 out.append("Use mcp__vestige__memory(action='get', id=...) to expand any preview.")
 out.append("Required shape: (a) Composing: [memories] - logic. (b) Never-composed: [combos|None].")
-out.append("(c) Recommendation: Sam should DO [concrete action].")
+out.append("(c) Recommendation: the user should DO [concrete action].")
 
 print("\n".join(out))
 COMPOSE_PYEOF

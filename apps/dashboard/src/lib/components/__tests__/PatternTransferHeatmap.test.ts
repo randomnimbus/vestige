@@ -25,20 +25,20 @@ import {
 // patterns/+page.svelte, but small enough to reason about by hand.
 // ---------------------------------------------------------------------------
 
-const PROJECTS = ['vestige', 'nullgaze', 'injeranet'] as const;
+const PROJECTS = ['vestige', 'api-gateway', 'desktop-app'] as const;
 
 const PATTERNS: TransferPatternLike[] = [
 	{
 		name: 'Result<T, E>',
 		category: 'ErrorHandling',
 		origin_project: 'vestige',
-		transferred_to: ['nullgaze', 'injeranet'],
+		transferred_to: ['api-gateway', 'desktop-app'],
 		transfer_count: 2,
 	},
 	{
 		name: 'Axum middleware',
 		category: 'ErrorHandling',
-		origin_project: 'nullgaze',
+		origin_project: 'api-gateway',
 		transferred_to: ['vestige'],
 		transfer_count: 1,
 	},
@@ -46,7 +46,7 @@ const PATTERNS: TransferPatternLike[] = [
 		name: 'proptest',
 		category: 'Testing',
 		origin_project: 'vestige',
-		transferred_to: ['nullgaze'],
+		transferred_to: ['api-gateway'],
 		transfer_count: 1,
 	},
 	{
@@ -172,15 +172,15 @@ describe('buildTransferMatrix', () => {
 
 	it('aggregates transfer counts directionally', () => {
 		const m = buildTransferMatrix(PROJECTS, PATTERNS);
-		// vestige → nullgaze: Result<T,E> + proptest = 2
-		expect(m.vestige.nullgaze.count).toBe(2);
-		// vestige → injeranet: Result<T,E> only = 1
-		expect(m.vestige.injeranet.count).toBe(1);
-		// nullgaze → vestige: Axum middleware = 1
-		expect(m.nullgaze.vestige.count).toBe(1);
-		// injeranet → anywhere: zero (no origin in injeranet in fixtures)
-		expect(m.injeranet.vestige.count).toBe(0);
-		expect(m.injeranet.nullgaze.count).toBe(0);
+		// vestige → api-gateway: Result<T,E> + proptest = 2
+		expect(m.vestige.api-gateway.count).toBe(2);
+		// vestige → desktop-app: Result<T,E> only = 1
+		expect(m.vestige.desktop-app.count).toBe(1);
+		// api-gateway → vestige: Axum middleware = 1
+		expect(m.api-gateway.vestige.count).toBe(1);
+		// desktop-app → anywhere: zero (no origin in desktop-app in fixtures)
+		expect(m.desktop-app.vestige.count).toBe(0);
+		expect(m.desktop-app.api-gateway.count).toBe(0);
 	});
 
 	it('treats (A, B) and (B, A) as distinct directions (asymmetry confirmed)', () => {
@@ -189,7 +189,7 @@ describe('buildTransferMatrix', () => {
 		// bug that aggregates both directions into the same cell would pass
 		// the "count" test above but fail this symmetry check.
 		const m = buildTransferMatrix(PROJECTS, PATTERNS);
-		expect(m.vestige.nullgaze.count).not.toBe(m.nullgaze.vestige.count);
+		expect(m.vestige.api-gateway.count).not.toBe(m.api-gateway.vestige.count);
 	});
 
 	it('records self-transfer on the diagonal', () => {
@@ -203,13 +203,13 @@ describe('buildTransferMatrix', () => {
 			name: `pattern-${i}`,
 			category: 'ErrorHandling',
 			origin_project: 'vestige',
-			transferred_to: ['nullgaze'],
+			transferred_to: ['api-gateway'],
 			transfer_count: 1,
 		}));
-		const m = buildTransferMatrix(['vestige', 'nullgaze'], manyPatterns);
-		expect(m.vestige.nullgaze.count).toBe(5);
-		expect(m.vestige.nullgaze.topNames).toHaveLength(3);
-		expect(m.vestige.nullgaze.topNames).toEqual(['pattern-0', 'pattern-1', 'pattern-2']);
+		const m = buildTransferMatrix(['vestige', 'api-gateway'], manyPatterns);
+		expect(m.vestige.api-gateway.count).toBe(5);
+		expect(m.vestige.api-gateway.topNames).toHaveLength(3);
+		expect(m.vestige.api-gateway.topNames).toEqual(['pattern-0', 'pattern-1', 'pattern-2']);
 	});
 
 	it('silently drops patterns whose origin is not in the projects axis', () => {
@@ -233,12 +233,12 @@ describe('buildTransferMatrix', () => {
 			name: 'StrayDest',
 			category: 'Security',
 			origin_project: 'vestige',
-			transferred_to: ['ghost-project', 'nullgaze'],
+			transferred_to: ['ghost-project', 'api-gateway'],
 			transfer_count: 2,
 		};
 		const m = buildTransferMatrix(PROJECTS, [strayDest]);
 		// The known destination counts; the ghost doesn't.
-		expect(m.vestige.nullgaze.count).toBe(1);
+		expect(m.vestige.api-gateway.count).toBe(1);
 		expect((m.vestige as Record<string, unknown>)['ghost-project']).toBeUndefined();
 	});
 
@@ -248,19 +248,19 @@ describe('buildTransferMatrix', () => {
 				name: 'a',
 				category: 'Testing',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze'],
+				transferred_to: ['api-gateway'],
 				transfer_count: 1,
 			},
 			{
 				name: 'b',
 				category: 'Testing',
 				origin_project: 'vestige',
-				transferred_to: ['nullgaze'],
+				transferred_to: ['api-gateway'],
 				transfer_count: 1,
 			},
 		];
-		const m = buildTransferMatrix(['vestige', 'nullgaze'], pats, 1);
-		expect(m.vestige.nullgaze.topNames).toEqual(['a']);
+		const m = buildTransferMatrix(['vestige', 'api-gateway'], pats, 1);
+		expect(m.vestige.api-gateway.topNames).toEqual(['a']);
 	});
 });
 
@@ -276,7 +276,7 @@ describe('matrixMaxCount', () => {
 
 	it('returns the hottest cell count across all pairs', () => {
 		const m = buildTransferMatrix(PROJECTS, PATTERNS);
-		// vestige→nullgaze has 2; everything else is ≤1
+		// vestige→api-gateway has 2; everything else is ≤1
 		expect(matrixMaxCount(PROJECTS, m)).toBe(2);
 	});
 
@@ -297,12 +297,12 @@ describe('flattenNonZero', () => {
 		const m = buildTransferMatrix(PROJECTS, PATTERNS);
 		const rows = flattenNonZero(PROJECTS, m);
 		// Distinct non-zero cells in fixtures:
-		//   vestige→nullgaze  = 2
-		//   vestige→injeranet = 1
+		//   vestige→api-gateway  = 2
+		//   vestige→desktop-app = 1
 		//   vestige→vestige   = 1
-		//   nullgaze→vestige  = 1
+		//   api-gateway→vestige  = 1
 		expect(rows).toHaveLength(4);
-		expect(rows[0]).toMatchObject({ from: 'vestige', to: 'nullgaze', count: 2 });
+		expect(rows[0]).toMatchObject({ from: 'vestige', to: 'api-gateway', count: 2 });
 		// Later rows all tied at 1 — we only verify the leader.
 		expect(rows.slice(1).every((r) => r.count === 1)).toBe(true);
 	});

@@ -421,7 +421,7 @@ export class NodeManager {
 	/// The scene runs an UnrealBloomPass with threshold 0.2, so any bright
 	/// canvas pixels get smeared into a halo. Previously the labels were
 	/// near-white (#e2e8f0) text on a transparent background, which bloomed
-	/// into unreadable white blobs (issue filed by Sam 2026-04-19). The fix:
+	/// into unreadable white blobs (issue filed 2026-04-19). The fix:
 	///
 	///   1. A ~85%-opaque dark pill under the text so the background is
 	///      well below the bloom threshold, stopping the halo before it

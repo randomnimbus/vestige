@@ -55,7 +55,7 @@ For each claim, it checks Vestige's `deep_reference` for high-trust contradictin
 |---|---|
 | TECHNICAL / EXISTENTIAL / TIMELINE | VETO if memory trust > 0.55 directly contradicts |
 | BIOGRAPHICAL / FINANCIAL / ACHIEVEMENT / ATTRIBUTION | VETO if contradicted OR if factual-shaped with zero supporting evidence (fail-closed) |
-| **VAGUE-QUANTIFIER** | VETO on "a few wins / some prize money / most placed" without enumeration |
+| **VAGUE-QUANTIFIER** | VETO on vague achievement or financial claims without enumeration |
 | **UNVERIFIED-POSITIVE** | VETO on specific named institutions/dates/employers not in evidence |
 
 False-positive guards (added v2.1.0 after dogfood):
@@ -183,7 +183,7 @@ On M3 Max 14-core or M2/M1 Max: closer to 3–7s prompt processing, ~50–60 tok
 
 ## Architecture provenance
 
-The Cognitive Sandwich originated April 2026 as a defense against the AIMO3 36/50 failure mode — Claude retrieving relevant memories but summarizing them instead of composing them into recommendations. The pre-cognitive layer enforces composition; the post-cognitive layer catches contradictions before they ship.
+The Cognitive Sandwich originated April 2026 as a defense against a dogfood failure mode: Claude retrieved relevant memories but summarized them instead of composing them into a recommendation. The pre-cognitive layer enforces composition; the post-cognitive layer catches contradictions before they ship.
 
 Full architecture memory: search Vestige for `god-tier-plan` or `cognitive-sandwich` tags after install.
 

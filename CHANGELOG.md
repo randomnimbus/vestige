@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-05-01 — "Honest Memory"
+
+v2.1.2 focuses on operational trust: exact search stays exact, purge really removes content, contradictions are directly inspectable, and the update flow no longer depends on copied curl commands.
+
+### Added
+
+- **Concrete search mode** — `search` now auto-detects literal queries such as quoted strings, env vars, UUIDs, paths, and code identifiers. Those queries take a keyword/literal path that skips HyDE, semantic fusion, FSRS reweighting, retrieval competition, and spreading activation so exact matches land first.
+- **Irreversible purge** — `memory(action="purge", confirm=true)` permanently removes memory content and embeddings, scrubs `insights.source_memories`, detaches temporal-summary children, prunes graph edges, and writes only a non-content `deletion_tombstones` row for sync/audit.
+- **First-class contradictions tool** — new `contradictions` MCP tool scans a topic or recent memories for trust-weighted disagreements using the same local contradiction logic as `deep_reference`.
+- **Simple update flow** — `vestige update` refreshes the installed binary and companion Sandwich files without requiring users to paste a curl installer.
+- **Pro waitlist preview** — `/dashboard/waitlist` adds a local-only marketing surface for Solo Pro and Team Pro early-access signups. `VITE_WAITLIST_ENDPOINT` and `VITE_SUPPORT_BOT_ENDPOINT` are opt-in dashboard env vars, so no signup data is captured unless endpoints are configured.
+
 ### Fixed
 
 - **Dream connection persistence cap** — dense single-domain dreams now persist every connection discovered in that run instead of losing everything beyond the old 1,000-entry live buffer. The live dreamer buffer now keeps up to 200,000 high-scoring recent connections, and the MCP `dream` tool exposes `min_similarity` for corpus-specific tuning.

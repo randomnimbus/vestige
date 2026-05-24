@@ -1210,22 +1210,21 @@ impl McpServer {
                     .unwrap_or("")
                     .to_string();
                 match action {
-                    "delete" | "purge" => {
+                    "delete" | "purge"
                         if result
                             .get("success")
                             .and_then(|value| value.as_bool())
-                            .unwrap_or(false)
-                        {
-                            let node_id = result
-                                .get("nodeId")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or(&id)
-                                .to_string();
-                            self.emit(VestigeEvent::MemoryDeleted {
-                                id: node_id,
-                                timestamp: now,
-                            });
-                        }
+                            .unwrap_or(false) =>
+                    {
+                        let node_id = result
+                            .get("nodeId")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(&id)
+                            .to_string();
+                        self.emit(VestigeEvent::MemoryDeleted {
+                            id: node_id,
+                            timestamp: now,
+                        });
                     }
                     "promote" => {
                         let retention = result

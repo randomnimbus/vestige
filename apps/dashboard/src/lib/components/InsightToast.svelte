@@ -20,6 +20,7 @@
 		MemoryUnsuppressed: '◉',
 		Rac1CascadeSwept: '✺',
 		MemoryDeleted: '✕',
+		HookVerdictRecorded: '⚑',
 	};
 
 	function iconFor(type: VestigeEventType): string {
@@ -90,7 +91,7 @@
 			right: 0.75rem;
 			left: 0.75rem;
 			bottom: auto;
-			top: 0.75rem;
+			top: 5.25rem;
 			max-width: none;
 			width: auto;
 			align-items: stretch;

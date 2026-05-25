@@ -16,6 +16,7 @@
 	import ForgettingIndicator from '$lib/components/ForgettingIndicator.svelte';
 	import InsightToast from '$lib/components/InsightToast.svelte';
 	import AmbientAwarenessStrip from '$lib/components/AmbientAwarenessStrip.svelte';
+	import VerdictBar from '$lib/components/VerdictBar.svelte';
 	import ThemeToggle from '$lib/components/ThemeToggle.svelte';
 	import { initTheme } from '$stores/theme';
 
@@ -199,6 +200,7 @@
 		<!-- Main content -->
 		<main class="flex-1 flex flex-col min-h-0 pb-16 md:pb-0">
 			<AmbientAwarenessStrip />
+			<VerdictBar />
 			<div class="animate-page-in flex-1 min-h-0 overflow-y-auto">
 				{@render children()}
 			</div>

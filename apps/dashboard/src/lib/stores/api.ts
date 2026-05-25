@@ -12,7 +12,10 @@ import type {
 	ConsolidationResult,
 	IntentionItem,
 	SuppressResult,
-	UnsuppressResult
+	UnsuppressResult,
+	SanhedrinAppealReason,
+	SanhedrinAppealResponse,
+	SanhedrinLatestResponse
 } from '$types';
 
 const BASE = '/api';
@@ -119,5 +122,14 @@ export const api = {
 		fetcher<Record<string, unknown>>('/deep_reference', {
 			method: 'POST',
 			body: JSON.stringify({ query, depth })
-		})
+		}),
+
+	sanhedrin: {
+		latest: () => fetcher<SanhedrinLatestResponse>('/sanhedrin/latest'),
+		appeal: (reason: SanhedrinAppealReason, note?: string, claimId?: string, receiptId?: string) =>
+			fetcher<SanhedrinAppealResponse>('/sanhedrin/appeal', {
+				method: 'POST',
+				body: JSON.stringify({ reason, note, claimId, receiptId })
+			})
+	}
 };

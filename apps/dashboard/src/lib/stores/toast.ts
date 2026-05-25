@@ -61,6 +61,13 @@ function createToastStore() {
 		update(list => {
 			const next = [entry, ...list];
 			if (next.length > MAX_VISIBLE) {
+				for (const dropped of next.slice(MAX_VISIBLE)) {
+					const handle = dwellTimers.get(dropped.id);
+					if (handle) clearTimeout(handle);
+					dwellTimers.delete(dropped.id);
+					dwellPaused.delete(dropped.id);
+					dwellStart.delete(dropped.id);
+				}
 				return next.slice(0, MAX_VISIBLE);
 			}
 			return next;
@@ -226,6 +233,18 @@ function createToastStore() {
 					body: String(d.id ?? '').slice(0, 8),
 					color,
 					dwellMs: 4000,
+				};
+			}
+
+			case 'HookVerdictRecorded': {
+				const verdict = String(d.verdict ?? 'NOTE');
+				const reason = String(d.reason ?? 'Sanhedrin receipt updated');
+				return {
+					type: event.type,
+					title: `Sanhedrin ${verdict}`,
+					body: reason,
+					color,
+					dwellMs: verdict === 'VETO' ? 8000 : DEFAULT_DWELL_MS,
 				};
 			}
 

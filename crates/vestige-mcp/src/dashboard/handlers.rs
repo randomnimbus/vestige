@@ -3,6 +3,9 @@
 //! v2.0: Adds cognitive operation endpoints (dream, explore, predict, importance, consolidation)
 
 use std::cmp::Reverse;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path as FsPath, PathBuf};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -340,6 +343,328 @@ pub async fn unsuppress_memory(
         "retrievalStrength": node.retrieval_strength,
         "stability": node.stability,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SanhedrinAppealRequest {
+    pub reason: String,
+    pub note: Option<String>,
+    #[serde(rename = "receiptId")]
+    pub receipt_id: Option<String>,
+    #[serde(rename = "claimId")]
+    pub claim_id: Option<String>,
+}
+
+/// Return the latest Sanhedrin receipt written by the Stop-hook bridge.
+pub async fn get_sanhedrin_latest() -> Result<Json<Value>, StatusCode> {
+    let state_dir = sanhedrin_state_dir();
+    let latest_path = state_dir.join("latest.json");
+    if !latest_path.exists() {
+        return Ok(Json(serde_json::json!({
+            "receipt": null,
+            "stateDir": state_dir,
+        })));
+    }
+
+    let raw = fs::read_to_string(&latest_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let receipt: Value =
+        serde_json::from_str(&raw).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "receipt": receipt,
+        "stateDir": state_dir,
+        "receiptPath": latest_path,
+        "htmlPath": state_dir.join("latest.html"),
+    })))
+}
+
+/// Record feedback that a Sanhedrin veto was stale, wrong, or too strict.
+///
+/// This intentionally does not promote, demote, suppress, edit, or delete any
+/// memory. The hook reads this ledger and suppresses future same-fingerprint
+/// vetoes, which keeps appeal training scoped to Sanhedrin behavior.
+pub async fn appeal_sanhedrin(
+    State(state): State<AppState>,
+    Json(req): Json<SanhedrinAppealRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let reason = req.reason.trim().to_ascii_lowercase();
+    if !matches!(reason.as_str(), "stale" | "wrong" | "too_strict") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let state_dir = sanhedrin_state_dir();
+    let latest_path = state_dir.join("latest.json");
+    let raw = match fs::read_to_string(&latest_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let mut receipt: Value = serde_json::from_str(&raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let original_receipt = receipt.clone();
+    let note = req.note.unwrap_or_default();
+    let receipt_id = receipt
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let receipt_id_ref = receipt_id.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+    let _ = sanitize_receipt_id(receipt_id_ref)?;
+    let expected_receipt_id = req.receipt_id.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+    if expected_receipt_id != receipt_id_ref {
+        return Err(StatusCode::CONFLICT);
+    }
+    if receipt
+        .get("verdictBar")
+        .and_then(Value::as_str)
+        .map(|v| v != "VETO")
+        .unwrap_or(true)
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    let claim = mark_sanhedrin_claim(&mut receipt, &reason, &note, req.claim_id.as_deref())?;
+
+    let appeal = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "receiptId": receipt_id.as_deref(),
+        "claimId": claim.get("id").and_then(Value::as_str),
+        "claimFingerprint": claim.get("fingerprint").and_then(Value::as_str),
+        "claim": claim.get("text").and_then(Value::as_str),
+        "reason": &reason,
+        "note": &note,
+        "status": "active",
+    });
+
+    set_json_field(&mut receipt, "overall", "appealed");
+    set_json_field(&mut receipt, "verdictBar", "APPEALED");
+    set_json_field(&mut receipt, "summary", &format!("Appealed as {}.", reason));
+    save_sanhedrin_receipt(&state_dir, &receipt)?;
+    if let Err(err) = append_sanhedrin_appeal(&state_dir, &appeal) {
+        let _ = save_sanhedrin_receipt(&state_dir, &original_receipt);
+        return Err(err);
+    }
+
+    state.emit(VestigeEvent::HookVerdictRecorded {
+        hook: "sanhedrin".to_string(),
+        verdict: "APPEALED".to_string(),
+        phase: "appeal".to_string(),
+        reason: reason.clone(),
+        receipt_id: receipt_id.clone(),
+        timestamp: Utc::now(),
+    });
+
+    Ok(Json(serde_json::json!({
+        "appeal": appeal,
+        "receipt": receipt,
+    })))
+}
+
+fn sanhedrin_state_dir() -> PathBuf {
+    std::env::var_os("VESTIGE_SANHEDRIN_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".vestige/sanhedrin"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".vestige/sanhedrin"))
+}
+
+fn ensure_sanhedrin_dirs(state_dir: &FsPath) -> Result<(), StatusCode> {
+    fs::create_dir_all(state_dir.join("receipts")).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn mark_sanhedrin_claim(
+    receipt: &mut Value,
+    reason: &str,
+    note: &str,
+    claim_id: Option<&str>,
+) -> Result<Value, StatusCode> {
+    let claim_id = claim_id.ok_or(StatusCode::BAD_REQUEST)?;
+    let claims = receipt
+        .get_mut("claims")
+        .and_then(Value::as_array_mut)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    if claims.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let selected = claims
+        .iter()
+        .position(|claim| claim.get("id").and_then(Value::as_str) == Some(claim_id))
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if claims
+        .get(selected)
+        .and_then(|claim| claim.get("decision"))
+        .and_then(Value::as_str)
+        != Some("veto")
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let claim = claims
+        .get_mut(selected)
+        .and_then(Value::as_object_mut)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    claim.insert(
+        "decision".to_string(),
+        Value::String("appealed".to_string()),
+    );
+    claim.insert(
+        "evidence_state".to_string(),
+        Value::String("appealed".to_string()),
+    );
+    claim.insert(
+        "appeal".to_string(),
+        serde_json::json!({
+            "status": "appealed",
+            "lastReason": reason,
+            "note": note,
+            "actions": ["stale", "wrong", "too_strict"],
+        }),
+    );
+
+    Ok(Value::Object(claim.clone()))
+}
+
+fn set_json_field(receipt: &mut Value, key: &str, value: &str) {
+    if let Some(obj) = receipt.as_object_mut() {
+        obj.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn save_sanhedrin_receipt(state_dir: &FsPath, receipt: &Value) -> Result<(), StatusCode> {
+    ensure_sanhedrin_dirs(state_dir)?;
+    let rendered = render_sanhedrin_receipt_html(receipt);
+    let pretty = serde_json::to_string_pretty(receipt).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let safe_id = receipt
+        .get("id")
+        .and_then(Value::as_str)
+        .map(sanitize_receipt_id)
+        .transpose()?;
+
+    if let Some(safe_id) = safe_id {
+        write_atomic(
+            &state_dir.join("receipts").join(format!("{}.json", safe_id)),
+            pretty.as_bytes(),
+        )?;
+        write_atomic(
+            &state_dir.join("receipts").join(format!("{}.html", safe_id)),
+            rendered.as_bytes(),
+        )?;
+    }
+
+    write_atomic(&state_dir.join("latest.json"), pretty.as_bytes())?;
+    write_atomic(&state_dir.join("latest.html"), rendered.as_bytes())?;
+    Ok(())
+}
+
+fn append_sanhedrin_appeal(state_dir: &FsPath, appeal: &Value) -> Result<(), StatusCode> {
+    ensure_sanhedrin_dirs(state_dir)?;
+    let mut appeals = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir.join("appeals.jsonl"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    writeln!(appeals, "{}", appeal).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn sanitize_receipt_id(id: &str) -> Result<&str, StatusCode> {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        Ok(id)
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
+}
+
+fn write_atomic(path: &FsPath, bytes: &[u8]) -> Result<(), StatusCode> {
+    let parent = path.parent().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    fs::create_dir_all(parent).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::write(&tmp, bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    fs::rename(&tmp, path).map_err(|_| {
+        let _ = fs::remove_file(&tmp);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+fn render_sanhedrin_receipt_html(receipt: &Value) -> String {
+    let verdict = escape_html(
+        receipt
+            .get("verdictBar")
+            .and_then(Value::as_str)
+            .unwrap_or("PASS"),
+    );
+    let summary = escape_html(receipt.get("summary").and_then(Value::as_str).unwrap_or(""));
+    let mut claims_html = String::new();
+
+    if let Some(claims) = receipt.get("claims").and_then(Value::as_array) {
+        for claim in claims {
+            let text = escape_html(claim.get("text").and_then(Value::as_str).unwrap_or(""));
+            let decision = escape_html(claim.get("decision").and_then(Value::as_str).unwrap_or(""));
+            let evidence_state = escape_html(
+                claim
+                    .get("evidence_state")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            );
+            let fix = escape_html(
+                claim
+                    .get("fix")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("No change required."),
+            );
+            let mut precedents = String::new();
+            if let Some(items) = claim.get("precedent").and_then(Value::as_array) {
+                for item in items {
+                    let summary = item
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Precedent recorded.");
+                    precedents.push_str(&format!("<li>{}</li>", escape_html(summary)));
+                }
+            }
+            claims_html.push_str(&format!(
+                "<section class='claim'><div class='meta'>{} / {}</div><h2>{}</h2><p><strong>Fix:</strong> {}</p><p><strong>Appeal:</strong> stale | wrong | too_strict</p><ul>{}</ul></section>",
+                decision, evidence_state, text, fix, precedents
+            ));
+        }
+    }
+
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Vestige Veto Receipt</title>
+<style>
+body{{margin:0;background:#050509;color:#e7e7f4;font-family:Inter,ui-sans-serif,system-ui;padding:32px}}
+.bar{{display:inline-flex;gap:10px;align-items:center;border:1px solid #6d5dfc66;border-radius:8px;padding:10px 14px;background:#171528}}
+.status{{font-weight:800;color:#fff;letter-spacing:.08em}}
+.claim{{margin-top:18px;border:1px solid #ffffff1a;border-radius:8px;padding:16px;background:#0e0f18}}
+.meta{{font-size:12px;color:#a8a8c8;text-transform:uppercase;letter-spacing:.08em}}
+h1{{font-size:24px;margin:18px 0 4px}} h2{{font-size:16px;line-height:1.4}} p,li{{color:#c7c7dd}}
+</style></head><body>
+<div class="bar"><span>Verdict</span><span class="status">{}</span></div>
+<h1>Veto Receipt</h1><p>{}</p>{}
+</body></html>"#,
+        verdict, summary, claims_html
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Get system stats

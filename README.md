@@ -20,6 +20,19 @@ Built on proven memory and retrieval ideas — FSRS-6 spaced repetition, predict
 
 ---
 
+## What's New in v2.1.22 "Sanhedrin Receipts"
+
+v2.1.22 makes the optional Sanhedrin hook accountable enough to trust in daily
+agent work. Vetoes now leave local receipts, verification claims need real
+command evidence, and users can appeal stale or over-strict blocks from the
+dashboard.
+
+- **Receipt Lock.** Claims like "tests passed", "build is green", or "lint is clean" are blocked unless the current transcript contains a matching successful command receipt.
+- **Screenshotable veto receipts.** Sanhedrin writes `~/.vestige/sanhedrin/latest.json` and `latest.html` with Claim -> Verdict -> Precedent -> Fix -> Appeal.
+- **Dashboard Verdict Bar.** The dashboard shows PASS, NOTE, CAUTION, VETO, or APPEALED globally, expands into the receipt, and records stale/wrong/too-strict appeals.
+- **Claim ledger.** Claim-mode Sanhedrin output now maps every extracted claim into structured JSON instead of treating the whole draft as one blob.
+- **Appeal training.** Appeals are saved to `appeals.jsonl` and suppress future vetoes for the same claim fingerprint.
+
 ## What's New in v2.1.21 "Agent-Neutral Hardening"
 
 v2.1.21 tightens Vestige for normal use across MCP-compatible agents, without

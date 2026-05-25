@@ -85,6 +85,16 @@ pub enum VestigeEvent {
         timestamp: DateTime<Utc>,
     },
 
+    // -- Hook verdicts --
+    HookVerdictRecorded {
+        hook: String,
+        verdict: String,
+        phase: String,
+        reason: String,
+        receipt_id: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
+
     // -- Dream --
     DreamStarted {
         memory_count: usize,

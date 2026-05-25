@@ -167,6 +167,7 @@ export type VestigeEventType =
 	| 'ActivationSpread'
 	| 'ImportanceScored'
 	| 'DeepReferenceCompleted'
+	| 'HookVerdictRecorded'
 	| 'Heartbeat';
 
 export interface VestigeEvent {
@@ -200,6 +201,64 @@ export interface UnsuppressResult {
 	retentionStrength: number;
 	retrievalStrength: number;
 	stability: number;
+}
+
+export type VerdictLevel = 'PASS' | 'NOTE' | 'CAUTION' | 'VETO' | 'APPEALED';
+export type SanhedrinAppealReason = 'stale' | 'wrong' | 'too_strict';
+
+export interface SanhedrinAppealState {
+	status: 'open' | 'appealed';
+	actions?: SanhedrinAppealReason[];
+	lastReason?: SanhedrinAppealReason;
+	note?: string;
+}
+
+export interface SanhedrinPrecedent {
+	type?: string;
+	summary?: string;
+	command?: string;
+	exitCode?: number | null;
+	evidence?: string;
+}
+
+export interface SanhedrinClaim {
+	id: string;
+	text: string;
+	fingerprint: string;
+	class: string;
+	subject: string;
+	risk: string;
+	evidence_state: string;
+	decision: string;
+	precedent: SanhedrinPrecedent[];
+	fix: string;
+	appeal: SanhedrinAppealState;
+}
+
+export interface SanhedrinReceipt {
+	schema: string;
+	id: string;
+	draftId: string;
+	createdAt: string;
+	overall: string;
+	verdictBar: VerdictLevel;
+	summary: string;
+	draftPreview: string;
+	claims: SanhedrinClaim[];
+	receipts: Array<Record<string, unknown>>;
+	source?: Record<string, unknown>;
+}
+
+export interface SanhedrinLatestResponse {
+	receipt: SanhedrinReceipt | null;
+	stateDir: string;
+	receiptPath?: string;
+	htmlPath?: string;
+}
+
+export interface SanhedrinAppealResponse {
+	appeal: Record<string, unknown>;
+	receipt: SanhedrinReceipt;
 }
 
 // Intentions (prospective memory)
@@ -238,6 +297,7 @@ export const EVENT_TYPE_COLORS: Record<string, string> = {
 	Rac1CascadeSwept: '#6E3FFF',
 	SearchPerformed: '#818CF8',
 	DeepReferenceCompleted: '#C4B5FD',
+	HookVerdictRecorded: '#F59E0B',
 	DreamStarted: '#9D00FF',
 	DreamProgress: '#B44AFF',
 	DreamCompleted: '#C084FC',

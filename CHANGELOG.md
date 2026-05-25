@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.22] - 2026-05-25 — "Sanhedrin Receipts"
+
+v2.1.22 makes the optional Sanhedrin hook quieter and more accountable by
+turning draft judgment into local, appealable receipts instead of opaque vetoes.
+
+### Added
+
+- **Receipt Lock** blocks unsupported verification claims such as "tests passed"
+  unless the current transcript contains a matching successful test, build,
+  lint, or typecheck command receipt.
+- **Veto receipts** are written to `~/.vestige/sanhedrin/latest.json` and
+  `latest.html` with Claim -> Verdict -> Precedent -> Fix -> Appeal fields.
+- **Dashboard Verdict Bar** surfaces the latest PASS, NOTE, CAUTION, VETO, or
+  APPEALED state and lets users appeal stale, wrong, or too-strict vetoes.
+- **Appeal training** records feedback in `appeals.jsonl` and suppresses future
+  vetoes for the same claim fingerprint.
+
+### Changed
+
+- Sanhedrin claim-mode output now feeds a per-claim receipt ledger while keeping
+  the existing one-line Stop-hook contract for Claude Code.
+
 ## [2.1.21] - 2026-05-24 — "Agent-Neutral Hardening"
 
 v2.1.21 is a release-hardening pass for normal MCP usage across agents. It keeps

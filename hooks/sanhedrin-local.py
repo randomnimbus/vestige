@@ -25,7 +25,14 @@ import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import sanhedrin_core
+except Exception:
+    sanhedrin_core = None
 
 
 def env_int(name: str, default: int) -> int:
@@ -1059,6 +1066,139 @@ def render_legacy_from_verdicts(verdicts: list[ClaimVerdict]) -> str:
     return f"no - [Sanhedrin Veto] [{chosen.claim.claim_class}]: {reason}"
 
 
+def recompute_legacy_from_result(result: dict[str, Any]) -> str:
+    vetoes = []
+    for raw in result.get("verdicts", []):
+        claim = raw.get("claim", {}) if isinstance(raw, dict) else {}
+        status = str(raw.get("status", ""))
+        if status not in {"REFUTED", "REFUTED_BY_ABSENCE"}:
+            continue
+        vetoes.append(
+            (
+                SEVERITY_ORDER.get(str(claim.get("claim_class", "")), 99),
+                int(claim.get("source_index", 0) or 0),
+                str(claim.get("claim_class", "TECHNICAL")),
+                truncate_chars(str(raw.get("reason") or claim.get("text") or ""), 140),
+            )
+        )
+    if not vetoes:
+        return "yes"
+    _, _, claim_class, reason = sorted(vetoes)[0]
+    return f"no - [Sanhedrin Veto] [{claim_class}]: {reason}"
+
+
+def apply_appeals_to_claim_mode_result(result: dict[str, Any]) -> dict[str, Any]:
+    if sanhedrin_core is None:
+        return result
+    appeals = sanhedrin_core.load_appeals()
+    changed = False
+    for raw in result.get("verdicts", []):
+        if not isinstance(raw, dict) or raw.get("status") not in {"REFUTED", "REFUTED_BY_ABSENCE"}:
+            continue
+        claim = raw.get("claim", {}) if isinstance(raw.get("claim"), dict) else {}
+        text = str(claim.get("text") or "")
+        if sanhedrin_core.is_appealed({"fingerprint": sanhedrin_core.claim_fingerprint(text)}, appeals):
+            raw["status"] = "APPEALED"
+            raw["reason"] = "Prior appeal suppresses this Sanhedrin veto."
+            changed = True
+
+    if changed:
+        legacy = recompute_legacy_from_result(result)
+        result["legacy_verdict"] = legacy
+        result["decision"] = "yes" if legacy == "yes" else "no"
+        result["verdict"] = result["decision"]
+        result["passed"] = legacy == "yes"
+        result["reason"] = "" if result["passed"] else legacy.split(" - ", 1)[-1]
+    return result
+
+
+def save_claim_mode_receipt(
+    draft: str,
+    result: dict[str, Any],
+    manifest: dict[str, Any] | None = None,
+) -> None:
+    if sanhedrin_core is None:
+        return
+    manifest = manifest or sanhedrin_core.new_manifest(draft)
+    claims = []
+    for idx, raw in enumerate(result.get("verdicts", []), start=1):
+        if not isinstance(raw, dict):
+            continue
+        claim = raw.get("claim", {}) if isinstance(raw.get("claim"), dict) else {}
+        text = str(claim.get("text") or "")
+        claim_class = str(claim.get("claim_class") or "TECHNICAL")
+        status = str(raw.get("status") or "NEI")
+        evidence_ids = raw.get("evidence_ids") if isinstance(raw.get("evidence_ids"), list) else []
+        if status == "SUPPORTED":
+            decision = "pass"
+            evidence_state = "supported"
+            fix = "No change required."
+        elif status == "APPEALED":
+            decision = "appealed"
+            evidence_state = "appealed"
+            fix = "Prior appeal suppresses this veto fingerprint."
+        elif status == "REFUTED_BY_ABSENCE":
+            decision = "veto"
+            evidence_state = "missing_precedent"
+            fix = "Remove the unsupported user-specific claim or cite durable Vestige evidence first."
+        elif status == "REFUTED":
+            decision = "veto"
+            evidence_state = "contradicted"
+            fix = "Remove or qualify the contradicted claim using the cited Vestige precedent."
+        else:
+            decision = "pass_unverified"
+            evidence_state = "not_enough_information"
+            fix = "No blocking change required."
+        claims.append(
+            {
+                "id": f"c{idx:03d}",
+                "text": text,
+                "fingerprint": sanhedrin_core.claim_fingerprint(text),
+                "class": claim_class,
+                "subject": "Sam" if bool(claim.get("sam_critical")) else "draft",
+                "risk": "hard" if bool(claim.get("sam_critical")) else "normal",
+                "evidence_state": evidence_state,
+                "decision": decision,
+                "precedent": [
+                    {
+                        "type": "vestige",
+                        "summary": str(raw.get("reason") or status),
+                        "evidence": ", ".join(str(eid) for eid in evidence_ids[:5]),
+                        "durableCount": raw.get("durable_evidence_count"),
+                        "highTrustCount": raw.get("high_trust_evidence_count"),
+                    }
+                ],
+                "fix": fix,
+                "appeal": {
+                    "status": "appealed" if decision == "appealed" else "open",
+                    "actions": ["stale", "wrong", "too_strict"],
+                },
+            }
+        )
+
+    manifest["claims"] = claims
+    manifest["overall"] = "pass" if result.get("passed") else "veto"
+    if any(claim["decision"] == "appealed" for claim in claims):
+        manifest["overall"] = "pass_with_warnings" if result.get("passed") else manifest["overall"]
+        manifest["verdictBar"] = "APPEALED"
+        manifest["summary"] = "Prior appeal suppressed a Sanhedrin veto."
+    elif result.get("passed"):
+        manifest["verdictBar"] = "PASS" if not claims else "NOTE"
+        manifest["summary"] = "Sanhedrin found no blocking claim issues."
+    else:
+        manifest["verdictBar"] = "VETO"
+        manifest["summary"] = str(result.get("reason") or "Sanhedrin blocked a claim.")
+    sanhedrin_core.save_manifest(manifest)
+
+
+def save_legacy_receipt(manifest: dict[str, Any] | None, verdict: str, evidence: str = "") -> str:
+    if sanhedrin_core is None or manifest is None:
+        return verdict
+    updated = sanhedrin_core.apply_model_verdict(manifest, verdict, evidence)
+    sanhedrin_core.save_manifest(manifest)
+    return updated
+
+
 def claim_mode_result(draft: str) -> dict[str, Any]:
     claims = extract_check_worthy_claims(draft)
     staged = load_staged_evidence(os.environ.get(STAGE_FILE_ENV))
@@ -1105,8 +1245,18 @@ def main() -> None:
         print("yes")
         return
 
+    manifest = sanhedrin_core.new_manifest(draft) if sanhedrin_core is not None else None
+    if sanhedrin_core is not None and manifest is not None:
+        receipt_veto = sanhedrin_core.apply_receipt_lock(manifest)
+        if receipt_veto:
+            sanhedrin_core.save_manifest(manifest)
+            print(f"no - [Sanhedrin Veto] [TECHNICAL]: {receipt_veto}")
+            return
+
     if env_flag(CLAIM_MODE_ENV):
-        print_claim_mode_result(claim_mode_result(draft))
+        result = apply_appeals_to_claim_mode_result(claim_mode_result(draft))
+        save_claim_mode_receipt(draft, result, manifest)
+        print_claim_mode_result(result)
         return
 
     evidence, high_trust_count = fetch_evidence(draft)
@@ -1115,6 +1265,7 @@ def main() -> None:
     # without something concrete to cite. Eliminates the common false-positive
     # mode where the model invents a contradiction from low-trust noise.
     if high_trust_count == 0:
+        save_legacy_receipt(manifest, "yes", evidence)
         print("yes")
         return
 
@@ -1122,9 +1273,11 @@ def main() -> None:
 
     if not verdict:
         # Fail-open: server unreachable, malformed response, etc.
+        save_legacy_receipt(manifest, "yes", evidence)
         print("yes")
         return
 
+    verdict = save_legacy_receipt(manifest, verdict, evidence)
     print(verdict)
 
 

@@ -30,7 +30,7 @@ load_vestige_sanhedrin_env() {
   command -v python3 >/dev/null 2>&1 || return 0
   while IFS="$(printf '\t')" read -r key value; do
     case "$key" in
-      VESTIGE_SANHEDRIN_ENABLED|VESTIGE_SANHEDRIN_MODEL|VESTIGE_SANHEDRIN_ENDPOINT|VESTIGE_SANHEDRIN_CLAIM_MODE|VESTIGE_SANHEDRIN_OUTPUT|VESTIGE_SANHEDRIN_PYTHON|VESTIGE_DASHBOARD_PORT)
+      VESTIGE_SANHEDRIN_ENABLED|VESTIGE_SANHEDRIN_MODEL|VESTIGE_SANHEDRIN_ENDPOINT|VESTIGE_SANHEDRIN_CLAIM_MODE|VESTIGE_SANHEDRIN_OUTPUT|VESTIGE_SANHEDRIN_PYTHON|VESTIGE_SANHEDRIN_STATE_DIR|VESTIGE_SANHEDRIN_ALLOW_COMMAND_LEDGER|VESTIGE_DASHBOARD_PORT)
         export "$key=$value"
         ;;
     esac
@@ -45,6 +45,8 @@ allowed = {
     "VESTIGE_SANHEDRIN_CLAIM_MODE",
     "VESTIGE_SANHEDRIN_OUTPUT",
     "VESTIGE_SANHEDRIN_PYTHON",
+    "VESTIGE_SANHEDRIN_STATE_DIR",
+    "VESTIGE_SANHEDRIN_ALLOW_COMMAND_LEDGER",
     "VESTIGE_DASHBOARD_PORT",
 }
 
@@ -117,7 +119,7 @@ DRAFT_SCRIPT="$(mktemp -t vestige-sanhedrin-draft.XXXXXX)"
 trap 'rm -f "$DRAFT_SCRIPT"' EXIT
 
 cat > "$DRAFT_SCRIPT" <<'DRAFT_PYEOF'
-import json, os, sys
+import json, os, re, sys
 
 transcript = os.environ.get("TRANSCRIPT_PATH", "")
 last_assistant = ""
@@ -146,21 +148,31 @@ try:
 except Exception:
     sys.exit(0)
 
-# Print nothing if no draft or draft too short to contain a technical claim
+# Print nothing if no draft. Short verification claims still need Receipt Lock.
 stripped = last_assistant.strip()
-if not stripped or len(stripped) < 100:
+if not stripped:
     sys.exit(0)
 
 # Legacy gate: only check drafts that contain technical indicators. Claim mode
 # deliberately broadens this to any substantive assistant draft while keeping
 # Sanhedrin opt-in through VESTIGE_SANHEDRIN_ENABLED.
 claim_mode = os.environ.get("VESTIGE_SANHEDRIN_CLAIM_MODE", "") == "1"
+receipt_gate = bool(
+    re.search(
+        r"\b((all\s+)?(tests?|test suite|build|lint|typecheck|checks?|cargo test|npm test|pnpm test|pytest|vitest|jest|playwright|tsc|clippy)\s+(passed|passes|passing|green|succeeded|succeeds|clean)|(verified|validated|confirmed)\s+(with|by|via))\b",
+        stripped,
+        re.I,
+    )
+)
+if len(stripped) < 100 and not receipt_gate:
+    sys.exit(0)
+
 if not claim_mode:
     has_code = "`" in stripped or "```" in stripped
     has_cmd = any(kw in stripped.lower() for kw in ["install", "run ", "use ", "call ", "invoke", "execute"])
     has_path = "/" in stripped and any(ext in stripped for ext in [".rs", ".ts", ".py", ".sh", ".md", ".json"])
 
-    if not (has_code or has_cmd or has_path):
+    if not (has_code or has_cmd or has_path or receipt_gate):
         sys.exit(0)
 
 # Truncate to 4000 chars to keep Haiku prompt bounded
@@ -190,6 +202,7 @@ fi
 # === SPAWN LOCAL EXECUTIONER (background with timeout) ===
 OUTPUT_FILE="$(mktemp -t vestige-sanhedrin-out.XXXXXX)"
 trap 'rm -f "$DRAFT_SCRIPT" "$OUTPUT_FILE"' EXIT
+export VESTIGE_SANHEDRIN_TRANSCRIPT="$TRANSCRIPT_PATH"
 
 (
   printf '%s\n' "$DRAFT" | "$PYTHON_BIN" "$BRIDGE" > "$OUTPUT_FILE" 2>/dev/null
@@ -225,6 +238,22 @@ sanhedrin_veto() {
   REASON="$1"
   REASON="$(printf '%s' "$REASON" | "$PYTHON_BIN" -c 'import sys; print(sys.stdin.read().strip())' 2>/dev/null || printf '%s' "$REASON")"
 
+  if printf '%s' "$REASON" | /usr/bin/grep -qi 'Receipt Lock'; then
+    cat >&2 <<SANHEDRIN_RECEIPT_MSG
+[SANHEDRIN VETO - Receipt Lock rejected draft]
+
+$REASON
+
+You may NOT stop with an unsupported verification claim. Either run the
+matching test/build/lint/typecheck command successfully in this session, or
+rewrite the response to say the command was not run.
+
+Receipt artifact:
+~/.vestige/sanhedrin/latest.html
+SANHEDRIN_RECEIPT_MSG
+    exit 2
+  fi
+
   cat >&2 <<SANHEDRIN_MSG
 [SANHEDRIN VETO - Post-Cognitive Executioner (LOCAL) rejected draft]
 
@@ -240,6 +269,9 @@ correct replacement pattern from its \`recommended\` field.
 
 Bridge script:
 ~/.claude/hooks/sanhedrin-local.py
+
+Receipt artifact:
+~/.vestige/sanhedrin/latest.html
 SANHEDRIN_MSG
   exit 2
 }

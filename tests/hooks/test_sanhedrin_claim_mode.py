@@ -41,12 +41,76 @@ class SanhedrinClaimModeTests(unittest.TestCase):
     def setUp(self):
         self.sanhedrin = load_sanhedrin()
 
+    @contextlib.contextmanager
+    def isolated_receipt_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            core = self.sanhedrin.sanhedrin_core
+            with patched_attr(core, "STATE_DIR", state_dir), patched_attr(
+                core, "RECEIPTS_DIR", state_dir / "receipts"
+            ), patched_attr(core, "LATEST_JSON", state_dir / "latest.json"), patched_attr(
+                core, "LATEST_HTML", state_dir / "latest.html"
+            ), patched_attr(
+                core, "APPEALS_JSONL", state_dir / "appeals.jsonl"
+            ), patched_attr(
+                core, "COMMAND_RECEIPTS_JSONL", state_dir / "command-receipts.jsonl"
+            ):
+                yield state_dir
+
     def run_main(self, draft):
         stdin = io.StringIO(draft)
         stdout = io.StringIO()
         with mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stdout", stdout):
             self.sanhedrin.main()
         return stdout.getvalue().strip()
+
+    def test_receipt_lock_blocks_unbacked_test_claim(self):
+        with self.isolated_receipt_state() as state_dir:
+            out = self.run_main("All tests passed.")
+
+            self.assertIn("Receipt Lock", out)
+            receipt = json.loads((state_dir / "latest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(receipt["verdictBar"], "VETO")
+        self.assertEqual(receipt["claims"][0]["decision"], "veto")
+        self.assertEqual(receipt["claims"][0]["evidence_state"], "missing_receipt")
+
+    def test_receipt_lock_allows_matching_success_receipt(self):
+        with self.isolated_receipt_state() as state_dir, mock.patch.dict(
+            os.environ, {"VESTIGE_SANHEDRIN_ALLOW_COMMAND_LEDGER": "1"}, clear=False
+        ):
+            (state_dir / "command-receipts.jsonl").write_text(
+                json.dumps({
+                    "command": "cargo test --workspace --release",
+                    "exitCode": 0,
+                    "success": True,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            out = self.run_main("All tests passed.")
+            receipt = json.loads((state_dir / "latest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(out, "yes")
+        self.assertNotEqual(receipt["verdictBar"], "VETO")
+        self.assertEqual(receipt["claims"][0]["decision"], "pass")
+
+    def test_receipt_lock_appeal_suppresses_same_fingerprint(self):
+        with self.isolated_receipt_state() as state_dir:
+            fingerprint = self.sanhedrin.sanhedrin_core.claim_fingerprint("All tests passed.")
+            (state_dir / "appeals.jsonl").write_text(
+                json.dumps({
+                    "claimFingerprint": fingerprint,
+                    "reason": "too_strict",
+                    "status": "active",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            out = self.run_main("All tests passed.")
+            receipt = json.loads((state_dir / "latest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(out, "yes")
+        self.assertEqual(receipt["verdictBar"], "APPEALED")
+        self.assertEqual(receipt["claims"][0]["decision"], "appealed")
 
     def test_plain_sam_biographical_achievement_claim_is_check_worthy(self):
         claims = self.sanhedrin.extract_check_worthy_claims(

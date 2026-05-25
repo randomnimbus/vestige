@@ -82,13 +82,25 @@ pub struct ServerCapabilities {
 // ============================================================================
 
 /// Tool description for tools/list
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDescription {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: Value,
+    /// Per-tool `_meta` annotations from the MCP wire spec.
+    ///
+    /// Notable keys recognized by Claude Code (v2.1.91+):
+    /// - `anthropic/maxResultSizeChars` (integer, up to 500_000):
+    ///   per-tool override of the 50K default `CallToolResult` truncation
+    ///   ceiling. Pinned on the Tool definition; applies to every invocation.
+    ///
+    /// Free-form `serde_json::Value` (typically an object) so additional
+    /// vendor-specific `_meta` keys can be added without further schema
+    /// changes.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Result of tools/list

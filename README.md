@@ -444,6 +444,56 @@ cargo build --release -p vestige-mcp --features qwen3-embeddings,metal
 VESTIGE_EMBEDDING_MODEL=qwen3-0.6b vestige consolidate
 ```
 
+### Building with CUDA support (NVIDIA hosts — Windows / Linux)
+
+The `cuda` feature routes Qwen3 embedding through NVIDIA GPUs via
+`candle-core/cuda`. On a host with the CUDA toolkit installed and a
+supported NVIDIA runtime, this drops Qwen3-Embedding inference from
+CPU-bound to GPU-bound (typically ~40-50x speedup for batched workloads).
+
+```bash
+# Linux / Windows + CUDA toolkit (12.x or 13.x)
+cargo build --release -p vestige-mcp --features qwen3-embeddings,cuda
+
+# Optional cuDNN acceleration on top of CUDA
+cargo build --release -p vestige-mcp --features qwen3-embeddings,cudnn
+
+VESTIGE_EMBEDDING_MODEL=qwen3-0.6b vestige consolidate
+```
+
+**Prerequisites:**
+
+- NVIDIA driver + CUDA toolkit (12.x or 13.x). Verify with `nvcc --version`.
+- A C++ host compiler that `nvcc` can drive (Linux: `gcc`; Windows:
+  MSVC / `cl.exe` from a recent Visual Studio Build Tools install).
+
+**Windows + MSVC + CUDA 13.x build note.** Recent CCCL headers (shipped
+with CUDA 13.x) require the modern preprocessor. Without it, the
+`candle-kernels` `.cu` compile pass fails with `fatal error C1189:
+[...] CCCL requires MSVC/cl.exe with traditional preprocessor` (see
+`cuda/include/cuda/std/__cccl/compiler.h`). Set this env var before
+`cargo build` to instruct `nvcc` to pass `/Zc:preprocessor` to the
+host compiler:
+
+```powershell
+# PowerShell
+$env:NVCC_PREPEND_FLAGS = '-Xcompiler="/Zc:preprocessor"'
+cargo build --release -p vestige-mcp --features qwen3-embeddings,cuda
+```
+
+```cmd
+:: cmd.exe
+set NVCC_PREPEND_FLAGS=-Xcompiler="/Zc:preprocessor"
+cargo build --release -p vestige-mcp --features qwen3-embeddings,cuda
+```
+
+Linux + CUDA 13.x builds with `gcc` do not need the equivalent flag.
+
+**Verifying GPU is actually used.** With CUDA-enabled builds, run
+`VESTIGE_EMBEDDING_MODEL=qwen3-0.6b vestige consolidate` on a corpus of
+~1000+ memories and watch `nvidia-smi` — embedding passes should pin a
+single GPU while the run is active.
+
 ---
 
 ## CLI

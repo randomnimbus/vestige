@@ -60,6 +60,19 @@ qwen3-reranker = ["qwen3-embeddings"]
 # Metal GPU acceleration on Apple Silicon (significantly faster inference)
 metal = ["fastembed/metal"]
 
+# CUDA GPU acceleration on NVIDIA hardware (Windows / Linux, x86_64 + aarch64).
+# Propagates to `candle-core/cuda`, which pulls in `cudarc` and `candle-kernels`
+# (per-build nvcc compile pass). Pair with the `qwen3-embeddings` feature so
+# the Candle backend is actually present in the build graph; on its own,
+# `cuda` is a no-op for builds that don't include `candle-core`.
+#
+# Build: cargo build --release -p vestige-mcp --features qwen3-embeddings,cuda
+# See README "Building with CUDA support" for prerequisites + MSVC notes.
+cuda = ["qwen3-embeddings", "candle-core/cuda"]
+
+# cuDNN on top of CUDA — additional fused kernels, faster inference paths.
+cudnn = ["cuda", "candle-core/cudnn"]
+
 
 [dependencies]
 # Serialization

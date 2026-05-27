@@ -24,6 +24,10 @@ ort-dynamic = ["embeddings", "vestige-core/ort-dynamic"]
 qwen3-embeddings = ["embeddings", "vestige-core/qwen3-embeddings"]
 qwen3-reranker = ["qwen3-embeddings"]
 metal = ["embeddings", "vestige-core/metal"]
+# CUDA GPU acceleration on NVIDIA hardware (Windows / Linux, x86_64 + aarch64).
+# Pairs with `qwen3-embeddings` — see vestige-core Cargo.toml.
+cuda = ["qwen3-embeddings", "vestige-core/cuda"]
+cudnn = ["cuda", "vestige-core/cudnn"]
 
 [[bin]]
 name = "vestige-mcp"

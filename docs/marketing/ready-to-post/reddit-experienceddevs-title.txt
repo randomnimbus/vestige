@@ -1,0 +1,1 @@
+My coding agent kept saying "tests passed" when they hadn't. I added a receipt check before the summary ships.

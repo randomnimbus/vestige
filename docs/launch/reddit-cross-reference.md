@@ -1,4 +1,6 @@
-# Reddit Launch Posts — cross_reference Tool
+# Reddit Launch Posts — cross_reference / deep_reference (v2.1.23)
+
+> Canonical install: [LAUNCH_STATS.md](../LAUNCH_STATS.md) — **no `sudo mv`**; use `npm install -g vestige-mcp-server@latest`
 
 ## Post 1: r/ClaudeAI (Primary)
 
@@ -78,8 +80,8 @@ Memory systems need to be SMARTER, not just bigger. That's what Vestige does —
 - **cross_reference** — the new tool that catches contradictions before they become wrong answers
 
 ### Stats:
-- 22 MCP tools
-- 746 tests, 0 failures
+- 25 MCP tools
+- 1,200+ tests
 - Zero `unsafe` code
 - Clean security audit (0 findings — AgentAudit verified)
 - Single 22MB Rust binary — no Docker, no PostgreSQL, no cloud
@@ -87,9 +89,8 @@ Memory systems need to be SMARTER, not just bigger. That's what Vestige does —
 
 ### Install (30 seconds):
 ```bash
-# macOS Apple Silicon
-npm install -g vestige-mcp-server
-sudo mv vestige-mcp /usr/local/bin/
+npm install -g vestige-mcp-server@latest
+vestige health
 claude mcp add vestige vestige-mcp -s user
 ```
 
@@ -162,12 +163,12 @@ The AI sees the conflict. Picks the right one. Every time.
 **100% local. Your data never leaves your machine.**
 
 ```bash
-npm install -g vestige-mcp-server
-sudo mv vestige-mcp /usr/local/bin/
+npm install -g vestige-mcp-server@latest
+vestige health
 claude mcp add vestige vestige-mcp -s user
 ```
 
-746 tests. Zero unsafe code. Clean security audit. AGPL-3.0.
+1,200+ tests. Zero unsafe code. AGPL-3.0.
 
 GitHub: https://github.com/samvallad33/vestige
 
@@ -175,7 +176,7 @@ GitHub: https://github.com/samvallad33/vestige
 
 ## Post 3: r/rust (Optional, technical audience)
 
-**Title:** `I built a 22MB Rust binary that gives AI agents a brain — FSRS-6, 29 cognitive modules, 3D dashboard, and a new contradiction detection tool. 746 tests, zero unsafe.`
+**Title:** `I built a 22MB Rust binary that gives AI agents a brain — FSRS-6, 30 cognitive modules, Receipt Lock, 25 MCP tools. ~86K LOC, zero unsafe.`
 
 ---
 
@@ -188,7 +189,7 @@ The latest addition: `cross_reference` — pairwise contradiction detection acro
 - No runtime, no GC pauses during real-time search
 - `tokio::sync::Mutex` for the cognitive engine, `std::sync::Mutex` for SQLite reader/writer split
 - Zero `unsafe` blocks in the entire codebase
-- `cargo test` runs 746 tests in 11 seconds
+- `cargo test` runs 1,200+ tests across the workspace
 
 **Architecture:**
 ```
@@ -213,7 +214,7 @@ SQLite WAL + FTS5 + USearch HNSW
 Clean security audit. Parameterized SQL everywhere. CSP headers on the dashboard. Constant-time auth comparison (`subtle::ConstantTimeEq`). File permissions 0o600/0o700.
 
 GitHub: https://github.com/samvallad33/vestige  
-AGPL-3.0 | 746 tests | 79K+ LOC
+AGPL-3.0 | 1,200+ tests | ~86K LOC
 
 ---
 

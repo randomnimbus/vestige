@@ -1,0 +1,32 @@
+Hi HN,
+
+Your coding agent probably ends sessions with something like "all tests passed" or
+"the build is green." I kept trusting that — until it wasn't true.
+
+I built Receipt Lock in Vestige (an MCP memory server I maintain). Before operational
+claims become part of the final answer, Vestige checks them against structured
+command receipts from the current transcript. No matching successful receipt → the
+claim can be blocked and a local veto receipt is written (JSON + HTML under
+~/.vestige/sanhedrin/).
+
+**What it is:** Optional Claude Code Cognitive Sandwich hooks + local MCP server.
+Not cloud. Not "trust me bro" logging — inspectable receipts on disk.
+
+**Install (memory server — required base):**
+npm install -g vestige-mcp-server@latest
+claude mcp add vestige vestige-mcp -s user
+
+**Enable Receipt Lock (optional):**
+vestige sandwich install --enable-sanhedrin
+
+Sanhedrin verifier can point at any OpenAI-compatible endpoint (Ollama, MLX, hosted API).
+
+**And it also does real memory:** FSRS-6 spaced repetition, prediction error gating,
+memory dreaming, 3D dashboard at localhost:3927. ~86K LOC Rust, 25 MCP tools, 1,200+
+tests, 22MB binary. 100% local after first embedding download.
+
+I'm 22, solo, AGPL-3.0. Repo: https://github.com/samvallad33/vestige
+Comparison: https://github.com/samvallad33/vestige/blob/main/docs/comparison.md
+Landing: https://samvallad33.github.io/vestige/
+
+Happy to discuss false positive tuning, Sanhedrin presets, or why receipts beat vibes.

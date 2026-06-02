@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vestige — Local memory and receipts for AI agents</title>
+  <meta name="description" content="FSRS-6 cognitive memory + Receipt Lock for MCP agents. 22MB Rust binary. 100% local." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono&display=swap" rel="stylesheet" />
+  <style>
+    :root { --bg: #07070f; --fg: #e8e8f0; --muted: #9ca3af; --accent: #818cf8; --gold: #fbbf24; --card: #12121c; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'IBM Plex Sans', system-ui, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.6; }
+    a { color: var(--accent); }
+    .wrap { max-width: 880px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+    h1 { font-size: clamp(1.75rem, 5vw, 2.5rem); font-weight: 700; line-height: 1.2; margin-bottom: 1rem; }
+    h2 { font-size: 1.35rem; margin: 2.5rem 0 1rem; color: var(--accent); }
+    p.lead { font-size: 1.15rem; color: var(--muted); margin-bottom: 1.5rem; }
+    .badge { display: inline-block; font-size: 0.75rem; font-family: 'IBM Plex Mono', monospace; background: var(--card); padding: 0.25rem 0.6rem; border-radius: 4px; margin-right: 0.5rem; margin-bottom: 0.5rem; }
+    pre { background: var(--card); padding: 1rem; border-radius: 8px; overflow-x: auto; font-family: 'IBM Plex Mono', monospace; font-size: 0.9rem; margin: 1rem 0; border: 1px solid #1f1f2e; }
+    .hero-img { width: 100%; border-radius: 12px; border: 1px solid #1f1f2e; margin: 1.5rem 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; margin: 1rem 0; }
+    th, td { border: 1px solid #1f1f2e; padding: 0.6rem 0.75rem; text-align: left; }
+    th { background: var(--card); }
+    .cta { display: inline-block; background: var(--accent); color: #fff; font-weight: 600; padding: 0.75rem 1.25rem; border-radius: 8px; text-decoration: none; margin-top: 0.5rem; }
+    .cta:hover { filter: brightness(1.1); }
+    footer { margin-top: 3rem; font-size: 0.85rem; color: var(--muted); }
+    .hook { border-left: 3px solid var(--gold); padding-left: 1rem; margin: 1.5rem 0; font-style: italic; color: #d1d5db; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <p>
+      <span class="badge">v2.1.23</span>
+      <span class="badge">25 MCP tools</span>
+      <span class="badge">~86K LOC Rust</span>
+      <span class="badge">AGPL-3.0</span>
+    </p>
+
+    <h1>Your agent forgets yesterday.<br />It can lie about today.</h1>
+    <p class="lead">Vestige is a local MCP memory server: real FSRS-6 forgetting and consolidation, plus optional <strong>Receipt Lock</strong> that blocks &ldquo;tests passed&rdquo; without command receipts.</p>
+
+    <pre>npm install -g vestige-mcp-server@latest
+claude mcp add vestige vestige-mcp -s user</pre>
+    <a class="cta" href="https://github.com/samvallad33/vestige">GitHub →</a>
+
+    <h2>Wave A: Receipt Lock</h2>
+    <div class="hook">Coding agents finish with confident summaries. Vestige checks operational claims against structured command receipts before they become your final answer.</div>
+    <p>If the agent claims verification happened but no matching successful receipt exists, the claim can be blocked and an inspectable local veto is written to <code>~/.vestige/sanhedrin/</code>.</p>
+    <pre>vestige sandwich install --enable-sanhedrin</pre>
+    <p><a href="https://github.com/samvallad33/vestige#receipt-lock">Receipt Lock docs</a></p>
+
+    <h2>Wave B: A brain, not a bucket</h2>
+    <img class="hero-img" src="../marketing/assets/dashboard-placeholder.svg" alt="Vestige 3D memory dashboard" width="960" height="540" />
+    <p>Memories decay on FSRS-6 curves. Search strengthens them (Testing Effect). <code>dream</code> consolidates offline. The 3D dashboard shows pulses, connections, and dream replay in real time.</p>
+    <p><code>vestige dashboard</code> → <a href="http://localhost:3927/dashboard">localhost:3927/dashboard</a></p>
+
+    <h2>Vestige vs the rest</h2>
+    <table>
+      <thead><tr><th></th><th>RAG</th><th>Native AI memory</th><th>Vestige</th></tr></thead>
+      <tbody>
+        <tr><td>Forgetting</td><td>None</td><td>Opaque</td><td><strong>FSRS-6</strong></td></tr>
+        <tr><td>Local / private</td><td>Varies</td><td>Cloud</td><td><strong>100% local</strong></td></tr>
+        <tr><td>Contradictions</td><td>Both chunks</td><td>No</td><td><strong>deep_reference</strong></td></tr>
+        <tr><td>Fake &ldquo;tests passed&rdquo;</td><td>N/A</td><td>N/A</td><td><strong>Receipt Lock</strong></td></tr>
+        <tr><td>Visualization</td><td>None</td><td>None</td><td><strong>3D graph</strong></td></tr>
+      </tbody>
+    </table>
+    <p><a href="https://github.com/samvallad33/vestige/blob/main/docs/comparison.md">Full comparison (Mem0, RAG, native)</a></p>
+
+    <h2>Install</h2>
+    <pre>npm install -g vestige-mcp-server@latest
+vestige health
+claude mcp add vestige vestige-mcp -s user</pre>
+    <p>Also works with Codex, Cursor, VS Code Copilot, JetBrains, Windsurf, Xcode. See <a href="https://github.com/samvallad33/vestige/tree/main/docs/integrations">integration guides</a>.</p>
+
+    <footer>
+      Built by Sam Valladares (22, solo). Stats: <a href="../LAUNCH_STATS.md">LAUNCH_STATS.md</a> · Science: <a href="../SCIENCE.md">SCIENCE.md</a>
+    </footer>
+  </div>
+</body>
+</html>

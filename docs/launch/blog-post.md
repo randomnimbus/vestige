@@ -6,7 +6,7 @@ Every conversation starts from zero. You explain your project structure, your pr
 
 Vestige is an open-source Rust MCP server that gives AI agents persistent memory modeled on real neuroscience. Not metaphorical neuroscience. Actual published algorithms from Ebbinghaus (1885), Collins & Loftus (1975), Bjork & Bjork (1992), Frey & Morris (1997), and the FSRS-6 spaced repetition scheduler trained on 700 million Anki reviews.
 
-77,840+ lines of Rust. 29 cognitive modules. 734 tests. Single binary deployment with an embedded SvelteKit dashboard. AGPL-3.0 licensed.
+~86,000 lines of Rust. 30 cognitive modules. 1,200+ tests. v2.1.23 adds Receipt Lock for unverified agent claims. Single 22MB binary with embedded SvelteKit dashboard. AGPL-3.0 licensed. Stats: [LAUNCH_STATS.md](../LAUNCH_STATS.md).
 
 Here is how we built it.
 

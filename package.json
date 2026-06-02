@@ -7,7 +7,8 @@
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "https://github.com/samvallad33/vestige"
+    "url": "https://github.com/samvallad33/vestige",
+    "homepage": "https://samvallad33.github.io/vestige/"
   },
   "scripts": {
     "build:mcp": "cargo build --release --package vestige-mcp",

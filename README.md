@@ -2,7 +2,7 @@
 
 # Vestige
 
-### Local cognitive memory for MCP-compatible AI agents.
+### Local memory and receipts for MCP-compatible AI agents.
 
 [![GitHub stars](https://img.shields.io/github/stars/samvallad33/vestige?style=social)](https://github.com/samvallad33/vestige)
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige)](https://github.com/samvallad33/vestige/releases/latest)
@@ -10,11 +10,23 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![MCP Compatible](https://img.shields.io/badge/MCP-compatible-green)](https://modelcontextprotocol.io)
 
-**Your agent forgets project decisions between sessions. Vestige gives it local, inspectable memory.**
+**Your coding agent forgets yesterday and can lie about today.** Vestige gives it a local brain — FSRS-6 memory that learns and forgets — plus **Receipt Lock** that blocks "tests passed" unless a real command receipt exists.
 
-Built on proven memory and retrieval ideas — FSRS-6 spaced repetition, prediction error gating, synaptic tagging, spreading activation, and memory consolidation — all running in a single Rust binary with a local dashboard. 100% local. Zero cloud.
+```bash
+npm install -g vestige-mcp-server@latest
+claude mcp add vestige vestige-mcp -s user
+```
 
-[Quick Start](#quick-start) | [Dashboard](#-3d-memory-dashboard) | [How It Works](#-the-cognitive-science-stack) | [Tools](#-25-mcp-tools) | [Docs](docs/)
+| | |
+|---|---|
+| **Receipt Lock** — optional hook layer; vetoes unverified "green build" claims | **3D dashboard** — `vestige dashboard` → `localhost:3927` |
+| ![Receipt Lock demo](docs/marketing/assets/receipt-lock.gif) · [capture guide](docs/marketing/assets/CAPTURE.md) | ![Memory dashboard](docs/marketing/assets/dashboard-placeholder.svg) |
+
+*Replace placeholders with GIFs from [`CAPTURE.md`](docs/marketing/assets/CAPTURE.md) before Wave B launch.*
+
+**v2.1.23** · ~86K LOC Rust · **25** MCP tools · **30** cognitive modules · **1,200+** tests · **22MB** binary · 100% local · AGPL-3.0
+
+[Quick Start](#quick-start) | [Receipt Lock](#receipt-lock) | [Dashboard](#-3d-memory-dashboard) | [Compare vs RAG](docs/comparison.md) | [Launch stats](docs/LAUNCH_STATS.md) | [Docs](docs/)
 
 </div>
 
@@ -54,6 +66,43 @@ codex mcp add vestige -- vestige-mcp
 # "What are my coding preferences?"
 # → "You prefer TypeScript over JavaScript."
 ```
+
+## Receipt Lock
+
+Coding agents often finish with confident summaries like "tests passed" or
+"the build is green." Receipt Lock checks those operational claims against
+structured command receipts from the current transcript before they become part
+of the final answer.
+
+If the agent claims verification happened but no matching successful command
+receipt exists, Vestige can block the claim and write an inspectable local
+receipt instead of letting the agent invent a clean ending.
+
+Receipt Lock is optional and works through the Claude Code Cognitive Sandwich
+hook layer:
+
+```bash
+# Install the local memory server first
+npm install -g vestige-mcp-server@latest
+
+# Add normal MCP memory
+claude mcp add vestige vestige-mcp -s user
+
+# Optional: enable Receipt Lock / Sanhedrin hooks
+vestige sandwich install --enable-sanhedrin
+
+# Optional: point Sanhedrin at any OpenAI-compatible endpoint
+vestige sandwich install \
+  --enable-sanhedrin \
+  --sanhedrin-endpoint=http://127.0.0.1:11434/v1/chat/completions \
+  --sanhedrin-model=qwen2.5:14b
+```
+
+Receipts are local:
+
+- Latest JSON: `~/.vestige/sanhedrin/latest.json`
+- Latest HTML: `~/.vestige/sanhedrin/latest.html`
+- Command ledger: `~/.vestige/sanhedrin/command-receipts.jsonl`
 
 <details>
 <summary>Other platforms & install methods</summary>
@@ -422,6 +471,8 @@ vestige dashboard                # Open 3D dashboard in browser
 | [CLAUDE.md Setup](docs/CLAUDE-SETUP.md) | Templates for proactive memory |
 | [Configuration](docs/CONFIGURATION.md) | CLI commands, environment variables |
 | [Integrations](docs/integrations/) | Codex, Xcode, Cursor, VS Code, JetBrains, Windsurf |
+| [Comparison vs RAG/Mem0](docs/comparison.md) | When to use Vestige |
+| [Marketing kit](docs/marketing/README.md) | Launch waves, growth engine, metrics |
 | [Changelog](CHANGELOG.md) | Version history |
 
 ---

@@ -29,6 +29,7 @@
     "type": "git",
     "url": "git+https://github.com/samvallad33/vestige.git"
   },
+  "homepage": "https://samvallad33.github.io/vestige/",
   "engines": {
     "node": ">=18"
   },

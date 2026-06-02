@@ -1,4 +1,6 @@
-# Vestige v2.0 "Cognitive Leap" — MCP Dev Summit NYC Demo Script
+# Vestige v2.1.23 — Demo Script (Conference + Launch Video)
+
+> Stats: [LAUNCH_STATS.md](../LAUNCH_STATS.md) · Wave A hook: [receipt-lock.md](receipt-lock.md)
 
 **Event:** MCP Dev Summit NYC, April 1-3, 2026
 **Presenter:** Sam Valladares
@@ -15,7 +17,7 @@
 - [ ] Phone hotspot configured as backup (embedding model already cached = no network needed)
 
 ### Software
-- [ ] Vestige v2.0 binary installed: `vestige-mcp --version` shows `2.0.0`
+- [ ] Vestige binary installed: `vestige-mcp --version` shows `2.1.23` (or latest)
 - [ ] Claude Code installed and authenticated
 - [ ] Terminal font size: 18pt minimum (audience readability)
 - [ ] Browser zoom: 150% for dashboard views
@@ -205,7 +207,7 @@ claude mcp add vestige vestige-mcp -s user
 
 ### [2:50-3:00] Close
 
-> Vestige v2.0, "Cognitive Leap." Open source, AGPL-3.0. The repo is `samvallad33/vestige`. Come talk to me if you want to see the neuroscience under the hood.
+> Vestige v2.1.23. Open source, AGPL-3.0. The repo is `samvallad33/vestige`. Come talk to me if you want to see the neuroscience under the hood.
 
 ---
 
@@ -391,9 +393,9 @@ vestige-mcp --version
 # One command to install
 ```
 
-> This is what I've been building for the past three months. I'm one person, I'm twenty-one years old, and I believe this is how AI memory should work — grounded in real science, running locally, open source.
+> This is what I've been building. I'm one person, I'm twenty-two years old, and I believe this is how AI memory should work — grounded in real science, running locally, open source.
 >
-> Vestige v2.0, "Cognitive Leap." The repo is `github.com/samvallad33/vestige`. The dashboard is running at `localhost:3927`. I'll be around all three days — come find me if you want to talk about FSRS, or synaptic tagging, or why I think every AI assistant on the planet should have a forgetting curve.
+> Vestige v2.1.23. The repo is `github.com/samvallad33/vestige`. The dashboard is running at `localhost:3927`. I'll be around all three days — come find me if you want to talk about FSRS, or synaptic tagging, or why I think every AI assistant on the planet should have a forgetting curve.
 >
 > Thank you.
 

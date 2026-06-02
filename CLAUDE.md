@@ -18,7 +18,8 @@ dashboard embedded into the release binary. The core product promise is:
 ## Working Rules
 
 - Prefer source evidence over memory. Use `rg`, tests, and nearby code before
-  making claims about behavior.
+  making claims about behavior. This public repo guidance does not override
+  private user-level memory protocols loaded outside the repository.
 - Keep release changes scoped. Do not rewrite unrelated modules during a
   version/tag cleanup unless the release gate requires it.
 - Preserve local-first behavior. Heavy models, Sanhedrin-style verifier hooks,

@@ -1,0 +1,18 @@
+1/8 Your coding agent ends with "tests passed." Did it run tests? Or did it summarize hope?
+
+2/8 I ship Receipt Lock in Vestige — checks operational claims against command receipts from the transcript.
+
+3/8 No matching successful receipt → claim blocked. Local veto receipt: ~/.vestige/sanhedrin/latest.html
+
+4/8 Optional hooks. Local MCP server. Not cloud analytics.
+
+5/8
+npm i -g vestige-mcp-server@latest
+claude mcp add vestige vestige-mcp -s user
+vestige sandwich install --enable-sanhedrin
+
+6/8 Same binary also does FSRS-6 memory — decay, dreaming, 3D brain viz. Thread on that tomorrow.
+
+7/8 22yo solo dev. AGPL. https://github.com/samvallad33/vestige
+
+8/8 What's the worst "green build" lie your agent told you? Reply — building the FAQ from real stories.

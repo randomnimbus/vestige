@@ -10,22 +10,18 @@
    ./scripts/marketing/preflight.sh
    ```
 
-2. **Enable GitHub Pages** (one-time, if preflight warns): Repo → Settings → Pages → Build: **GitHub Actions**. Or re-run deploy after the workflow with `enablement: true` lands.
-
-3. **Hacker News** → https://news.ycombinator.com/submit
+2. **Hacker News** → https://news.ycombinator.com/submit
    - URL: `https://github.com/samvallad33/vestige`
    - Title: paste `ready-to-post/hn-title.txt`
    - Post link, then immediately paste `ready-to-post/hn-first-comment.txt` as first comment
 
-4. **Lobste.rs** — paste `ready-to-post/lobsters.md`
+3. **X** — paste `ready-to-post/x-thread.txt` (one tweet per numbered block)
 
-5. **X** — paste `ready-to-post/x-thread.txt` (one tweet per numbered block)
+4. **r/ExperiencedDevs** — title from `reddit-experienceddevs-title.txt`, body from `reddit-experienceddevs.md`
 
-6. **r/ExperiencedDevs** — title from `reddit-experienceddevs-title.txt`, body from `reddit-experienceddevs.md`
+5. **r/programming** — same body + line: `License: AGPL-3.0. v2.1.23. ~86K LOC, 25 tools, 22MB binary.`
 
-7. **r/programming** — same body + line: `License: AGPL-3.0. v2.1.23. ~86K LOC, 25 tools, 22MB binary.`
-
-8. Log URLs in [metrics-tracker.md](metrics-tracker.md)
+6. Log URLs in [metrics-tracker.md](metrics-tracker.md)
 
 ## After posting (30 min SLA on comments)
 

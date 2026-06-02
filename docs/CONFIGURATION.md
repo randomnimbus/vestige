@@ -141,6 +141,20 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
 }
 ```
 
+### Opencode TUI/Desktop 
+
+You can put it at various different locations. I recommend `opencode.json` in the project folder. 
+
+```json
+{
+  "mcpServers": {
+    "vestige": {
+      "command": "vestige-mcp"
+    }
+  }
+}
+```
+
 ---
 
 ## Custom Data Directory

@@ -1890,6 +1890,103 @@ impl Storage {
         })
     }
 
+    /// Introspect the live SQLite schema: schema version + per-table row/column
+    /// shape + embedding-coverage convenience fields.
+    ///
+    /// This is the v2.1.24+ replacement for the direct-SQLite reads that
+    /// audit scripts and migration guards previously had to perform. The set
+    /// of tables walked matches `PORTABLE_USER_DATA_TABLES` — the same
+    /// canonical set used by portable export / import — so the surface stays
+    /// stable across migrations rather than chasing arbitrary
+    /// `sqlite_master` rows.
+    ///
+    /// Cost: O(N_tables) `COUNT(*)` queries + one PRAGMA per table. Negligible
+    /// at the table cardinalities Vestige carries (~15 tables, all indexed).
+    /// Safe to call on every MCP `system_status` invocation when the flag is
+    /// set; callers wanting to limit cost should leave the flag off (default).
+    pub fn schema_introspection(&self) -> Result<crate::SchemaIntrospection> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+
+        let schema_version = Self::current_schema_version(&reader)?;
+
+        // schema_version has the row (version PK + applied_at TEXT). Read the
+        // applied_at for the current version row; tolerate failure (legacy
+        // databases may have skipped the applied_at fill on early upgrades).
+        let applied_at_str: Option<String> = reader
+            .query_row(
+                "SELECT applied_at FROM schema_version WHERE version = ?1",
+                params![schema_version as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let schema_version_applied_at = applied_at_str.and_then(|s| {
+            // The migration scripts use `datetime('now')` which yields
+            // SQLite's "YYYY-MM-DD HH:MM:SS" UTC form (NOT RFC3339).
+            // Try the SQLite form first, fall back to RFC3339 for any
+            // future migrations that switch.
+            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                .map(|naive| naive.and_utc())
+                .or_else(|_| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                })
+                .ok()
+        });
+
+        let mut tables = Vec::with_capacity(PORTABLE_USER_DATA_TABLES.len());
+        for table_name in PORTABLE_USER_DATA_TABLES {
+            if Self::table_exists(&reader, table_name)? {
+                let rows = Self::table_row_count(&reader, table_name)?;
+                let columns = Self::table_columns(&reader, table_name)?;
+                tables.push(crate::TableIntrospection {
+                    name: (*table_name).to_string(),
+                    rows,
+                    columns,
+                });
+            }
+        }
+
+        // Convenience: embedding-coverage NULL count. Defined as the number
+        // of knowledge_nodes with NO matching row in node_embeddings. This is
+        // distinct from `nodes_with_embeddings` in MemoryStats (which uses
+        // the `has_embedding` column flag); we compute the join-based truth
+        // here so audit scripts can detect drift between the flag and the
+        // actual embeddings table.
+        let embedding_null_count: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_nodes kn
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM node_embeddings ne WHERE ne.node_id = kn.id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        #[cfg(feature = "embeddings")]
+        let active_embedding_model = Some(self.embedding_service.model_name().to_string());
+        #[cfg(not(feature = "embeddings"))]
+        let active_embedding_model: Option<String> = None;
+
+        #[cfg(feature = "embeddings")]
+        let active_embedding_dimensions: Option<u32> =
+            Some(self.embedding_service.dimensions() as u32);
+        #[cfg(not(feature = "embeddings"))]
+        let active_embedding_dimensions: Option<u32> = None;
+
+        Ok(crate::SchemaIntrospection {
+            schema_version,
+            schema_version_applied_at,
+            tables,
+            embedding_null_count,
+            active_embedding_model,
+            active_embedding_dimensions,
+        })
+    }
+
     /// Delete a node
     pub fn delete_node(&self, id: &str) -> Result<bool> {
         let mut writer = self

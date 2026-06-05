@@ -127,9 +127,11 @@ pub use memory::{
     MemorySystem,
     NodeType,
     RecallInput,
+    SchemaIntrospection,
     SearchMode,
     SearchResult,
     SimilarityResult,
+    TableIntrospection,
     TemporalRange,
 };
 

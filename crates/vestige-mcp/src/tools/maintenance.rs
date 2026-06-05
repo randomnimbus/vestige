@@ -105,8 +105,22 @@ pub fn gc_schema() -> Value {
 pub fn system_status_schema() -> Value {
     serde_json::json!({
         "type": "object",
-        "properties": {}
+        "properties": {
+            "schema_introspection": {
+                "type": "boolean",
+                "description": "When true, extends the response with a 'schema' block carrying the SQLite schema version, per-table row counts + column lists, and embedding-coverage convenience fields. Default: false (response shape unchanged). Use this for audit / migration-guard / downstream-upgrade scripts that otherwise have to read SQLite directly.",
+                "default": false
+            }
+        }
     })
+}
+
+/// Arguments for the system_status tool. All optional.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemStatusArgs {
+    #[serde(alias = "schema_introspection")]
+    schema_introspection: Option<bool>,
 }
 
 // ============================================================================
@@ -117,11 +131,24 @@ pub fn system_status_schema() -> Value {
 ///
 /// Returns system health status, full statistics, FSRS preview,
 /// cognitive module health, state distribution, and actionable recommendations.
+///
+/// v2.1.24+: when `schema_introspection: true` is passed, the response
+/// additionally carries a `schema` block with the live SQLite schema version,
+/// per-table row counts + column lists, and embedding-coverage convenience
+/// fields. Default off; response shape unchanged when omitted.
 pub async fn execute_system_status(
     storage: &Arc<Storage>,
     cognitive: &Arc<Mutex<CognitiveEngine>>,
-    _args: Option<Value>,
+    args: Option<Value>,
 ) -> Result<Value, String> {
+    // Parse arguments (all optional, including the args envelope itself).
+    let parsed: SystemStatusArgs = match args {
+        Some(v) => serde_json::from_value(v)
+            .map_err(|e| format!("Invalid arguments: {}", e))?,
+        None => SystemStatusArgs::default(),
+    };
+    let include_schema = parsed.schema_introspection.unwrap_or(false);
+
     let stats = storage.get_stats().map_err(|e| e.to_string())?;
 
     // === Health assessment ===
@@ -259,7 +286,7 @@ pub async fn execute_system_status(
     };
     let last_backup = storage.last_backup_timestamp();
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "tool": "system_status",
         // Health
         "status": status,
@@ -299,7 +326,34 @@ pub async fn execute_system_status(
             "lastBackupTimestamp": last_backup.map(|dt| dt.to_rfc3339()),
             "lastConsolidationTimestamp": last_consolidation.map(|dt| dt.to_rfc3339()),
         },
-    }))
+    });
+
+    // v2.1.24+: optional schema introspection block. Default off; response
+    // shape unchanged when omitted.
+    if include_schema {
+        let intro = storage.schema_introspection().map_err(|e| e.to_string())?;
+        let tables_json: Vec<Value> = intro
+            .tables
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "rows": t.rows,
+                    "columns": t.columns,
+                })
+            })
+            .collect();
+        response["schema"] = serde_json::json!({
+            "schemaVersion": intro.schema_version,
+            "schemaVersionAppliedAt": intro.schema_version_applied_at.map(|dt| dt.to_rfc3339()),
+            "tables": tables_json,
+            "embeddingNullCount": intro.embedding_null_count,
+            "activeEmbeddingModel": intro.active_embedding_model,
+            "activeEmbeddingDimensions": intro.active_embedding_dimensions,
+        });
+    }
+
+    Ok(response)
 }
 
 /// Consolidate tool
@@ -790,6 +844,163 @@ mod tests {
         // No dream ever → savesSinceLastDream == totalMemories
         assert_eq!(triggers["savesSinceLastDream"], 3);
         assert!(triggers["lastDreamTimestamp"].is_null());
+    }
+
+    // ========================================================================
+    // SCHEMA INTROSPECTION TESTS (PR2)
+    // ========================================================================
+
+    #[test]
+    fn test_system_status_schema_has_schema_introspection_flag() {
+        let schema = system_status_schema();
+        let props = &schema["properties"];
+        let flag = &props["schema_introspection"];
+        assert!(flag.is_object(), "schema_introspection property must exist");
+        assert_eq!(flag["type"], "boolean");
+        assert_eq!(flag["default"], false);
+        // Top-level required must NOT include this — flag is opt-in.
+        let required = schema.get("required");
+        if let Some(req) = required {
+            let req_arr = req.as_array().unwrap();
+            assert!(!req_arr.contains(&serde_json::json!("schema_introspection")));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_system_status_without_schema_flag_omits_schema_block() {
+        // Backwards-compat: when the flag is not set (or false), the response
+        // shape is unchanged — no `schema` key.
+        let (storage, _dir) = test_storage().await;
+        let result = execute_system_status(&storage, &test_cognitive(), None).await;
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert!(
+            value.get("schema").is_none(),
+            "schema block must NOT be present when flag is unset, got {:?}",
+            value.get("schema")
+        );
+
+        // Explicit false → still no schema block.
+        let result = execute_system_status(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({ "schema_introspection": false })),
+        )
+        .await;
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert!(value.get("schema").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_system_status_with_schema_flag_emits_schema_block() {
+        let (storage, _dir) = test_storage().await;
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Schema introspection seed memory".to_string(),
+                node_type: "fact".to_string(),
+                source: None,
+                sentiment_score: 0.0,
+                sentiment_magnitude: 0.0,
+                tags: vec!["schema-test".to_string()],
+                valid_from: None,
+                valid_until: None,
+            })
+            .unwrap();
+
+        let result = execute_system_status(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({ "schema_introspection": true })),
+        )
+        .await;
+        assert!(result.is_ok(), "{:?}", result);
+        let value = result.unwrap();
+
+        // Shape assertions.
+        let schema_block = value
+            .get("schema")
+            .expect("schema block must be present when flag is true");
+        assert!(schema_block.is_object());
+        assert!(
+            schema_block["schemaVersion"].is_number(),
+            "schemaVersion must be a number, got {:?}",
+            schema_block["schemaVersion"]
+        );
+        // Schema version should be >= 13 (V13 is the highest landed migration
+        // at the time this PR was authored).
+        let v = schema_block["schemaVersion"].as_u64().unwrap();
+        assert!(v >= 13, "expected schema_version >= 13, got {}", v);
+
+        // tables should be a non-empty array of {name, rows, columns}.
+        let tables = schema_block["tables"].as_array().unwrap();
+        assert!(!tables.is_empty(), "expected at least one table");
+        let kn = tables
+            .iter()
+            .find(|t| t["name"] == "knowledge_nodes")
+            .expect("knowledge_nodes table must be present");
+        assert_eq!(kn["rows"], 1, "ingested exactly one memory");
+        let cols = kn["columns"].as_array().unwrap();
+        assert!(!cols.is_empty(), "knowledge_nodes must have columns");
+        // The id column is universally present.
+        let col_names: Vec<&str> = cols.iter().filter_map(|c| c.as_str()).collect();
+        assert!(
+            col_names.contains(&"id"),
+            "knowledge_nodes.id must be in columns list: {:?}",
+            col_names
+        );
+
+        // Convenience fields.
+        assert!(schema_block["embeddingNullCount"].is_number());
+        // activeEmbeddingModel may be null if the `embeddings` feature is
+        // not enabled in the test build; just check the key exists.
+        assert!(schema_block.get("activeEmbeddingModel").is_some());
+        assert!(schema_block.get("activeEmbeddingDimensions").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_system_status_camelcase_alias() {
+        // Accept both `schema_introspection` (snake) and `schemaIntrospection`
+        // (camel) per the #[serde(rename_all = "camelCase")] + alias attr.
+        let (storage, _dir) = test_storage().await;
+        let result = execute_system_status(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({ "schemaIntrospection": true })),
+        )
+        .await;
+        assert!(result.is_ok(), "{:?}", result);
+        let value = result.unwrap();
+        assert!(
+            value.get("schema").is_some(),
+            "camelCase form must also trigger schema block"
+        );
+    }
+
+    #[test]
+    fn test_storage_schema_introspection_method() {
+        // Direct test on the Storage method, independent of the MCP layer.
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let intro = storage
+            .schema_introspection()
+            .expect("schema_introspection must succeed on a fresh DB");
+
+        // Schema version pulled from the schema_version table.
+        assert!(
+            intro.schema_version >= 13,
+            "fresh DB should be at schema_version >= 13, got {}",
+            intro.schema_version
+        );
+        // At least one walked table should exist.
+        assert!(
+            !intro.tables.is_empty(),
+            "expected at least one user-data table"
+        );
+        // Empty DB → no embeddings → embedding_null_count == 0 (no rows to
+        // count). Once we ingest, it should be > 0 (no embeddings generated
+        // in tests by default).
+        assert_eq!(intro.embedding_null_count, 0);
     }
 
     #[tokio::test]

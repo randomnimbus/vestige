@@ -92,6 +92,10 @@ pub fn schema() -> Value {
                 "type": "boolean",
                 "description": "Force literal/concrete search. Skips semantic expansion, FSRS reweighting, spreading activation, and cognitive side effects. Auto-enabled for quoted strings, env vars, UUIDs, paths, and code identifiers.",
                 "default": false
+            },
+            "tag_prefix": {
+                "type": "string",
+                "description": "Optional tag-prefix filter. When set, only results carrying at least one tag whose value starts with this prefix are returned (case-sensitive). Example: tag_prefix=\"meeting:\" matches memories tagged 'meeting:standup', 'meeting:1-on-1', etc. Applied as a post-filter; combine with a larger 'limit' if you expect heavy thinning."
             }
         },
         "required": ["query"]
@@ -120,6 +124,8 @@ struct SearchArgs {
     #[serde(alias = "retrieval_mode")]
     retrieval_mode: Option<String>,
     concrete: Option<bool>,
+    #[serde(alias = "tag_prefix")]
+    tag_prefix: Option<String>,
 }
 
 /// Execute unified search with 7-stage cognitive pipeline.
@@ -183,19 +189,43 @@ pub async fn execute(
         .concrete
         .unwrap_or_else(|| is_literal_query(&args.query));
     if concrete {
+        // When a tag_prefix is requested, fetch a larger pool so the
+        // post-filter has enough headroom to still return ~limit results
+        // after thinning. Cap at the same upper bound the underlying SQL
+        // path uses elsewhere (100).
+        let concrete_fetch_limit = if args.tag_prefix.is_some() {
+            (limit * 3).min(100)
+        } else {
+            limit
+        };
         let results = storage
             .concrete_search_filtered(
                 &args.query,
-                limit,
+                concrete_fetch_limit,
                 args.include_types.as_deref(),
                 args.exclude_types.as_deref(),
             )
             .map_err(|e| e.to_string())?;
 
-        let ids: Vec<&str> = results.iter().map(|r| r.node.id.as_str()).collect();
+        // Apply tag_prefix post-filter BEFORE strengthen-on-access so
+        // results the caller did not actually receive do not get a
+        // testing-effect boost.
+        let filtered_results: Vec<&vestige_core::SearchResult> = match args.tag_prefix.as_deref() {
+            Some(prefix) => results
+                .iter()
+                .filter(|r| tags_match_prefix(&r.node.tags, prefix))
+                .take(limit as usize)
+                .collect(),
+            None => results.iter().collect(),
+        };
+
+        let ids: Vec<&str> = filtered_results
+            .iter()
+            .map(|r| r.node.id.as_str())
+            .collect();
         let _ = storage.strengthen_batch_on_access(&ids);
 
-        let mut formatted: Vec<Value> = results
+        let mut formatted: Vec<Value> = filtered_results
             .iter()
             .filter(|r| r.node.retention_strength >= min_retention)
             .map(|r| format_search_result(r, detail_level))
@@ -297,7 +327,11 @@ pub async fn execute(
         "exhaustive" => 5, // Deep overfetch for maximum recall
         _ => 3,            // Balanced default
     };
-    let overfetch_limit = (limit * overfetch_multiplier).min(100); // Cap at 100 to avoid excessive DB load
+    // When a tag_prefix filter is requested, double the overfetch (capped at
+    // the same 100 ceiling) so the post-filter has enough headroom to still
+    // return ~limit results after thinning.
+    let tag_prefix_multiplier = if args.tag_prefix.is_some() { 2 } else { 1 };
+    let overfetch_limit = (limit * overfetch_multiplier * tag_prefix_multiplier).min(100); // Cap at 100 to avoid excessive DB load
 
     let results = storage
         .hybrid_search_filtered(
@@ -326,10 +360,26 @@ pub async fn execute(
         })
         .collect();
 
+    // Apply tag_prefix post-filter BEFORE the reranker so the (expensive)
+    // cross-encoder does not waste cycles on memories the caller will not
+    // receive. The Stage 0 keyword-priority merge below also respects the
+    // filter when applied, since merged items must have survived this step
+    // OR be re-introduced from keyword_priority_results (which we re-filter).
+    if let Some(prefix) = args.tag_prefix.as_deref() {
+        filtered_results.retain(|r| tags_match_prefix(&r.node.tags, prefix));
+    }
+
     // ====================================================================
     // Dedup: merge Stage 0 keyword-priority results into Stage 1 results
     // ====================================================================
     for kp in &keyword_priority_results {
+        // Respect tag_prefix here too — Stage 0 ran without it and can
+        // re-introduce filtered-out memories on the "new result" branch.
+        if let Some(prefix) = args.tag_prefix.as_deref()
+            && !tags_match_prefix(&kp.node.tags, prefix)
+        {
+            continue;
+        }
         if let Some(existing) = filtered_results
             .iter_mut()
             .find(|r| r.node.id == kp.node.id)
@@ -779,6 +829,18 @@ fn is_literal_query(query: &str) -> bool {
         && trimmed
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Returns `true` when the given tag list contains at least one tag whose
+/// string value starts with `prefix`. Empty prefix matches every result with
+/// at least one tag (and never matches a tagless result).
+///
+/// Case-sensitive by design: the existing tag-match semantics in
+/// `memory_timeline` / `export` / `gc` are exact-match (case-sensitive), so
+/// keeping this consistent avoids surprise. Operators wanting case-insensitive
+/// prefix-search should normalize tags at ingest time.
+fn tags_match_prefix(tags: &[String], prefix: &str) -> bool {
+    tags.iter().any(|t| t.starts_with(prefix))
 }
 
 /// Format a search result based on the requested detail level.
@@ -1530,5 +1592,211 @@ mod tests {
         assert!(tb.is_object());
         assert_eq!(tb["minimum"], 100);
         assert_eq!(tb["maximum"], 100000);
+    }
+
+    // ========================================================================
+    // TAG_PREFIX TESTS (PR1)
+    // ========================================================================
+
+    #[test]
+    fn test_tags_match_prefix_unit() {
+        let with_meeting = vec!["meeting:standup".to_string(), "team".to_string()];
+        let without_meeting = vec!["adhoc".to_string(), "team".to_string()];
+        let tagless: Vec<String> = vec![];
+
+        assert!(tags_match_prefix(&with_meeting, "meeting:"));
+        assert!(!tags_match_prefix(&without_meeting, "meeting:"));
+        // Empty prefix matches when any tag exists; never matches a tagless
+        // memory. This preserves the "tag_prefix is a filter, not a default
+        // wildcard" semantics — a tagless memory has no tag-prefix to satisfy.
+        assert!(tags_match_prefix(&with_meeting, ""));
+        assert!(!tags_match_prefix(&tagless, ""));
+        // Case-sensitive (consistent with existing exact-tag matching).
+        assert!(!tags_match_prefix(&with_meeting, "Meeting:"));
+        // Prefix must match from the start, not anywhere in the tag value.
+        assert!(!tags_match_prefix(&with_meeting, "standup"));
+    }
+
+    #[test]
+    fn test_schema_has_tag_prefix() {
+        let schema_value = schema();
+        let tp = &schema_value["properties"]["tag_prefix"];
+        assert!(tp.is_object(), "tag_prefix property must be present");
+        assert_eq!(tp["type"], "string");
+        // tag_prefix is NOT required.
+        let required = schema_value["required"].as_array().unwrap();
+        assert!(!required.contains(&serde_json::json!("tag_prefix")));
+    }
+
+    /// Helper that ingests a memory with specific tags. The base
+    /// `ingest_test_content` helper passes `tags: vec![]`, which is fine
+    /// for legacy tests but not for tag_prefix coverage.
+    async fn ingest_with_tags(
+        storage: &Arc<Storage>,
+        content: &str,
+        tags: Vec<&str>,
+    ) -> String {
+        let input = IngestInput {
+            content: content.to_string(),
+            node_type: "fact".to_string(),
+            source: None,
+            sentiment_score: 0.0,
+            sentiment_magnitude: 0.0,
+            tags: tags.into_iter().map(String::from).collect(),
+            valid_from: None,
+            valid_until: None,
+        };
+        let node = storage.ingest(input).unwrap();
+        node.id
+    }
+
+    #[tokio::test]
+    async fn test_search_tag_prefix_filters_results() {
+        let (storage, _dir) = test_storage().await;
+        // Three memories matching the query semantically, only two carry
+        // the meeting:* tag-class.
+        ingest_with_tags(
+            &storage,
+            "Standup discussion about Q3 roadmap blockers",
+            vec!["meeting:standup", "roadmap"],
+        )
+        .await;
+        ingest_with_tags(
+            &storage,
+            "1-on-1 sync on roadmap clarity and ownership",
+            vec!["meeting:1-on-1", "roadmap"],
+        )
+        .await;
+        ingest_with_tags(
+            &storage,
+            "Solo note: roadmap dependency graph audit",
+            vec!["adhoc", "roadmap"],
+        )
+        .await;
+
+        let args = serde_json::json!({
+            "query": "roadmap",
+            "tag_prefix": "meeting:",
+            "min_similarity": 0.0
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args)).await;
+        assert!(result.is_ok(), "{:?}", result);
+        let value = result.unwrap();
+        let results = value["results"].as_array().unwrap();
+        // Both meeting:* memories should land; the adhoc one should not.
+        for r in results {
+            let tags = r["tags"].as_array().expect("tags must be present");
+            let has_meeting = tags
+                .iter()
+                .any(|t| t.as_str().is_some_and(|s| s.starts_with("meeting:")));
+            assert!(has_meeting, "result lacks meeting:* tag: {}", r);
+        }
+        // We expect 2 matches given the corpus above. The exact count
+        // depends on the cognitive pipeline's competition/suppression
+        // dynamics, so assert a lower bound.
+        assert!(
+            results.len() >= 1,
+            "tag_prefix should leave at least one meeting:* result, got {}",
+            results.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tag_prefix_excludes_tagless_memories() {
+        let (storage, _dir) = test_storage().await;
+        ingest_with_tags(
+            &storage,
+            "Notebook entry about consolidation cycles",
+            vec![], // tagless
+        )
+        .await;
+        ingest_with_tags(
+            &storage,
+            "Project note about consolidation cycles",
+            vec!["project:vestige"],
+        )
+        .await;
+
+        let args = serde_json::json!({
+            "query": "consolidation",
+            "tag_prefix": "project:",
+            "min_similarity": 0.0
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args)).await;
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        let results = value["results"].as_array().unwrap();
+        for r in results {
+            let tags = r["tags"].as_array().expect("tags must be present");
+            let has_project = tags
+                .iter()
+                .any(|t| t.as_str().is_some_and(|s| s.starts_with("project:")));
+            assert!(has_project, "tagless or non-project result leaked: {}", r);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_without_tag_prefix_unchanged() {
+        // Backwards-compat: same corpus, same query, no tag_prefix → all
+        // results pass through regardless of tag composition. This is the
+        // load-bearing test for additive-only behavior.
+        let (storage, _dir) = test_storage().await;
+        ingest_with_tags(&storage, "Notebook entry about audit cycles", vec![]).await;
+        ingest_with_tags(
+            &storage,
+            "Project note about audit cycles",
+            vec!["project:audit"],
+        )
+        .await;
+
+        let args = serde_json::json!({
+            "query": "audit",
+            "min_similarity": 0.0
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args)).await;
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        let results = value["results"].as_array().unwrap();
+        // Both should be retrievable since no tag_prefix is set.
+        assert!(
+            results.len() >= 1,
+            "expected at least one result with no tag_prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tag_prefix_concrete_path() {
+        // Concrete-search path (literal query) must also honor tag_prefix.
+        let (storage, _dir) = test_storage().await;
+        ingest_with_tags(
+            &storage,
+            "OPENAI_API_KEY rotation playbook for meetings",
+            vec!["meeting:ops"],
+        )
+        .await;
+        ingest_with_tags(
+            &storage,
+            "OPENAI_API_KEY rotation playbook for solo audits",
+            vec!["adhoc"],
+        )
+        .await;
+
+        let args = serde_json::json!({
+            "query": "OPENAI_API_KEY",
+            "concrete": true,
+            "tag_prefix": "meeting:"
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args)).await;
+        assert!(result.is_ok(), "{:?}", result);
+        let value = result.unwrap();
+        assert_eq!(value["method"], "concrete");
+        let results = value["results"].as_array().unwrap();
+        for r in results {
+            let tags = r["tags"].as_array().expect("tags must be present");
+            let has_meeting = tags
+                .iter()
+                .any(|t| t.as_str().is_some_and(|s| s.starts_with("meeting:")));
+            assert!(has_meeting, "concrete result lacks meeting:* tag: {}", r);
+        }
     }
 }

@@ -307,7 +307,7 @@ pub struct TableIntrospection {
 /// gives them a first-class MCP-callable surface. The list of tables walked is
 /// intentionally the same canonical set used elsewhere in storage (the user-
 /// data tables) so the surface stays stable across migrations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SchemaIntrospection {
     /// Current schema version (highest applied migration; matches the
@@ -327,19 +327,6 @@ pub struct SchemaIntrospection {
     pub active_embedding_model: Option<String>,
     /// Embedding dimensions for the active model, if known.
     pub active_embedding_dimensions: Option<u32>,
-}
-
-impl Default for SchemaIntrospection {
-    fn default() -> Self {
-        Self {
-            schema_version: 0,
-            schema_version_applied_at: None,
-            tables: Vec::new(),
-            embedding_null_count: 0,
-            active_embedding_model: None,
-            active_embedding_dimensions: None,
-        }
-    }
 }
 
 // ============================================================================

@@ -1034,12 +1034,31 @@ mod tests {
 
         let path = result["path"].as_str().unwrap();
         assert_eq!(result["format"], "portable");
-        assert!(path.ends_with("exports/portable-test.json"));
+        // Separator-agnostic suffix check: on Windows the exported path is
+        // built with the platform separator (`exports\portable-test.json`),
+        // so a raw forward-slash `ends_with` fails. Normalize `\` -> `/`
+        // before comparing so the assertion holds on every platform.
+        assert!(
+            path.replace('\\', "/").ends_with("exports/portable-test.json"),
+            "unexpected export path (want suffix exports/portable-test.json): {path}"
+        );
         assert!(std::path::Path::new(path).exists());
         assert_eq!(
             result["archiveFormat"],
             vestige_core::PORTABLE_ARCHIVE_FORMAT
         );
         assert!(result["rowsExported"].as_u64().unwrap() > 0);
+    }
+
+    /// Regression lock for the Windows path-separator bug: the export-path
+    /// suffix match must accept BOTH `/` and `\` separators. This runs on every
+    /// platform (pure string logic), so the Windows shape is exercised even on
+    /// a Unix CI host where the real export path would only ever use `/`.
+    #[test]
+    fn test_portable_export_path_suffix_is_separator_agnostic() {
+        let unix = "/tmp/vestige/exports/portable-test.json";
+        let windows = r"C:\Users\lucla\vestige\exports\portable-test.json";
+        assert!(unix.replace('\\', "/").ends_with("exports/portable-test.json"));
+        assert!(windows.replace('\\', "/").ends_with("exports/portable-test.json"));
     }
 }

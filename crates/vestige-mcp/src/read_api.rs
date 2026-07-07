@@ -36,10 +36,8 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::get;
 use tower::ServiceBuilder;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
-use crate::dashboard::events::VestigeEvent;
 use crate::dashboard::handlers;
 use crate::dashboard::state::AppState;
 use vestige_core::Storage;
@@ -55,14 +53,16 @@ pub const DEFAULT_READ_API_PORT: u16 = 3927;
 
 /// Build the read-only axum router. `GET`-only; reuses the dashboard read
 /// handlers so the response schema has a single source of truth.
+///
+/// **No CORS layer is mounted, by design.** The consumer is a server-side
+/// httpx/FastAPI backend that performs no cross-origin preflight and needs no
+/// `Access-Control-Allow-Origin` header. Mounting a permissive CORS layer
+/// (`allow_origin(Any)`) would instead let an arbitrary hostile web page the
+/// operator happens to be visiting read the local memory store cross-origin and
+/// exfiltrate it. The correct posture for a loopback-only read surface is the
+/// browser same-origin-policy default: no CORS header at all, so a cross-origin
+/// `fetch` receives an opaque response it cannot read.
 pub fn build_read_router(state: AppState) -> Router {
-    // Loopback bind is the security boundary; a permissive CORS layer is safe
-    // here (read-only, local-only) and lets a browser-based local tool consume
-    // the surface if ever needed. Only GET/OPTIONS are allowed.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([axum::http::Method::GET, axum::http::Method::OPTIONS]);
-
     Router::new()
         .route("/health", get(handlers::health_check))
         .route("/api/health", get(handlers::health_check))
@@ -74,23 +74,28 @@ pub fn build_read_router(state: AppState) -> Router {
         .route("/api/search", get(handlers::search_memories))
         .route("/stats", get(handlers::get_stats))
         .route("/api/stats", get(handlers::get_stats))
-        .layer(ServiceBuilder::new().concurrency_limit(CONCURRENCY_LIMIT).layer(cors))
+        .layer(ServiceBuilder::new().concurrency_limit(CONCURRENCY_LIMIT))
         .with_state(state)
 }
 
 /// Start the read-only HTTP surface as a background task (non-blocking — use in
 /// the MCP server). Cognitive engine is intentionally `None`: none of the read
-/// handlers require it. `event_tx` is shared with the main bus so `/search`
-/// events reach the autopilot/dashboard subscribers.
+/// handlers require it.
+///
+/// The read surface gets its **own private event bus** (`AppState::new`), NOT
+/// the shared main bus. Machine consumers (Forge's automated `/search` and
+/// `/memories?q=` polling) would otherwise emit `SearchPerformed` events onto
+/// the live autopilot bus, polluting the interactive predictive/prefetch model
+/// with non-interactive query traffic. Events emitted by the read handlers now
+/// go to a private sender with no subscribers and are silently dropped.
 ///
 /// A bind failure is logged and returned (the MCP server continues without the
 /// read surface), matching the dashboard's non-fatal startup posture.
 pub async fn start_background(
     storage: Arc<Storage>,
-    event_tx: tokio::sync::broadcast::Sender<VestigeEvent>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let state = AppState::with_event_tx(storage, None, event_tx);
+    let state = AppState::new(storage, None);
     let app = build_read_router(state);
 
     let bind_addr: std::net::IpAddr = std::env::var("VESTIGE_READ_API_BIND")
@@ -199,6 +204,38 @@ mod tests {
         let json = body_json(resp).await;
         assert!(json.get("memories").is_some(), "list envelope has memories");
         assert!(json.get("total").is_some(), "list envelope has total");
+    }
+
+    #[tokio::test]
+    async fn memories_response_has_no_cors_header() {
+        // Security posture (adversarial-review P2): the read surface mounts NO
+        // CORS layer. A response MUST NOT carry `Access-Control-Allow-Origin`,
+        // so a hostile cross-origin web page's `fetch` receives an opaque
+        // response it cannot read — closing the cross-origin memory-store
+        // exfiltration vector. The real consumer is a same-process/server-side
+        // httpx backend that needs no CORS.
+        let (state, _dir) = test_state();
+        let app = build_read_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    // Simulate a cross-origin browser request — even WITH an
+                    // Origin header, no ACAO must be echoed back.
+                    .header("Origin", "https://evil.example.com")
+                    .uri("/memories?limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "read surface must NOT emit Access-Control-Allow-Origin (no CORS layer)"
+        );
     }
 
     #[tokio::test]

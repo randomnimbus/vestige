@@ -499,11 +499,12 @@ async fn main() {
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(vestige_mcp::read_api::DEFAULT_READ_API_PORT);
         let read_api_storage = Arc::clone(&storage);
-        let read_api_event_tx = event_tx.clone();
+        // NOTE: the read surface deliberately does NOT receive the shared
+        // `event_tx` — it runs a private event bus so machine-consumer polling
+        // does not pollute the interactive autopilot predictive/prefetch model.
         tokio::spawn(async move {
             match vestige_mcp::read_api::start_background(
                 read_api_storage,
-                read_api_event_tx,
                 read_api_port,
             )
             .await

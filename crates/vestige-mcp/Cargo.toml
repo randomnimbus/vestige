@@ -112,3 +112,6 @@ mime_guess = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# `util` enables `ServiceExt::oneshot` for hermetic axum router tests (dev-only;
+# `tower` is already a runtime dependency, so this adds no new crate).
+tower = { version = "0.5", features = ["limit", "util"] }

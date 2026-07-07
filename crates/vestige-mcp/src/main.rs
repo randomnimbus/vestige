@@ -484,6 +484,40 @@ async fn main() {
         info!("Dashboard disabled by VESTIGE_DASHBOARD_ENABLED=false");
     }
 
+    // Start optional native read-only HTTP surface (v2.2.1+). Opt-in via
+    // VESTIGE_READ_API_ENABLED=1. Loopback-only, GET-only; lets a non-MCP
+    // consumer (FastAPI/httpx) list/search memories without the MCP handshake
+    // and without coupling to the internal storage layout. Reuses the dashboard
+    // read handlers (single source of truth for the response schema) but mounts
+    // a strict GET-only subset (no mutation, SPA, or WebSocket).
+    let read_api_enabled = std::env::var("VESTIGE_READ_API_ENABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if read_api_enabled {
+        let read_api_port = std::env::var("VESTIGE_READ_API_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(vestige_mcp::read_api::DEFAULT_READ_API_PORT);
+        let read_api_storage = Arc::clone(&storage);
+        let read_api_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            match vestige_mcp::read_api::start_background(
+                read_api_storage,
+                read_api_event_tx,
+                read_api_port,
+            )
+            .await
+            {
+                Ok(()) => info!("Native read-only HTTP surface started"),
+                Err(e) => warn!("Read API failed to start: {}", e),
+            }
+        });
+    } else {
+        info!(
+            "Native read-only HTTP surface disabled; set VESTIGE_READ_API_ENABLED=1 to enable"
+        );
+    }
+
     // Start optional HTTP MCP transport for clients that need Streamable HTTP.
     if config.http_enabled {
         let http_storage = Arc::clone(&storage);

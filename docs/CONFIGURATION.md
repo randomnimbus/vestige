@@ -45,8 +45,96 @@ Qwen3 currently uses Hugging Face Hub's Candle loader directly, so use the stand
 | `VESTIGE_AUTH_TOKEN` | auto-generated | Dashboard + MCP HTTP bearer auth |
 | `VESTIGE_DASHBOARD_ENABLED` | `false` | Set `true` or `1` to enable the web dashboard |
 | `VESTIGE_CONSOLIDATION_INTERVAL_HOURS` | `6` | FSRS-6 decay cycle cadence |
+| `VESTIGE_BACKFILL_AUTOFIRE` | `on` | Retroactive Salience Backfill auto-fire during consolidation. On by default; set `0`/`false`/`off`/`no` to disable. The manual `backfill` tool + CLI stay available either way. When on, promotion is bounded (`stability = MIN(stability * 1.5, stability + 365)`) |
 
 > **Storage location precedence:** `--data-dir <path>` wins over `VESTIGE_DATA_DIR`; if neither is set, Vestige uses your OS's per-user data directory: `~/Library/Application Support/com.vestige.core/` on macOS, `~/.local/share/vestige/core/` on Linux, `%APPDATA%\vestige\core\` on Windows. Custom paths are directories, are created if missing, expand a leading `~`, and store the database at `<dir>/vestige.db`.
+
+---
+
+## Output Configuration (`vestige.toml`)
+
+> Added in **v2.1.26** (Roadmap Phase 2: Configurable Output).
+
+You can control the default shape and size of high-traffic MCP responses with an
+optional config file. It is **local-first** — no cloud service is involved — and
+**fully backward-compatible**: with no file present, Vestige behaves exactly as
+it did before.
+
+### Location
+
+The config file lives in the active Vestige data directory, alongside the
+database:
+
+```
+<data_dir>/vestige.toml      # e.g. ~/Library/Application Support/com.vestige.core/vestige.toml
+```
+
+The data directory is resolved with the same precedence as storage
+(`--data-dir` > `VESTIGE_DATA_DIR` > OS per-user data dir). A missing file, or a
+file with no recognized keys, falls back to built-in defaults. The parser is
+lenient: unknown keys and unknown sections are ignored, so the file can grow in
+future releases without breaking older binaries.
+
+### `[defaults]` table
+
+```toml
+[defaults]
+# Detail level for high-traffic tools: "brief" | "summary" | "full"
+detail_level = "summary"
+
+# Default result count for high-traffic tools (positive integer)
+limit = 10
+
+# Output profile: "lean" | "default" | "audit" | "research"
+profile = "default"
+```
+
+All three keys are optional. `detail_level` and `limit`, when set, override the
+selected profile's presets.
+
+### Output profiles
+
+A profile presets a coherent bundle of detail level, default limit, and whether
+scores and timestamps are included:
+
+| Profile | Detail | Default limit | Scores | Timestamps | Use when |
+|---------|--------|---------------|--------|------------|----------|
+| `lean` | `brief` | 5 | dropped | dropped | Context budget matters most |
+| `default` | `summary` | tool default | shown | shown | **Historical behavior (unchanged)** |
+| `audit` | `full` | tool default | shown | shown | Reviewing or debugging memory state |
+| `research` | `full` | 25 | shown | shown | Wide, detailed result sets |
+
+### Precedence
+
+Resolved per call, highest to lowest:
+
+1. **Explicit MCP parameter** (e.g. `detail_level` / `limit` on a `search`
+   call) — always wins.
+2. **`vestige.toml`** — the `[defaults]` keys and the selected profile.
+3. **Built-in default** — the `default` profile, identical to pre-v2.1.26
+   behavior.
+
+### Affected tools
+
+`search`, `memory_timeline`, `codebase` (`get_context`), and `session_context`
+resolve their default detail level and result limit through this config. Each of
+these tools also echoes the active `profile` in its response so you can confirm
+what was applied. Tools that take no `detail_level`/`limit` are unaffected.
+
+### Example: minimize context cost
+
+```toml
+[defaults]
+profile = "lean"
+```
+
+### Example: detailed audits without changing the profile
+
+```toml
+[defaults]
+detail_level = "full"
+limit = 50
+```
 
 ---
 
@@ -140,6 +228,42 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
   }
 }
 ```
+
+### OpenCode
+
+OpenCode supports global and project-local config. For a project-local setup, add to `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "vestige": {
+      "type": "local",
+      "command": ["vestige-mcp"],
+      "enabled": true,
+      "timeout": 10000
+    }
+  }
+}
+```
+
+For isolated per-project memory, pass the data directory in the command array:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "vestige": {
+      "type": "local",
+      "command": ["vestige-mcp", "--data-dir", "./.vestige"],
+      "enabled": true,
+      "timeout": 10000
+    }
+  }
+}
+```
+
+See the [OpenCode integration guide](integrations/opencode.md) for global config, verification, and troubleshooting.
 
 ---
 

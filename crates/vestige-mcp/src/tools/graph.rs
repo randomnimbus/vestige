@@ -328,6 +328,7 @@ mod tests {
                 tags: vec!["test".to_string()],
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap();
 
@@ -355,6 +356,7 @@ mod tests {
                 tags: vec!["science".to_string()],
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap();
 
@@ -378,6 +380,7 @@ mod tests {
                 tags: vec![],
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap();
 

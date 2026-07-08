@@ -69,6 +69,31 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "v2.1.2 Honest Memory: non-content purge tombstones",
         up: MIGRATION_V13_UP,
     },
+    Migration {
+        version: 14,
+        description: "v2.1.25 Merge/Supersede: reversible operation log, merge plans, bitemporal lineage, protected pins",
+        up: MIGRATION_V14_UP,
+    },
+    Migration {
+        version: 15,
+        description: "ComposedGraph: composition events, members, outcomes",
+        up: MIGRATION_V15_UP,
+    },
+    Migration {
+        version: 16,
+        description: "ADR 0001 Phase 1: embedding_model registry, domains/domain_scores columns, domains table",
+        up: MIGRATION_V16_UP,
+    },
+    Migration {
+        version: 17,
+        description: "#57 Source envelope: provenance columns + connector cursor checkpoints for idempotent external-source sync",
+        up: MIGRATION_V17_UP,
+    },
+    Migration {
+        version: 18,
+        description: "Agent Black Box + Memory Receipts + Memory PRs: replayable run traces, retrieval receipts, risk-gated brain-change review queue",
+        up: MIGRATION_V18_UP,
+    },
 ];
 
 /// A database migration
@@ -735,6 +760,140 @@ ON deletion_tombstones(deleted_at);
 UPDATE schema_version SET version = 13, applied_at = datetime('now');
 "#;
 
+/// V14: Merge / Supersede controls (Phase 3).
+///
+/// Adds the four pieces the merge/supersede feature needs on a never-delete
+/// (bitemporal) store:
+///
+/// 1. `merge_plans` — previewable, not-yet-applied plans. `plan_merge` and
+///    `plan_supersede` write a plan row containing a JSON diff; `apply_plan`
+///    consumes it by id. Plans are append-only; status moves
+///    pending -> applied / cancelled.
+/// 2. `merge_operations` — the reversible operation log (the "memory reflog").
+///    Every applied merge/supersede records one row with a JSON `undo_payload`
+///    capturing exactly what changed, so `merge_undo` can reverse it. The
+///    `signals` column records WHY the memories combined (provenance), which is
+///    the self-explaining differentiator.
+/// 3. `knowledge_nodes.protected` — pin flag. A protected memory can never be
+///    auto-merged, superseded, or forgotten.
+/// 4. `knowledge_nodes.superseded_by` — bitemporal lineage pointer. Superseding
+///    A with B does NOT delete A: it stamps A.valid_until = B.valid_from and
+///    sets A.superseded_by = B.id, leaving A fully queryable for audit
+///    (Graphiti-style invalidate-don't-delete).
+// The two `protected` / `superseded_by` ADD COLUMNs (and their indexes) are
+// applied separately in `apply_migrations` BEFORE this batch runs, guarded
+// against "duplicate column" on replay, since SQLite has no
+// `ADD COLUMN IF NOT EXISTS`. The rest of V14 is idempotent (CREATE ... IF NOT
+// EXISTS).
+const MIGRATION_V14_UP: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_nodes_protected ON knowledge_nodes(protected);
+CREATE INDEX IF NOT EXISTS idx_nodes_superseded_by ON knowledge_nodes(superseded_by);
+
+-- Previewable plans (a diff) produced by plan_merge / plan_supersede.
+-- `kind` is 'merge' | 'supersede'. `payload` is the full JSON plan/diff.
+CREATE TABLE IF NOT EXISTS merge_plans (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | applied | cancelled
+    created_at TEXT NOT NULL,
+    applied_at TEXT,
+    survivor_id TEXT,                          -- node kept after the op
+    member_ids TEXT NOT NULL DEFAULT '[]',     -- JSON array of all involved node ids
+    confidence REAL,                           -- Fellegi-Sunter match score (0-1)
+    classification TEXT,                       -- match | possible | non_match
+    payload TEXT NOT NULL                      -- full JSON plan/diff
+);
+
+CREATE INDEX IF NOT EXISTS idx_merge_plans_status ON merge_plans(status);
+CREATE INDEX IF NOT EXISTS idx_merge_plans_created_at ON merge_plans(created_at);
+
+-- Reversible operation log — the "git reflog for your agent's memory".
+-- One row per applied merge/supersede; `undo_payload` carries everything
+-- needed to reverse it, `signals` records why the memories combined.
+CREATE TABLE IF NOT EXISTS merge_operations (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT,                              -- merge_plans.id this came from
+    op_type TEXT NOT NULL,                     -- merge | supersede | undo
+    status TEXT NOT NULL DEFAULT 'applied',    -- applied | reverted
+    created_at TEXT NOT NULL,
+    reverted_at TEXT,
+    reverts_op_id TEXT,                        -- set when op_type = 'undo'
+    survivor_id TEXT,                          -- node kept
+    affected_ids TEXT NOT NULL DEFAULT '[]',   -- JSON array of node ids touched
+    confidence REAL,
+    signals TEXT,                              -- JSON: why they combined (provenance)
+    reason TEXT,                               -- human-readable explanation
+    undo_payload TEXT NOT NULL                 -- JSON snapshot to reverse the op
+);
+
+CREATE INDEX IF NOT EXISTS idx_merge_operations_status ON merge_operations(status);
+CREATE INDEX IF NOT EXISTS idx_merge_operations_created_at ON merge_operations(created_at);
+CREATE INDEX IF NOT EXISTS idx_merge_operations_survivor ON merge_operations(survivor_id);
+
+UPDATE schema_version SET version = 14, applied_at = datetime('now');
+"#;
+
+/// V15: ComposedGraph persistence for memory composition outcomes.
+///
+/// These tables record which memories were used together, which tool/query
+/// produced the composition, and what happened afterward. `memory_id` values
+/// are intentionally historical references instead of foreign keys to
+/// `knowledge_nodes`: purging or superseding a memory must not erase the fact
+/// that a bounty lane or reasoning path was previously composed.
+const MIGRATION_V15_UP: &str = r#"
+CREATE TABLE IF NOT EXISTS composition_events (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'deep_reference',
+    query TEXT,
+    query_hash TEXT,
+    confidence REAL,
+    status TEXT,
+    output_preview TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_composition_events_created_at ON composition_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_composition_events_tool ON composition_events(tool);
+CREATE INDEX IF NOT EXISTS idx_composition_events_mode ON composition_events(mode);
+CREATE INDEX IF NOT EXISTS idx_composition_events_query_hash ON composition_events(query_hash);
+
+CREATE TABLE IF NOT EXISTS composition_members (
+    event_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    role TEXT NOT NULL, -- primary | supporting | contradicting | superseded | related
+    rank INTEGER NOT NULL DEFAULT 0,
+    trust REAL,
+    score REAL,
+    preview TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (event_id, memory_id, role),
+    FOREIGN KEY (event_id) REFERENCES composition_events(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_composition_members_memory ON composition_members(memory_id);
+CREATE INDEX IF NOT EXISTS idx_composition_members_role ON composition_members(role);
+
+CREATE TABLE IF NOT EXISTS composition_outcomes (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    outcome_type TEXT NOT NULL,
+    labeled_at TEXT NOT NULL,
+    label_source TEXT NOT NULL DEFAULT 'tool',
+    confidence_delta REAL,
+    notes TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (event_id) REFERENCES composition_events(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_composition_outcomes_event ON composition_outcomes(event_id);
+CREATE INDEX IF NOT EXISTS idx_composition_outcomes_type ON composition_outcomes(outcome_type);
+CREATE INDEX IF NOT EXISTS idx_composition_outcomes_labeled_at ON composition_outcomes(labeled_at);
+
+UPDATE schema_version SET version = 15, applied_at = datetime('now');
+"#;
+
 /// Get current schema version from database
 pub fn get_current_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
     conn.query_row(
@@ -744,6 +903,235 @@ pub fn get_current_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32>
     )
     .or(Ok(0))
 }
+
+/// Run an `ALTER TABLE ... ADD COLUMN` statement, treating a "duplicate column
+/// name" failure as success so migration replay stays idempotent (SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`).
+fn add_column_if_missing(conn: &rusqlite::Connection, sql: &str) -> rusqlite::Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+            if msg.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// V16: ADR 0001 Phase 1 - embedding_model registry + domain columns.
+///
+/// The ALTER TABLE statements are split out into `MIGRATION_V16_ALTER_COLUMNS`
+/// because SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. The
+/// migration runner handles them individually so replaying V16 is idempotent.
+const MIGRATION_V16_UP: &str = r#"
+-- Migration V16: embedding model registry + per-memory domain columns.
+
+-- 1. Embedding model registry. Single logical row; the (id = 1) constraint is
+--    enforced in code via `register_model` (SQLite CHECK on a single-row
+--    table is uglier than a constraint we already enforce in Rust).
+CREATE TABLE IF NOT EXISTS embedding_model (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    name         TEXT    NOT NULL,
+    dimension    INTEGER NOT NULL,
+    hash         TEXT    NOT NULL,
+    created_at   TEXT    NOT NULL
+);
+
+-- 2. Per-memory domain columns are applied separately (see apply_migrations).
+
+-- 3. Index on the domains JSON column to enable LIKE-style filter in Phase 4.
+CREATE INDEX IF NOT EXISTS idx_nodes_domains ON knowledge_nodes(domains);
+CREATE INDEX IF NOT EXISTS idx_nodes_domain_scores ON knowledge_nodes(domain_scores);
+
+-- 4. Domains catalogue (empty until Phase 4 populates).
+CREATE TABLE IF NOT EXISTS domains (
+    id           TEXT    PRIMARY KEY,
+    label        TEXT    NOT NULL,
+    centroid     BLOB,
+    top_terms    TEXT    NOT NULL DEFAULT '[]',
+    memory_count INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_domains_created_at ON domains(created_at);
+
+UPDATE schema_version SET version = 16, applied_at = datetime('now');
+"#;
+
+/// The two ALTER TABLE statements for V16. Kept separate so the migration
+/// runner can try each individually and ignore "duplicate column" errors,
+/// making V16 idempotent on replay (SQLite has no ADD COLUMN IF NOT EXISTS).
+pub const MIGRATION_V16_ALTER_COLUMNS: &[&str] = &[
+    "ALTER TABLE knowledge_nodes ADD COLUMN domains TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE knowledge_nodes ADD COLUMN domain_scores TEXT NOT NULL DEFAULT '{}'",
+];
+
+/// V17: #57 Source envelope — structured provenance for connector-ingested
+/// records, plus a per-connector cursor checkpoint table.
+///
+/// The provenance columns live directly on `knowledge_nodes` (rather than a
+/// side table) so search can filter and cite them with no join. They are all
+/// nullable and default-NULL, so every existing memory is untouched and the
+/// migration is purely additive — legacy rows simply have no envelope.
+///
+/// The `(source_system, source_id)` pair is the idempotency key for
+/// `upsert_by_source`; the unique index enforces one memory per external
+/// record. `content_hash` is the change detector. `connector_cursors` holds the
+/// incremental-sync high-water mark and last full-reconcile time per
+/// (source_system, scope).
+///
+/// The `ALTER TABLE ... ADD COLUMN` statements are split into
+/// `MIGRATION_V17_ALTER_COLUMNS` and run individually by the migration runner,
+/// because SQLite has no `ADD COLUMN IF NOT EXISTS`; duplicate-column errors are
+/// swallowed so replay stays idempotent.
+const MIGRATION_V17_UP: &str = r#"
+-- Idempotency key: at most one memory per (source_system, source_id).
+-- Partial unique index so the millions of envelope-less legacy rows (all NULL)
+-- don't collide and don't pay index cost.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_source_key
+    ON knowledge_nodes(source_system, source_id)
+    WHERE source_system IS NOT NULL AND source_id IS NOT NULL;
+
+-- Filter/scan support for source-aware search + reconciliation passes.
+CREATE INDEX IF NOT EXISTS idx_nodes_source_system
+    ON knowledge_nodes(source_system)
+    WHERE source_system IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_nodes_source_project
+    ON knowledge_nodes(source_project)
+    WHERE source_project IS NOT NULL;
+
+-- Per-connector incremental-sync checkpoint. One row per (source_system, scope)
+-- e.g. ('github', 'samvallad33/vestige'). `cursor_updated_at` is the
+-- high-water mark on the source's update timestamp; `last_full_reconcile_at`
+-- gates the (expensive) deletion-reconcile pass.
+CREATE TABLE IF NOT EXISTS connector_cursors (
+    source_system          TEXT NOT NULL,
+    scope                  TEXT NOT NULL,
+    cursor_updated_at      TEXT,
+    last_synced_at         TEXT,
+    last_full_reconcile_at TEXT,
+    records_seen           INTEGER NOT NULL DEFAULT 0,
+    config                 TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (source_system, scope)
+);
+
+UPDATE schema_version SET version = 17, applied_at = datetime('now');
+"#;
+
+/// The `ALTER TABLE` statements for V17. Run individually + idempotently by the
+/// migration runner (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+pub const MIGRATION_V17_ALTER_COLUMNS: &[&str] = &[
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_system TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_id TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_url TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_updated_at TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN content_hash TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN synced_at TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_project TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_type TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_author TEXT",
+];
+
+/// V18: Agent Black Box + Memory Receipts + Memory PRs.
+///
+/// Three append-only / review tables that turn Vestige into the *black box,
+/// immune system, and cinematic debugger for agent memory*:
+///
+/// - `agent_traces` — one row per [`crate::trace::MemoryTraceEvent`], ordered by
+///   `(run_id, seq)`. Append-only so a run replays exactly as the agent
+///   experienced it. `payload` is the full serialized event; `event_type` and
+///   `run_id` are denormalized for fast filtering and the `vestige://trace/{id}`
+///   resource. `args_hash` (for `mcp.call`) is stored, never the raw args, so
+///   traces can't leak prompt contents or secrets.
+///
+/// - `memory_receipts` — one row per retrieval receipt. `payload` holds the full
+///   [`crate::trace::Receipt`]; the scalar columns (`trust_floor`, `decay_risk`)
+///   are denormalized for list/sort without parsing JSON.
+///
+/// - `memory_prs` — the risk-gated review queue. A risky write (contradiction
+///   vs high-trust, supersede/forget/merge/protect, sensitive topic, dream
+///   consolidation, decay resurrection, low-confidence batch, weak-provenance
+///   connector) lands here as `pending` instead of auto-committing. `diff` is the
+///   structured before/after, `signals` is the self-explaining risk evidence,
+///   `run_id` links the PR back to the black-box trace that produced it.
+///
+/// `memory_id` / `run_id` references are intentionally *not* foreign keys to
+/// `knowledge_nodes`: forgetting or superseding a memory must never erase the
+/// audit trail of the trace, receipt, or PR that touched it (same
+/// audit-preserving stance as V15's composition tables).
+const MIGRATION_V18_UP: &str = r#"
+-- Black-box trace events: append-only, ordered by (run_id, seq).
+CREATE TABLE IF NOT EXISTS agent_traces (
+    id          TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    event_type  TEXT NOT NULL,          -- mcp.call | memory.retrieve | ...
+    tool        TEXT,                   -- denormalized for mcp.call rows
+    payload     TEXT NOT NULL,          -- full serialized MemoryTraceEvent (JSON)
+    at          INTEGER NOT NULL,       -- wall-clock millis
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_traces_run ON agent_traces(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_agent_traces_type ON agent_traces(event_type);
+CREATE INDEX IF NOT EXISTS idx_agent_traces_at ON agent_traces(at);
+
+-- One row per agent run, for the Black Box run list (denormalized roll-up).
+CREATE TABLE IF NOT EXISTS agent_runs (
+    run_id         TEXT PRIMARY KEY,
+    first_tool     TEXT,
+    event_count    INTEGER NOT NULL DEFAULT 0,
+    retrieved_count INTEGER NOT NULL DEFAULT 0,
+    suppressed_count INTEGER NOT NULL DEFAULT 0,
+    write_count    INTEGER NOT NULL DEFAULT 0,
+    veto_count     INTEGER NOT NULL DEFAULT 0,
+    started_at     INTEGER NOT NULL,    -- millis of first event
+    last_at        INTEGER NOT NULL,    -- millis of latest event
+    created_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_last_at ON agent_runs(last_at DESC);
+
+-- Retrieval receipts (the "nutrition label" for a piece of agent memory).
+CREATE TABLE IF NOT EXISTS memory_receipts (
+    receipt_id  TEXT PRIMARY KEY,
+    run_id      TEXT,                   -- links to the trace, if any
+    tool        TEXT,
+    query       TEXT,
+    retrieved_count  INTEGER NOT NULL DEFAULT 0,
+    suppressed_count INTEGER NOT NULL DEFAULT 0,
+    trust_floor REAL NOT NULL DEFAULT 0,
+    decay_risk  TEXT NOT NULL DEFAULT 'low',
+    payload     TEXT NOT NULL,          -- full serialized Receipt (JSON)
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_receipts_run ON memory_receipts(run_id);
+CREATE INDEX IF NOT EXISTS idx_memory_receipts_created_at ON memory_receipts(created_at DESC);
+
+-- Memory PRs: the risk-gated review queue for brain changes.
+CREATE TABLE IF NOT EXISTS memory_prs (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,          -- new_fact | contradiction_detected | ...
+    status      TEXT NOT NULL DEFAULT 'pending',
+    title       TEXT NOT NULL,
+    subject_id  TEXT,                   -- the memory this PR concerns, if any
+    run_id      TEXT,                   -- the run that produced it
+    diff        TEXT NOT NULL DEFAULT '{}',   -- structured before/after (JSON)
+    signals     TEXT NOT NULL DEFAULT '[]',   -- self-explaining RiskSignal[] (JSON)
+    decision    TEXT,                   -- promote | merge | supersede | ...
+    created_at  TEXT NOT NULL,
+    decided_at  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_prs_status ON memory_prs(status);
+CREATE INDEX IF NOT EXISTS idx_memory_prs_kind ON memory_prs(kind);
+CREATE INDEX IF NOT EXISTS idx_memory_prs_created_at ON memory_prs(created_at DESC);
+
+UPDATE schema_version SET version = 18, applied_at = datetime('now');
+"#;
 
 /// Apply pending migrations
 pub fn apply_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
@@ -757,6 +1145,39 @@ pub fn apply_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
                 migration.version,
                 migration.description
             );
+
+            // V14: add the two bitemporal/protect columns BEFORE the batch (the
+            // batch's indexes reference them). SQLite lacks
+            // `ADD COLUMN IF NOT EXISTS`, so swallow the "duplicate column"
+            // error to stay idempotent on replay.
+            if migration.version == 14 {
+                add_column_if_missing(
+                    conn,
+                    "ALTER TABLE knowledge_nodes ADD COLUMN protected INTEGER NOT NULL DEFAULT 0",
+                )?;
+                add_column_if_missing(
+                    conn,
+                    "ALTER TABLE knowledge_nodes ADD COLUMN superseded_by TEXT",
+                )?;
+            }
+
+            // V16 adds columns via ALTER TABLE, which SQLite does not support
+            // with IF NOT EXISTS. Run them individually and ignore duplicate
+            // column errors so replay stays idempotent.
+            if migration.version == 16 {
+                for stmt in MIGRATION_V16_ALTER_COLUMNS {
+                    add_column_if_missing(conn, stmt)?;
+                }
+            }
+
+            // V17 (#57) adds the source-envelope columns. Same idempotent
+            // ALTER handling as V16 — the unique index in the V17 batch
+            // references these columns, so they must exist before the batch.
+            if migration.version == 17 {
+                for stmt in MIGRATION_V17_ALTER_COLUMNS {
+                    add_column_if_missing(conn, stmt)?;
+                }
+            }
 
             // Use execute_batch to handle multi-statement SQL including triggers
             conn.execute_batch(migration.up)?;
@@ -784,17 +1205,18 @@ mod tests {
     /// version after `apply_migrations` runs all migrations end-to-end, and
     /// neither of the dead tables V11 drops must exist afterwards.
     #[test]
-    fn test_apply_migrations_advances_to_v13_and_drops_dead_tables() {
+    fn test_apply_migrations_advances_to_v16_and_drops_dead_tables() {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
 
         // Pre-requisite: schema_version must be bootstrapped by V1.
         apply_migrations(&conn).expect("apply_migrations succeeds");
 
-        // 1. schema_version advanced to V13
+        // 1. schema_version advanced to the latest migration
         let version = get_current_version(&conn).expect("read schema_version");
+        let latest = MIGRATIONS.last().unwrap().version;
         assert_eq!(
-            version, 13,
-            "schema_version must be 13 after all migrations"
+            version, latest,
+            "schema_version must be the latest migration after all migrations"
         );
 
         // 2. knowledge_edges is gone (V11 drops it)
@@ -848,6 +1270,53 @@ mod tests {
             deletion_tombstone_rows, 1,
             "deletion_tombstones table must be created by V13"
         );
+
+        // 6. merge_plans + merge_operations exist (V14 creates them)
+        for table in ["merge_plans", "merge_operations"] {
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(rows, 1, "{table} table must be created by V14");
+        }
+
+        // 7. ComposedGraph tables exist (V15)
+        for table in [
+            "composition_events",
+            "composition_members",
+            "composition_outcomes",
+        ] {
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(rows, 1, "{table} table must be created by V15");
+        }
+
+        // 8. knowledge_nodes gains `protected` + `superseded_by` (V14)
+        let node_cols: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(knowledge_nodes)")
+                .expect("prepare table_info");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query table_info")
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(
+            node_cols.iter().any(|c| c == "protected"),
+            "knowledge_nodes must have `protected` column after V14"
+        );
+        assert!(
+            node_cols.iter().any(|c| c == "superseded_by"),
+            "knowledge_nodes must have `superseded_by` column after V14"
+        );
     }
 
     /// V11 must be idempotent on replay — if the tables were already dropped
@@ -865,10 +1334,234 @@ mod tests {
         conn.execute("UPDATE schema_version SET version = 10", [])
             .expect("rewind schema_version");
 
-        // Replay must not error.
-        apply_migrations(&conn).expect("V11 replay must be idempotent");
+        // Replay V11 onward. V11 uses DROP TABLE IF EXISTS so it is idempotent.
+        // V12/V13 tombstone tables use CREATE TABLE IF NOT EXISTS. V14/V16 ALTER
+        // TABLE idempotency is handled by the migration runner.
+        apply_migrations(&conn).expect("V11..V17 replay must be idempotent");
 
+        // After replaying from V10, the schema advances to the latest version.
         let version = get_current_version(&conn).expect("read schema_version");
-        assert_eq!(version, 13, "schema_version back at 13 after replay");
+        assert_eq!(
+            version,
+            MIGRATIONS.last().unwrap().version,
+            "schema_version back at latest after replay"
+        );
+    }
+
+    #[test]
+    fn v16_adds_embedding_model_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedding_model'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(count, 1, "embedding_model table must exist after V16");
+    }
+
+    #[test]
+    fn v16_adds_domains_columns() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+        let info: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(knowledge_nodes)")
+                .expect("prepare");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query_map")
+                .map(|r| r.expect("row"))
+                .collect()
+        };
+        assert!(
+            info.contains(&"domains".to_string()),
+            "domains column missing"
+        );
+        assert!(
+            info.contains(&"domain_scores".to_string()),
+            "domain_scores column missing"
+        );
+    }
+
+    #[test]
+    fn v16_default_values_empty_json() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+        // Insert a minimal row to test defaults
+        conn.execute(
+            "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, \
+             stability, difficulty, reps, lapses, learning_state, storage_strength, retrieval_strength, \
+             retention_strength, next_review, scheduled_days, has_embedding) \
+             VALUES ('test-id','content','fact',datetime('now'),datetime('now'),datetime('now'),\
+             1.0,0.3,0,0,'new',1.0,1.0,1.0,datetime('now'),1,0)",
+            [],
+        ).expect("insert row");
+        let (domains, domain_scores): (String, String) = conn
+            .query_row(
+                "SELECT domains, domain_scores FROM knowledge_nodes WHERE id='test-id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query row");
+        assert_eq!(domains, "[]");
+        assert_eq!(domain_scores, "{}");
+    }
+
+    #[test]
+    fn v16_is_replayable() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("first apply");
+        // Rewind to V15 so V16 runs again.
+        conn.execute("UPDATE schema_version SET version = 15", [])
+            .expect("rewind");
+        // V16 uses CREATE TABLE IF NOT EXISTS and idempotent ALTER handling.
+        apply_migrations(&conn).expect("V16 replay must be idempotent");
+        let version = get_current_version(&conn).expect("read version");
+        assert_eq!(
+            version,
+            MIGRATIONS.last().unwrap().version,
+            "schema_version must be latest after replay"
+        );
+    }
+
+    #[test]
+    fn v17_adds_source_envelope_columns_and_cursor_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+
+        // All nine envelope columns must exist on knowledge_nodes.
+        let cols: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(knowledge_nodes)")
+                .expect("prepare");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query_map")
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for c in [
+            "source_system",
+            "source_id",
+            "source_url",
+            "source_updated_at",
+            "content_hash",
+            "synced_at",
+            "source_project",
+            "source_type",
+            "source_author",
+        ] {
+            assert!(
+                cols.iter().any(|x| x == c),
+                "knowledge_nodes must have `{c}` column after V17"
+            );
+        }
+
+        // connector_cursors table must exist.
+        let cursor_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='connector_cursors'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(cursor_rows, 1, "connector_cursors must be created by V17");
+    }
+
+    #[test]
+    fn v17_unique_source_key_index_allows_many_null_legacy_rows() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+
+        // Two legacy rows with NULL source key must NOT collide on the partial
+        // unique index (the index only covers non-NULL keys).
+        for id in ["a", "b"] {
+            conn.execute(
+                "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, \
+                 stability, difficulty, reps, lapses, learning_state, storage_strength, retrieval_strength, \
+                 retention_strength, next_review, scheduled_days, has_embedding) \
+                 VALUES (?1,'c','fact',datetime('now'),datetime('now'),datetime('now'),\
+                 1.0,0.3,0,0,'new',1.0,1.0,1.0,datetime('now'),1,0)",
+                [id],
+            )
+            .expect("insert legacy row");
+        }
+
+        // Two real connector rows that share (source_system, source_id) MUST
+        // collide — the unique index is the idempotency guarantee.
+        conn.execute(
+            "UPDATE knowledge_nodes SET source_system='github', source_id='1' WHERE id='a'",
+            [],
+        )
+        .expect("set source key on a");
+        let dup = conn.execute(
+            "UPDATE knowledge_nodes SET source_system='github', source_id='1' WHERE id='b'",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate (source_system, source_id) must violate the unique index"
+        );
+    }
+
+    #[test]
+    fn v17_is_replayable() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("first apply");
+        conn.execute("UPDATE schema_version SET version = 16", [])
+            .expect("rewind to 16");
+        apply_migrations(&conn).expect("V17 replay must be idempotent");
+        let version = get_current_version(&conn).expect("read version");
+        assert_eq!(
+            version,
+            MIGRATIONS.last().unwrap().version,
+            "schema_version must be latest after replay"
+        );
+    }
+
+    #[test]
+    fn v16_preserves_existing_rows_from_v15() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        // Apply up to V15 only, including the V14 ALTER TABLE columns that
+        // `apply_migrations` normally runs before the V14 SQL batch.
+        for migration in MIGRATIONS {
+            if migration.version <= 15 {
+                if migration.version == 14 {
+                    add_column_if_missing(
+                        &conn,
+                        "ALTER TABLE knowledge_nodes ADD COLUMN protected INTEGER NOT NULL DEFAULT 0",
+                    )
+                    .expect("apply V14 protected column");
+                    add_column_if_missing(
+                        &conn,
+                        "ALTER TABLE knowledge_nodes ADD COLUMN superseded_by TEXT",
+                    )
+                    .expect("apply V14 superseded_by column");
+                }
+                conn.execute_batch(migration.up).expect("apply migration");
+            }
+        }
+        // Insert a row under the V15 schema, before PR #61's V16 columns exist.
+        conn.execute(
+            "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, \
+             stability, difficulty, reps, lapses, learning_state, storage_strength, retrieval_strength, \
+             retention_strength, next_review, scheduled_days, has_embedding) \
+             VALUES ('existing-id','old content','fact',datetime('now'),datetime('now'),datetime('now'),\
+             1.0,0.3,0,0,'new',1.0,1.0,1.0,datetime('now'),1,0)",
+            [],
+        ).expect("insert pre-v16 row");
+        apply_migrations(&conn).expect("apply V16 migration");
+
+        // Check the old row has defaults
+        let (domains, domain_scores): (String, String) = conn
+            .query_row(
+                "SELECT domains, domain_scores FROM knowledge_nodes WHERE id='existing-id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query pre-v16 row");
+        assert_eq!(domains, "[]");
+        assert_eq!(domain_scores, "{}");
     }
 }

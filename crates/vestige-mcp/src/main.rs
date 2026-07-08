@@ -256,12 +256,13 @@ fn prepare_storage_path(data_dir: Option<PathBuf>) -> io::Result<Option<PathBuf>
     }
 
     // Only create if it doesn't exist (avoids "File exists" error on existing directories)
-    if !data_dir.exists() {
+    let created = !data_dir.exists();
+    if created {
         fs::create_dir_all(&data_dir)?;
     }
 
     #[cfg(unix)]
-    {
+    if created {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700));
     }
@@ -300,21 +301,6 @@ async fn main() {
     let storage = match Storage::new(storage_path) {
         Ok(s) => {
             info!("Storage initialized successfully");
-
-            // Try to initialize embeddings early and log any issues
-            #[cfg(feature = "embeddings")]
-            {
-                if let Err(e) = s.init_embeddings() {
-                    error!("Failed to initialize embedding service: {}", e);
-                    error!("Smart ingest will fall back to regular ingest without deduplication");
-                    error!(
-                        "Hint: Check FASTEMBED_CACHE_PATH or ensure ~/.cache/vestige/fastembed is writable"
-                    );
-                } else {
-                    info!("Embedding service initialized successfully");
-                }
-            }
-
             Arc::new(s)
         }
         Err(e) => {
@@ -322,6 +308,40 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Initialize embeddings in the background so MCP clients can complete the
+    // stdio handshake quickly. First-run model downloads can otherwise exceed
+    // short client startup timeouts.
+    #[cfg(feature = "embeddings")]
+    {
+        let storage_clone = Arc::clone(&storage);
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = storage_clone.init_embeddings() {
+                error!("Failed to initialize embedding service: {}", e);
+                error!("Smart ingest will fall back to regular ingest without deduplication");
+                error!(
+                    "Hint: Check FASTEMBED_CACHE_PATH or ensure ~/.cache/vestige/fastembed is writable"
+                );
+            } else {
+                info!("Embedding service initialized successfully");
+
+                #[cfg(feature = "vector-search")]
+                match storage_clone.generate_embeddings(None, false) {
+                    Ok(result) => {
+                        if result.successful > 0 || result.failed > 0 {
+                            info!(
+                                embeddings_generated = result.successful,
+                                embeddings_failed = result.failed,
+                                embeddings_skipped = result.skipped,
+                                "Background embedding backfill complete"
+                            );
+                        }
+                    }
+                    Err(e) => warn!("Background embedding backfill failed: {}", e),
+                }
+            }
+        });
+    }
 
     // Spawn periodic auto-consolidation so FSRS-6 decay scores stay fresh.
     // Runs on startup (if needed) and then every N hours (default: 6).
@@ -464,6 +484,41 @@ async fn main() {
         info!("Dashboard disabled by VESTIGE_DASHBOARD_ENABLED=false");
     }
 
+    // Start optional native read-only HTTP surface (v2.2.1+). Opt-in via
+    // VESTIGE_READ_API_ENABLED=1. Loopback-only, GET-only; lets a non-MCP
+    // consumer (FastAPI/httpx) list/search memories without the MCP handshake
+    // and without coupling to the internal storage layout. Reuses the dashboard
+    // read handlers (single source of truth for the response schema) but mounts
+    // a strict GET-only subset (no mutation, SPA, or WebSocket).
+    let read_api_enabled = std::env::var("VESTIGE_READ_API_ENABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if read_api_enabled {
+        let read_api_port = std::env::var("VESTIGE_READ_API_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(vestige_mcp::read_api::DEFAULT_READ_API_PORT);
+        let read_api_storage = Arc::clone(&storage);
+        // NOTE: the read surface deliberately does NOT receive the shared
+        // `event_tx` — it runs a private event bus so machine-consumer polling
+        // does not pollute the interactive autopilot predictive/prefetch model.
+        tokio::spawn(async move {
+            match vestige_mcp::read_api::start_background(
+                read_api_storage,
+                read_api_port,
+            )
+            .await
+            {
+                Ok(()) => info!("Native read-only HTTP surface started"),
+                Err(e) => warn!("Read API failed to start: {}", e),
+            }
+        });
+    } else {
+        info!(
+            "Native read-only HTTP surface disabled; set VESTIGE_READ_API_ENABLED=1 to enable"
+        );
+    }
+
     // Start optional HTTP MCP transport for clients that need Streamable HTTP.
     if config.http_enabled {
         let http_storage = Arc::clone(&storage);
@@ -505,7 +560,7 @@ async fn main() {
     }
 
     // Load cross-encoder reranker in the background (downloads ~150MB on first run)
-    #[cfg(feature = "vector-search")]
+    #[cfg(all(feature = "vector-search", feature = "embeddings"))]
     {
         let cog_clone = Arc::clone(&cognitive);
         tokio::spawn(async move {
@@ -592,6 +647,23 @@ mod tests {
         let db_path = prepare_storage_path(Some(data_dir.clone())).unwrap();
 
         assert_eq!(db_path, Some(data_dir.join(DATABASE_FILE)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_storage_path_preserves_existing_data_dir_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("shared");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db_path = prepare_storage_path(Some(data_dir.clone())).unwrap();
+        let mode = fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(db_path, Some(data_dir.join(DATABASE_FILE)));
+        assert_eq!(mode, 0o755);
     }
 
     #[test]

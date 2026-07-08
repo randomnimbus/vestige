@@ -110,7 +110,7 @@ enum Commands {
 
     /// Update Vestige binaries from the latest GitHub release
     Update {
-        /// Install a specific release tag instead of latest (example: v2.1.21)
+        /// Install a specific release tag instead of latest (example: v2.1.27)
         #[arg(long)]
         version: Option<String>,
 
@@ -182,10 +182,20 @@ enum Commands {
         merge: bool,
     },
 
-    /// Two-way sync with a file-backed portable archive
+    /// Two-way sync with a file-backed portable archive, or Vestige Cloud
     Sync {
-        /// Sync archive path, often in Dropbox/iCloud/Syncthing/Git
-        archive: PathBuf,
+        /// Sync archive path, often in Dropbox/iCloud/Syncthing/Git.
+        /// Omit when using --cloud.
+        archive: Option<PathBuf>,
+        /// Sync with the hosted Vestige Cloud managed-sync service instead of a
+        /// file. Requires a sync key (VESTIGE_CLOUD_SYNC_KEY) and endpoint
+        /// (--endpoint or VESTIGE_CLOUD_ENDPOINT).
+        #[arg(long)]
+        cloud: bool,
+        /// Vestige Cloud base endpoint (e.g. https://sync.vestige.dev).
+        /// Defaults to the VESTIGE_CLOUD_ENDPOINT env var.
+        #[arg(long)]
+        endpoint: Option<String>,
     },
 
     /// Garbage collect stale memories below retention threshold
@@ -227,6 +237,64 @@ enum Commands {
         /// Source reference
         #[arg(long)]
         source: Option<String>,
+        /// Backdate this memory N days in the past (for demos / seeding history)
+        #[arg(long)]
+        ago_days: Option<i64>,
+    },
+
+    /// Retroactive Salience Backfill — reach BACKWARD from a failure and surface
+    /// the quiet earlier memory that caused it (the root cause a vector search
+    /// can't find). Cai 2024 Nature. "Memory with hindsight."
+    Backfill {
+        /// ID of the failure memory; if omitted, the latest failure-like memory is used
+        #[arg(long)]
+        failure_id: Option<String>,
+        /// Force the backfill even if the event isn't auto-detected as salient
+        #[arg(long)]
+        manual: bool,
+        /// How many days back to reach
+        #[arg(long, default_value = "30")]
+        lookback_days: i64,
+        /// Dry run: don't actually promote the surfaced cause
+        #[arg(long)]
+        no_promote: bool,
+        /// Demo mode: first show what a plain SEMANTIC SEARCH returns for the
+        /// failure (the lookalike, NOT the cause), then what Postdict surfaces.
+        #[arg(long)]
+        contrast: bool,
+        /// Machine-readable: print the raw backfill result as JSON (for tooling /
+        /// benchmarks). Suppresses the human-formatted output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Recall + reason across memories (deep_reference): hybrid search, FSRS-6 trust,
+    /// spreading activation, supersession + contradiction analysis. Returns the
+    /// synthesized answer, evidence, and confidence.
+    Recall {
+        /// The query / claim to reason about
+        query: String,
+        /// How many memories to analyze (candidate depth)
+        #[arg(long, default_value = "20")]
+        depth: i64,
+        /// Output raw JSON instead of the human-readable summary
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Compose: surface NEVER-COMPOSED memory pairs — two memories you wrote that nobody
+    /// (including you) ever connected — and the testable question they imply. The insight
+    /// generator: semantic-band + structural-bridge ranking over your cross-domain memory.
+    Compose {
+        /// How many candidate insight pairs to surface
+        #[arg(long, default_value = "5")]
+        limit: i32,
+        /// Optional tag filter (comma-separated) to focus a domain
+        #[arg(long)]
+        tags: Option<String>,
+        /// Output raw JSON instead of the human-readable summary
+        #[arg(long)]
+        json: bool,
     },
 
     /// Start standalone HTTP MCP server (no stdio, for remote access)
@@ -287,7 +355,11 @@ fn main() -> anyhow::Result<()> {
         } => run_export(output, format, tags, since),
         Commands::PortableExport { output } => run_portable_export(output),
         Commands::PortableImport { input, merge } => run_portable_import(input, merge),
-        Commands::Sync { archive } => run_sync(archive),
+        Commands::Sync {
+            archive,
+            cloud,
+            endpoint,
+        } => run_sync(archive, cloud, endpoint),
         Commands::Gc {
             min_retention,
             max_age_days,
@@ -300,7 +372,18 @@ fn main() -> anyhow::Result<()> {
             tags,
             node_type,
             source,
-        } => run_ingest(content, tags, node_type, source),
+            ago_days,
+        } => run_ingest(content, tags, node_type, source, ago_days),
+        Commands::Backfill {
+            failure_id,
+            manual,
+            lookback_days,
+            no_promote,
+            contrast,
+            json,
+        } => run_backfill(failure_id, manual, lookback_days, !no_promote, contrast, json),
+        Commands::Recall { query, depth, json } => run_recall(query, depth, json),
+        Commands::Compose { limit, tags, json } => run_compose(limit, tags, json),
         Commands::Serve {
             port,
             dashboard,
@@ -746,9 +829,19 @@ fn install_launchd_job(source_root: &Path, home: &Path, model: &str) -> anyhow::
         .join("com.vestige.mlx-server.plist.template");
     let template = fs::read_to_string(&template_path)
         .with_context(|| format!("failed to read {}", template_path.display()))?;
+    // XML-escape interpolated values: this plist is XML, and an unescaped model
+    // string containing &, <, >, " or ' would corrupt the plist (or inject
+    // elements). Escape before substitution.
+    let xml_escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    };
     let rendered = template
-        .replace("__HOME__", &home.display().to_string())
-        .replace("__MODEL__", model);
+        .replace("__HOME__", &xml_escape(&home.display().to_string()))
+        .replace("__MODEL__", &xml_escape(model));
 
     let plist = launchd_dir.join("com.vestige.mlx-server.plist");
     fs::write(&plist, rendered)?;
@@ -1817,6 +1910,7 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
             tags: memory.tags.unwrap_or_default(),
             valid_from: None,
             valid_until: None,
+            source_envelope: None,
         };
 
         match storage.ingest(input) {
@@ -2192,14 +2286,88 @@ fn run_portable_import(input: PathBuf, merge: bool) -> anyhow::Result<()> {
 }
 
 /// Run file-backed two-way sync.
-fn run_sync(archive: PathBuf) -> anyhow::Result<()> {
+fn run_sync(archive: Option<PathBuf>, cloud: bool, endpoint: Option<String>) -> anyhow::Result<()> {
+    if cloud {
+        run_sync_cloud(endpoint)
+    } else {
+        let archive = archive.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no sync target: pass an archive path for file sync, or --cloud for Vestige Cloud"
+            )
+        })?;
+        run_sync_file(archive)
+    }
+}
+
+fn run_sync_file(archive: PathBuf) -> anyhow::Result<()> {
     println!("{}", "=== Vestige File Sync ===".cyan().bold());
     println!();
     println!("{}: {}", "Archive".white().bold(), archive.display());
 
     let storage = open_storage()?;
     let report = storage.sync_portable_archive_file(&archive)?;
+    print_sync_report(&report);
+    Ok(())
+}
 
+#[cfg(feature = "cloud-sync")]
+fn run_sync_cloud(endpoint: Option<String>) -> anyhow::Result<()> {
+    let endpoint = endpoint
+        .or_else(|| std::env::var("VESTIGE_CLOUD_ENDPOINT").ok())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no cloud endpoint: pass --endpoint or set VESTIGE_CLOUD_ENDPOINT \
+                 (e.g. https://sync.vestige.dev)"
+            )
+        })?;
+    let sync_key = std::env::var("VESTIGE_CLOUD_SYNC_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no sync key: set VESTIGE_CLOUD_SYNC_KEY (issued when you subscribe to \
+                 Vestige Cloud)"
+            )
+        })?;
+
+    // Optional zero-knowledge encryption passphrase. Never sent to the server.
+    let encryption_key = std::env::var("VESTIGE_CLOUD_ENCRYPTION_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    println!("{}", "=== Vestige Cloud Sync ===".cyan().bold());
+    println!();
+    println!("{}: {}", "Endpoint".white().bold(), endpoint);
+    if encryption_key.is_some() {
+        println!(
+            "{}: {}",
+            "Encryption".white().bold(),
+            "zero-knowledge (XChaCha20-Poly1305) — your data is encrypted before upload".green()
+        );
+    } else {
+        println!(
+            "{}: {}",
+            "Encryption".white().bold(),
+            "OFF — set VESTIGE_CLOUD_ENCRYPTION_KEY for zero-knowledge sync".yellow()
+        );
+    }
+
+    let storage = open_storage()?;
+    let report = storage.sync_portable_archive_cloud(&endpoint, &sync_key, encryption_key)?;
+    print_sync_report(&report);
+    Ok(())
+}
+
+#[cfg(not(feature = "cloud-sync"))]
+fn run_sync_cloud(_endpoint: Option<String>) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "this build was compiled without the `cloud-sync` feature; rebuild with \
+         --features cloud-sync to use Vestige Cloud"
+    )
+}
+
+fn print_sync_report(report: &vestige_core::PortableSyncReport) {
     if let Some(pull) = &report.pull {
         println!("{}", "Pull: merged remote archive".yellow());
         println!(
@@ -2227,8 +2395,6 @@ fn run_sync(archive: PathBuf) -> anyhow::Result<()> {
         .green()
         .bold()
     );
-
-    Ok(())
 }
 
 /// Run garbage collection command
@@ -2296,7 +2462,7 @@ fn run_gc(
         let age_days = (now - node.created_at).num_days();
         println!(
             "  {} [ret={:.3}, age={}d] {}",
-            node.id[..8].dimmed(),
+            node.id.get(..8).unwrap_or(&node.id).dimmed(),
             node.retention_strength,
             age_days,
             truncate(&node.content, 60).dimmed()
@@ -2357,7 +2523,7 @@ fn run_gc(
                 eprintln!(
                     "  {} Failed to delete {}: {}",
                     "ERR".red(),
-                    &node.id[..8],
+                    node.id.get(..8).unwrap_or(&node.id),
                     e
                 );
                 errors += 1;
@@ -2391,6 +2557,7 @@ fn run_ingest(
     tags: Option<String>,
     node_type: String,
     source: Option<String>,
+    ago_days: Option<i64>,
 ) -> anyhow::Result<()> {
     if content.trim().is_empty() {
         anyhow::bail!("Content cannot be empty");
@@ -2415,6 +2582,7 @@ fn run_ingest(
         tags: tag_list,
         valid_from: None,
         valid_until: None,
+        source_envelope: None,
     };
 
     let storage = open_storage()?;
@@ -2423,6 +2591,10 @@ fn run_ingest(
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     {
         let result = storage.smart_ingest(input)?;
+        if let Some(days) = ago_days {
+            let when = chrono::Utc::now() - chrono::Duration::days(days);
+            storage.set_created_at(&result.node.id, when)?;
+        }
         println!("{}", "=== Vestige Ingest ===".cyan().bold());
         println!();
         println!("{}: {}", "Decision".white().bold(), result.decision.green());
@@ -2432,6 +2604,9 @@ fn run_ingest(
         }
         if let Some(pe) = result.prediction_error {
             println!("{}: {:.3}", "Prediction Error".white().bold(), pe);
+        }
+        if let Some(days) = ago_days {
+            println!("{}: {} days ago", "Backdated".white().bold(), days);
         }
         println!("{}: {}", "Reason".white().bold(), result.reason);
         println!();
@@ -2446,6 +2621,10 @@ fn run_ingest(
     #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
     {
         let node = storage.ingest(input)?;
+        if let Some(days) = ago_days {
+            let when = chrono::Utc::now() - chrono::Duration::days(days);
+            storage.set_created_at(&node.id, when)?;
+        }
         println!("{}", "=== Vestige Ingest ===".cyan().bold());
         println!();
         println!("{}: create", "Decision".white().bold());
@@ -2457,6 +2636,350 @@ fn run_ingest(
                 .green()
                 .bold()
         );
+    }
+
+    Ok(())
+}
+
+/// Run Retroactive Salience Backfill from the CLI (the demo's payoff command).
+fn run_backfill(
+    failure_id: Option<String>,
+    manual: bool,
+    lookback_days: i64,
+    promote: bool,
+    contrast: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let storage = std::sync::Arc::new(open_storage()?);
+    #[cfg(feature = "embeddings")]
+    {
+        let _ = storage.init_embeddings();
+    }
+
+    // Resolve the failure text up front (used by the contrast baseline).
+    // Use the SAME failure detector the backfill tool uses (content + tags, full
+    // marker list) so the CLI's pick and the tool's pick never diverge.
+    let failure_text: Option<String> = match &failure_id {
+        Some(id) => storage.get_node(id).ok().flatten().map(|n| n.content),
+        None => storage
+            .get_all_nodes(500, 0)
+            .ok()
+            .and_then(|nodes| {
+                nodes
+                    .into_iter()
+                    .find(vestige_mcp::tools::backfill::looks_like_failure)
+            })
+            .map(|n| n.content),
+    };
+
+    // CONTRAST: show what a SIMILARITY SEARCH returns for the failure first — the
+    // lookalike it ranks at the top, which is NOT the cause. Same store, same
+    // query. Uses semantic (hybrid) search when embeddings exist, else keyword
+    // search — either way it ranks by RESEMBLANCE, which is exactly the blind spot.
+    if contrast
+        && let Some(ftext) = &failure_text {
+            // Generic salient-words query: keep alphanumerics, drop a leading
+            // "<word>:" label if present (e.g. "Service crashed:"). No hardcoding.
+            let query = match ftext.split_once(": ") {
+                Some((lead, rest)) if lead.split_whitespace().count() <= 2 => rest,
+                _ => ftext.as_str(),
+            };
+
+            // Track which engine ACTUALLY ran so the label is honest (the audit's
+            // top finding: never present keyword search as "semantic").
+            let mut engine = "keyword (BM25)";
+            let mut shown = false;
+            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            {
+                if storage.is_embedding_ready()
+                    && let Ok(hits) = storage.hybrid_search(query, 6, 0.3, 0.7) {
+                        let others: Vec<_> =
+                            hits.iter().filter(|h| h.node.content != *ftext).take(3).collect();
+                        if !others.is_empty() {
+                            engine = "semantic (vector + BM25 hybrid)";
+                        }
+                    }
+            }
+            println!(
+                "{}",
+                format!("── 1. SIMILARITY SEARCH · {engine} ──").dimmed().bold()
+            );
+            println!("   query: {}", truncate(query, 60).dimmed());
+
+            // best OTHER match (exclude the failure itself, which trivially matches).
+            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            {
+                if storage.is_embedding_ready()
+                    && let Ok(hits) = storage.hybrid_search(query, 6, 0.3, 0.7) {
+                        let others: Vec<_> =
+                            hits.iter().filter(|h| h.node.content != *ftext).take(3).collect();
+                        for (i, h) in others.iter().enumerate() {
+                            let tag = if i == 0 { " ← top match".red().bold().to_string() } else { String::new() };
+                            println!("   {}. {}{}", i + 1, truncate(&h.node.content, 60).normal(), tag);
+                            shown = true;
+                        }
+                    }
+            }
+            if !shown {
+                // keyword/BM25 (always works) — still ranks by lexical resemblance.
+                if let Ok(hits) = storage.search(query, 6) {
+                    let others: Vec<_> =
+                        hits.iter().filter(|h| h.content != *ftext).take(3).collect();
+                    for (i, h) in others.iter().enumerate() {
+                        let tag = if i == 0 { " ← top match".red().bold().to_string() } else { String::new() };
+                        println!("   {}. {}{}", i + 1, truncate(&h.content, 60).normal(), tag);
+                        shown = true;
+                    }
+                }
+            }
+            if shown {
+                println!(
+                    "   {}",
+                    "→ ranked by RESEMBLANCE. its top hit is a lookalike, not the cause.".red()
+                );
+            } else {
+                println!("   {}", "(no lookalikes — nothing resembles the crash)".dimmed());
+            }
+            println!();
+            println!("{}", "── 2. POSTDICT (reach backward for the CAUSE) ──".magenta().bold());
+        }
+
+    let args = serde_json::json!({
+        "failure_id": failure_id,
+        "manual": manual,
+        "lookback_days": lookback_days,
+        "promote": promote,
+    });
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt
+        .block_on(vestige_mcp::tools::backfill::execute(&storage, Some(args)))
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Machine-readable path: dump the raw tool result (includes per-cause
+    // memory_id, shared_entities, similarity_rank) and stop. Used by tooling and
+    // the CauseBench harness so it can score against real engine output.
+    if json {
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
+
+    println!("{}", "=== Retroactive Salience Backfill ===".magenta().bold());
+    println!();
+    if result["triggered"] != serde_json::json!(true) {
+        println!(
+            "{} {}",
+            "Not triggered:".yellow().bold(),
+            result["reason"].as_str().unwrap_or("event not salient")
+        );
+        return Ok(());
+    }
+    if let Some(f) = result["failure"].as_object() {
+        println!(
+            "{} {}",
+            "Failure:".red().bold(),
+            f.get("content_preview").and_then(|v| v.as_str()).unwrap_or("")
+        );
+    }
+    println!();
+    println!("{}", "Reached BACKWARD and surfaced the cause(s) a vector search would miss:".white());
+    println!();
+    if let Some(causes) = result["causes"].as_array() {
+        for (i, c) in causes.iter().enumerate() {
+            let age = c["age_days_before_failure"].as_f64().unwrap_or(0.0);
+            let rank = c["similarity_rank"].as_u64();
+            println!(
+                "  {} {}",
+                format!("#{}", i + 1).cyan().bold(),
+                c["content_preview"].as_str().unwrap_or("").green().bold()
+            );
+            println!(
+                "     {} {:.1} days before the failure",
+                "↩ reached back".magenta(),
+                age
+            );
+            if let Some(shared) = c["shared_entities"].as_array() {
+                let ents: Vec<&str> = shared.iter().filter_map(|e| e.as_str()).collect();
+                println!("     {} {}", "🔗 causal join:".magenta(), ents.join(", "));
+            }
+            if let Some(r) = rank {
+                println!(
+                    "     {} ranked #{} on similarity {}",
+                    "🔍".magenta(),
+                    r,
+                    "(so semantic search would NOT have surfaced it)".dimmed()
+                );
+            }
+            if c["promoted"] == serde_json::json!(true) {
+                println!("     {} promoted — it will resurface next time", "✅".green());
+            }
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// Recall + reason across memories using the real deep_reference engine.
+fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
+    use vestige_mcp::cognitive::CognitiveEngine;
+
+    let storage = open_storage()?;
+
+    #[cfg(feature = "embeddings")]
+    {
+        if let Err(e) = storage.init_embeddings() {
+            eprintln!(
+                "  {} Embeddings unavailable: {} (recall will use keyword-only)",
+                "!".yellow(),
+                e
+            );
+        }
+    }
+
+    let storage = Arc::new(storage);
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(async move {
+        let cognitive = Arc::new(tokio::sync::Mutex::new(CognitiveEngine::new()));
+        {
+            let mut cog = cognitive.lock().await;
+            cog.hydrate(&storage);
+        }
+        let args = serde_json::json!({ "query": query, "depth": depth });
+        vestige_mcp::tools::cross_reference::execute(&storage, &cognitive, Some(args)).await
+    });
+
+    let value = result.map_err(|e| anyhow::anyhow!("recall error: {}", e))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    // Human-readable summary of the real engine output.
+    let conf = value
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let intent = value
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Synthesis");
+    let analyzed = value
+        .get("memoriesAnalyzed")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    println!(
+        "{}  intent={}  confidence={:.0}%  memories_analyzed={}",
+        "Recall".cyan().bold(),
+        intent,
+        conf * 100.0,
+        analyzed
+    );
+
+    if let Some(rec) = value.get("recommended") {
+        let ans = rec
+            .get("answer_preview")
+            .or_else(|| rec.get("preview"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !ans.is_empty() {
+            println!("\n{}", "Recommended:".white().bold());
+            for line in ans.lines().take(6) {
+                println!("  {}", line);
+            }
+        }
+    }
+
+    if let Some(ev) = value.get("evidence").and_then(|v| v.as_array()) {
+        println!("\n{} ({})", "Evidence".white().bold(), ev.len());
+        for (i, e) in ev.iter().take(5).enumerate() {
+            let pv = e
+                .get("preview")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .replace('\n', " ");
+            let pv: String = pv.chars().take(78).collect();
+            println!("  {}. {}", i + 1, pv);
+        }
+    }
+
+    Ok(())
+}
+
+/// Compose: surface never-composed memory pairs + the testable question they imply.
+fn run_compose(limit: i32, tags: Option<String>, json: bool) -> anyhow::Result<()> {
+    let storage = open_storage()?;
+
+    #[cfg(feature = "embeddings")]
+    {
+        let _ = storage.init_embeddings();
+    }
+
+    let tag_vec: Option<Vec<String>> = tags.map(|t| {
+        t.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+
+    let candidates = storage
+        .get_never_composed_candidates(limit, tag_vec.as_deref())
+        .map_err(|e| anyhow::anyhow!("compose error: {}", e))?;
+
+    if json {
+        let arr: Vec<_> = candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "score": c.score,
+                    "novelty": c.novelty_score,
+                    "bridge": c.bridge_score,
+                    "trust": c.trust_score,
+                    "a": c.first_preview,
+                    "b": c.second_preview,
+                    "shared_tags": c.shared_tags,
+                    "question": c.composition_question,
+                    "reason": c.reason,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
+
+    if candidates.is_empty() {
+        println!(
+            "{}  no never-composed candidates surfaced (try a wider --limit or remove --tags)",
+            "Compose".magenta().bold()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}  {} never-composed insight{} — pairs you wrote that were never connected:\n",
+        "Compose".magenta().bold(),
+        candidates.len(),
+        if candidates.len() == 1 { "" } else { "s" }
+    );
+
+    for (i, c) in candidates.iter().enumerate() {
+        let a: String = c.first_preview.replace('\n', " ").chars().take(70).collect();
+        let b: String = c.second_preview.replace('\n', " ").chars().take(70).collect();
+        let idx = format!("{}.", i + 1).cyan().bold();
+        let metrics = format!(
+            "{:.2}  (novelty {:.2}, bridge {:.2})",
+            c.score, c.novelty_score, c.bridge_score
+        );
+        println!("{} {} {}", idx, "score".white(), metrics);
+        println!("   A: {}", a);
+        println!("   B: {}", b);
+        let q: String = c.composition_question.replace('\n', " ").chars().take(120).collect();
+        if !q.is_empty() {
+            println!("   {} {}", "?".yellow().bold(), q.yellow());
+        }
+        println!();
     }
 
     Ok(())

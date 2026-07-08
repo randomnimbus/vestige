@@ -61,7 +61,7 @@ The server exposes the current unified MCP tools from
 - `search`, `smart_ingest`, `memory`, `codebase`, `intention`
 - `deep_reference`, `cross_reference`, `contradictions`
 - `dream`, `explore_connections`, `predict`
-- `memory_health`, `memory_graph`, `system_status`
+- `memory_health`, `memory_graph`, `composed_graph`, `system_status`
 - `importance_score`, `find_duplicates`
 - `consolidate`, `memory_timeline`, `memory_changelog`
 - `backup`, `export`, `restore`, `gc`, `suppress`

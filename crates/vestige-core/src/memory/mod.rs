@@ -10,7 +10,7 @@ mod node;
 mod strength;
 mod temporal;
 
-pub use node::{IngestInput, KnowledgeNode, NodeType, RecallInput, SearchMode};
+pub use node::{IngestInput, KnowledgeNode, NodeType, RecallInput, SearchMode, SourceEnvelope};
 pub use strength::{DualStrength, StrengthDecay};
 pub use temporal::{TemporalRange, TemporalValidity};
 
@@ -209,9 +209,12 @@ impl KnowledgeEdge {
         }
     }
 
-    /// Check if the edge is currently valid
+    /// Check if the edge is currently valid (within its [valid_from, valid_until)
+    /// window). Delegates to the bi-temporal check so a not-yet-active edge
+    /// (future valid_from) or an expired one is correctly reported invalid —
+    /// the old version only checked valid_until and ignored valid_from.
     pub fn is_valid(&self) -> bool {
-        self.valid_until.is_none()
+        self.was_valid_at(chrono::Utc::now())
     }
 
     /// Check if the edge was valid at a given time
@@ -277,6 +280,59 @@ impl Default for MemoryStats {
 }
 
 // ============================================================================
+// SCHEMA INTROSPECTION (v2.1.24+: surfaces DB shape to MCP consumers)
+// ============================================================================
+
+/// A single SQLite table's introspected shape: name, row count, column list.
+///
+/// Returned as part of `SchemaIntrospection` from `Storage::schema_introspection()`.
+/// Consumers needing more depth (e.g. per-column NULL counts) should request
+/// targeted methods rather than expecting this struct to grow unboundedly —
+/// the row + column shape covered here is the 80% case for audit / migration
+/// guard scripts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableIntrospection {
+    /// SQLite table name.
+    pub name: String,
+    /// Row count.
+    pub rows: i64,
+    /// Column names in declaration order.
+    pub columns: Vec<String>,
+}
+
+/// Result of `Storage::schema_introspection()`. Snapshots the schema version,
+/// migration timestamp, and a row/column view of every user-data table.
+///
+/// Motivation: external consumers (audit scripts, migration guards, downstream
+/// upgrade scripts) currently must read SQLite directly to learn the schema
+/// version and table shape, which couples them to internal layout. This struct
+/// gives them a first-class MCP-callable surface. The list of tables walked is
+/// intentionally the same canonical set used elsewhere in storage (the user-
+/// data tables) so the surface stays stable across migrations.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaIntrospection {
+    /// Current schema version (highest applied migration; matches the
+    /// `schema_version` table's MAX(version)).
+    pub schema_version: u32,
+    /// When the current schema version was applied (RFC3339), if known.
+    pub schema_version_applied_at: Option<DateTime<Utc>>,
+    /// Per-table introspection rows.
+    pub tables: Vec<TableIntrospection>,
+    /// Total number of nodes whose `embeddings.embedding` is NULL (i.e., have
+    /// no embedding row). Convenience field for embedding-coverage audits;
+    /// equivalent to (knowledge_nodes.rows − rows in `embeddings` joined to
+    /// knowledge_nodes), so consumers don't have to compute it themselves.
+    pub embedding_null_count: i64,
+    /// Active embedding model name (mirrors `MemoryStats.active_embedding_model`).
+    /// Useful when an audit script wants schema_version + active model in one call.
+    pub active_embedding_model: Option<String>,
+    /// Embedding dimensions for the active model, if known.
+    pub active_embedding_dimensions: Option<u32>,
+}
+
+// ============================================================================
 // CONSOLIDATION RESULT
 // ============================================================================
 
@@ -306,6 +362,10 @@ pub struct ConsolidationResult {
     pub activations_computed: i64,
     /// Personalized w20 if optimized this cycle
     pub w20_optimized: Option<f64>,
+    /// Retroactive Salience Backfill: number of quiet earlier *causes* promoted
+    /// because a recent salient failure reached backward and surfaced them
+    /// (root-cause memories a semantic search would have missed).
+    pub backfilled_causes: i64,
 }
 
 // ============================================================================

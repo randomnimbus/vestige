@@ -245,4 +245,67 @@ mod tests {
         assert!(!TemporalValidity::Past.is_valid());
         assert!(!TemporalValidity::Future.is_valid());
     }
+
+    #[test]
+    fn test_range_from() {
+        let now = Utc::now();
+        let start = now + Duration::days(10);
+        let range = TemporalRange::from(start);
+        assert_eq!(range.start, Some(start));
+        assert_eq!(range.end, None);
+        assert!(range.contains(start));
+        assert!(!range.contains(start - Duration::days(1)));
+        assert!(range.contains(start + Duration::days(1000)));
+        assert_eq!(range.duration(), None);
+    }
+
+    #[test]
+    fn test_range_until() {
+        let now = Utc::now();
+        let end = now + Duration::days(20);
+        let range = TemporalRange::until(end);
+        assert_eq!(range.start, None);
+        assert_eq!(range.end, Some(end));
+        assert!(range.contains(end));
+        assert!(!range.contains(end + Duration::days(1)));
+        assert!(range.contains(now - Duration::days(100)));
+        assert_eq!(range.duration(), None);
+    }
+
+    #[test]
+    fn test_range_all() {
+        let now = Utc::now();
+        let range = TemporalRange::all();
+        assert_eq!(range.start, None);
+        assert_eq!(range.end, None);
+        assert!(range.contains(now));
+        assert!(range.contains(now + Duration::days(100_000)));
+        assert_eq!(range.duration(), None);
+    }
+
+    #[test]
+    fn test_range_duration() {
+        let now = Utc::now();
+        let start = now + Duration::days(5);
+        let end = now + Duration::days(15);
+        let range = TemporalRange::between(start, end);
+        assert_eq!(range.duration(), Some(Duration::days(10)));
+        let from_range = TemporalRange::from(start);
+        assert_eq!(from_range.duration(), None);
+        let until_range = TemporalRange::until(end);
+        assert_eq!(until_range.duration(), None);
+    }
+
+    #[test]
+    fn test_range_default() {
+        let now = Utc::now();
+        let default_range = TemporalRange::default();
+        let all_range = TemporalRange::all();
+        assert_eq!(default_range.start, None);
+        assert_eq!(default_range.end, None);
+        assert_eq!(default_range.start, all_range.start);
+        assert_eq!(default_range.end, all_range.end);
+        assert!(default_range.contains(now));
+        assert_eq!(default_range.contains(now), all_range.contains(now));
+    }
 }

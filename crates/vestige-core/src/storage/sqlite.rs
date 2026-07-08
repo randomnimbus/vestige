@@ -2,7 +2,7 @@
 //!
 //! Core storage layer with integrated embeddings and vector search.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use directories::{BaseDirs, ProjectDirs};
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use lru::LruCache;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::fsrs::{
     DEFAULT_DECAY, FSRSScheduler, FSRSState, LearningState, Rating, retrievability_with_decay,
 };
-use crate::fts::sanitize_fts5_query;
+use crate::fts::{sanitize_fts5_or_query, sanitize_fts5_query};
 use crate::memory::{
     ConsolidationResult, IngestInput, KnowledgeNode, MatchType, MemoryStats, RecallInput,
     SearchMode, SearchResult,
@@ -37,7 +37,7 @@ use crate::embeddings::EmbeddingService;
 use crate::embeddings::{EMBEDDING_DIMENSIONS, Embedding, matryoshka_truncate};
 
 #[cfg(feature = "vector-search")]
-use crate::search::{VectorIndex, linear_combination};
+use crate::search::{VectorIndex, reciprocal_rank_fusion};
 
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use crate::search::hyde;
@@ -260,6 +260,9 @@ const PORTABLE_TABLES: &[&str] = &[
     "retention_snapshots",
     "sync_tombstones",
     "deletion_tombstones",
+    "composition_events",
+    "composition_members",
+    "composition_outcomes",
 ];
 
 const PORTABLE_USER_DATA_TABLES: &[&str] = &[
@@ -278,6 +281,9 @@ const PORTABLE_USER_DATA_TABLES: &[&str] = &[
     "retention_snapshots",
     "sync_tombstones",
     "deletion_tombstones",
+    "composition_events",
+    "composition_members",
+    "composition_outcomes",
 ];
 
 #[derive(Default)]
@@ -287,27 +293,111 @@ struct PortableMergeState {
 
 const DATA_DIR_ENV: &str = "VESTIGE_DATA_DIR";
 const DATABASE_FILE: &str = "vestige.db";
+const VESTIGE_DISABLE_VECTOR_SEARCH: &str = "VESTIGE_DISABLE_VECTOR_SEARCH";
 
 /// Main storage struct with integrated embedding and vector search
 ///
 /// Uses separate reader/writer connections for interior mutability.
 /// All methods take `&self` (not `&mut self`), making Storage `Send + Sync`
 /// so the MCP layer can use `Arc<Storage>` instead of `Arc<Mutex<Storage>>`.
-pub struct Storage {
+pub struct SqliteMemoryStore {
     db_path: PathBuf,
-    writer: Mutex<Connection>,
-    reader: Mutex<Connection>,
+    // `pub(crate)` so the sibling `trace_store` module (Black Box / Receipts /
+    // Memory PRs CRUD) can lock the same writer/reader connections and follow
+    // the established store idiom without duplicating connection management.
+    pub(crate) writer: Mutex<Connection>,
+    pub(crate) reader: Mutex<Connection>,
     scheduler: Mutex<FSRSScheduler>,
     #[cfg(feature = "embeddings")]
     embedding_service: EmbeddingService,
     #[cfg(feature = "vector-search")]
-    vector_index: Mutex<VectorIndex>,
+    vector_index: Option<Mutex<VectorIndex>>,
     /// LRU cache for query embeddings to avoid re-embedding repeated queries
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    query_cache: Mutex<LruCache<String, Vec<f32>>>,
+    query_cache: Option<Mutex<LruCache<String, Vec<f32>>>>,
+    /// Cached model signature. `None` until the first embedding is written.
+    registered_model: std::sync::RwLock<Option<crate::storage::memory_store::ModelSignature>>,
 }
 
-impl Storage {
+impl SqliteMemoryStore {
+    #[cfg(feature = "vector-search")]
+    fn vector_search_enabled_by_cpu() -> bool {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let has_required_features = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma");
+
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let has_required_features = true;
+
+        let disabled_by_env = std::env::var_os(VESTIGE_DISABLE_VECTOR_SEARCH)
+            .and_then(|v| {
+                let value = v.to_ascii_lowercase();
+                if value == "1"
+                    || value == "true"
+                    || value == "yes"
+                    || value == "on"
+                    || value == "enable"
+                    || value == "enabled"
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .is_some();
+
+        has_required_features && !disabled_by_env
+    }
+
+    #[cfg(feature = "vector-search")]
+    fn vector_search_unavailable_reason() -> Option<&'static str> {
+        if std::env::var_os(VESTIGE_DISABLE_VECTOR_SEARCH).is_some() {
+            return Some("disabled by VESTIGE_DISABLE_VECTOR_SEARCH");
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                return Some("unsupported CPU: AVX2 required");
+            }
+            if !std::arch::is_x86_feature_detected!("fma") {
+                return Some("unsupported CPU: FMA required");
+            }
+        }
+
+        None
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn vector_search_available(&self) -> bool {
+        self.vector_index.is_some()
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    fn vector_search_available(&self) -> bool {
+        false
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn regular_ingest_result(
+        &self,
+        input: IngestInput,
+        reason: impl Into<String>,
+    ) -> Result<SmartIngestResult> {
+        let node = self.ingest(input)?;
+        Ok(SmartIngestResult {
+            decision: "create".to_string(),
+            node,
+            superseded_id: None,
+            similarity: None,
+            prediction_error: Some(1.0),
+            reason: reason.into(),
+            previous_content: None,
+            merged_from: None,
+            merge_preview: None,
+        })
+    }
+
     fn data_dir_from_env() -> Option<PathBuf> {
         std::env::var_os(DATA_DIR_ENV).and_then(|value| {
             if value.is_empty() {
@@ -431,15 +521,26 @@ impl Storage {
         let embedding_service = EmbeddingService::new();
 
         #[cfg(feature = "vector-search")]
-        let vector_index = VectorIndex::new()
-            .map_err(|e| StorageError::Init(format!("Failed to create vector index: {}", e)))?;
+        let vector_index = if Self::vector_search_enabled_by_cpu() {
+            let vector_index = VectorIndex::new()
+                .map_err(|e| StorageError::Init(format!("Failed to create vector index: {}", e)))?;
+            Some(Mutex::new(vector_index))
+        } else {
+            tracing::warn!(
+                "Vector search disabled: {}",
+                Self::vector_search_unavailable_reason().unwrap_or("manual override"),
+            );
+            None
+        };
 
-        // Initialize LRU cache for query embeddings (capacity: 100 queries)
-        // SAFETY: 100 is always non-zero, this cannot fail
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        let query_cache = Mutex::new(LruCache::new(
-            NonZeroUsize::new(100).expect("100 is non-zero"),
-        ));
+        let query_cache = if vector_index.is_some() {
+            Some(Mutex::new(LruCache::new(
+                NonZeroUsize::new(100).expect("100 is non-zero"),
+            )))
+        } else {
+            None
+        };
 
         let storage = Self {
             db_path: path,
@@ -449,13 +550,16 @@ impl Storage {
             #[cfg(feature = "embeddings")]
             embedding_service,
             #[cfg(feature = "vector-search")]
-            vector_index: Mutex::new(vector_index),
+            vector_index,
             #[cfg(all(feature = "embeddings", feature = "vector-search"))]
             query_cache,
+            registered_model: std::sync::RwLock::new(None),
         };
 
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        storage.load_embeddings_into_index()?;
+        if storage.vector_index.is_some() {
+            storage.load_embeddings_into_index()?;
+        }
 
         Ok(storage)
     }
@@ -478,8 +582,11 @@ impl Storage {
     /// Load existing embeddings into vector index
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn load_embeddings_into_index(&self) -> Result<()> {
-        let mut index = self
-            .vector_index
+        let Some(index) = self.vector_index.as_ref() else {
+            return Ok(());
+        };
+
+        let mut index = index
             .lock()
             .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
         let reader = self
@@ -578,6 +685,12 @@ impl Storage {
         let valid_from_str = input.valid_from.map(|dt| dt.to_rfc3339());
         let valid_until_str = input.valid_until.map(|dt| dt.to_rfc3339());
 
+        // #57 Source envelope — flatten to nullable column values. A node with
+        // no external provenance leaves all nine columns NULL (legacy shape).
+        let env = input.source_envelope.clone().unwrap_or_default();
+        let env_source_updated_at = env.source_updated_at.map(|dt| dt.to_rfc3339());
+        let env_synced_at = env.synced_at.map(|dt| dt.to_rfc3339());
+
         {
             let writer = self
                 .writer
@@ -589,13 +702,19 @@ impl Storage {
                     stability, difficulty, reps, lapses, learning_state,
                     storage_strength, retrieval_strength, retention_strength,
                     sentiment_score, sentiment_magnitude, next_review, scheduled_days,
-                    source, tags, valid_from, valid_until, has_embedding, embedding_model
+                    source, tags, valid_from, valid_until, has_embedding, embedding_model,
+                    domains, domain_scores,
+                    source_system, source_id, source_url, source_updated_at,
+                    content_hash, synced_at, source_project, source_type, source_author
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9, ?10, ?11,
                     ?12, ?13, ?14,
                     ?15, ?16, ?17, ?18,
-                    ?19, ?20, ?21, ?22, ?23, ?24
+                    ?19, ?20, ?21, ?22, ?23, ?24,
+                    '[]', '{}',
+                    ?25, ?26, ?27, ?28,
+                    ?29, ?30, ?31, ?32, ?33
                 )",
                 params![
                     id,
@@ -622,6 +741,15 @@ impl Storage {
                     valid_until_str,
                     0,
                     Option::<String>::None,
+                    env.source_system,
+                    env.source_id,
+                    env.source_url,
+                    env_source_updated_at,
+                    env.content_hash,
+                    env_synced_at,
+                    env.source_project,
+                    env.source_type,
+                    env.source_author,
                 ],
             )?;
         }
@@ -666,19 +794,17 @@ impl Storage {
 
         // Generate embedding for new content
         if !self.embedding_service.is_ready() {
-            // Fall back to regular ingest if embeddings not available
-            let node = self.ingest(input)?;
-            return Ok(SmartIngestResult {
-                decision: "create".to_string(),
-                node,
-                superseded_id: None,
-                similarity: None,
-                prediction_error: Some(1.0),
-                reason: "Embeddings not available, falling back to regular ingest".to_string(),
-                previous_content: None,
-                merged_from: None,
-                merge_preview: None,
-            });
+            return self.regular_ingest_result(
+                input,
+                "Embeddings not available, falling back to regular ingest",
+            );
+        }
+
+        if !self.vector_search_available() {
+            return self.regular_ingest_result(
+                input,
+                "Vector search unavailable, falling back to regular ingest",
+            );
         }
 
         let new_embedding = self
@@ -987,7 +1113,9 @@ impl Storage {
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         {
             // Remove old embedding from index
-            if let Ok(mut index) = self.vector_index.lock() {
+            if let Some(index) = self.vector_index.as_ref()
+                && let Ok(mut index) = index.lock()
+            {
                 let _ = index.remove(id);
             }
             // Generate new embedding
@@ -1037,13 +1165,14 @@ impl Storage {
             )?;
         }
 
-        let mut index = self
-            .vector_index
-            .lock()
-            .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
-        index
-            .add(node_id, &embedding.vector)
-            .map_err(|e| StorageError::Init(format!("Vector index add failed: {}", e)))?;
+        if let Some(index) = self.vector_index.as_ref() {
+            let mut index = index
+                .lock()
+                .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
+            index
+                .add(node_id, &embedding.vector)
+                .map_err(|e| StorageError::Init(format!("Vector index add failed: {}", e)))?;
+        }
 
         Ok(())
     }
@@ -1060,20 +1189,41 @@ impl Storage {
         Ok(node)
     }
 
-    /// Parse RFC3339 timestamp
+    /// Parse a stored timestamp into a UTC `DateTime`.
+    ///
+    /// The canonical on-disk format is RFC 3339 (every Rust writer in this
+    /// crate uses `DateTime::to_rfc3339()`). However, timestamps can also be
+    /// written by external tooling that bypasses this storage layer — most
+    /// notably session hooks or manual maintenance that touch the DB with raw
+    /// `sqlite3`. SQLite's native `datetime('now')` / `CURRENT_TIMESTAMP`
+    /// emit a space-separated, timezone-less `YYYY-MM-DD HH:MM:SS[.fff]`
+    /// string that `parse_from_rfc3339` rejects, which would otherwise make
+    /// every affected row unreadable.
+    ///
+    /// We therefore parse RFC 3339 first and fall back to the SQLite-native
+    /// format (assumed UTC) so the store stays tolerant of either writer.
     fn parse_timestamp(value: &str, field_name: &str) -> rusqlite::Result<DateTime<Utc>> {
-        DateTime::parse_from_rfc3339(value)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Invalid {} timestamp '{}': {}", field_name, value, e),
-                    )),
-                )
-            })
+        if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+
+        // Fallback: SQLite-native "YYYY-MM-DD HH:MM:SS" (with optional
+        // fractional seconds), which has no timezone and is assumed UTC.
+        if let Ok(naive) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
+            return Ok(naive.and_utc());
+        }
+
+        Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid {} timestamp '{}': not RFC 3339 or SQLite datetime format",
+                    field_name, value
+                ),
+            )),
+        ))
     }
 
     /// Convert a row to KnowledgeNode
@@ -1129,6 +1279,33 @@ impl Storage {
                 .ok()
         });
 
+        // #57 Source envelope columns (Migration V17). `.ok().flatten()` is
+        // tolerant of pre-V17 databases that lack these columns. Collapse an
+        // all-NULL envelope to `None` so legacy nodes serialize unchanged.
+        let parse_ts = |s: Option<String>| -> Option<DateTime<Utc>> {
+            s.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok()
+            })
+        };
+        let envelope = crate::memory::SourceEnvelope {
+            source_system: row.get("source_system").ok().flatten(),
+            source_id: row.get("source_id").ok().flatten(),
+            source_url: row.get("source_url").ok().flatten(),
+            source_updated_at: parse_ts(row.get("source_updated_at").ok().flatten()),
+            content_hash: row.get("content_hash").ok().flatten(),
+            synced_at: parse_ts(row.get("synced_at").ok().flatten()),
+            source_project: row.get("source_project").ok().flatten(),
+            source_type: row.get("source_type").ok().flatten(),
+            source_author: row.get("source_author").ok().flatten(),
+        };
+        let source_envelope = if envelope.is_empty() {
+            None
+        } else {
+            Some(envelope)
+        };
+
         Ok(KnowledgeNode {
             id: row.get("id")?,
             content: row.get("content")?,
@@ -1165,6 +1342,8 @@ impl Storage {
             // v2.0.5 Active Forgetting
             suppression_count,
             suppressed_at,
+            // #57 Source envelope
+            source_envelope,
         })
     }
 
@@ -1176,8 +1355,12 @@ impl Storage {
             }
             #[cfg(all(feature = "embeddings", feature = "vector-search"))]
             SearchMode::Semantic => {
-                let results = self.semantic_search(&input.query, input.limit, 0.3)?;
-                results.into_iter().map(|r| r.node).collect()
+                if !self.vector_search_available() {
+                    self.keyword_search(&input.query, input.limit, input.min_retention)?
+                } else {
+                    let results = self.semantic_search(&input.query, input.limit, 0.3)?;
+                    results.into_iter().map(|r| r.node).collect()
+                }
             }
             #[cfg(all(feature = "embeddings", feature = "vector-search"))]
             SearchMode::Hybrid => {
@@ -1356,9 +1539,10 @@ impl Storage {
         // Content-aware cross-memory reinforcement: boost semantically similar neighbors
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         {
-            if let Ok(Some(embedding)) = self.get_node_embedding(id) {
-                let index = self
-                    .vector_index
+            if let Some(index) = self.vector_index.as_ref()
+                && let Ok(Some(embedding)) = self.get_node_embedding(id)
+            {
+                let index = index
                     .lock()
                     .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
 
@@ -1466,6 +1650,42 @@ impl Storage {
         let _ = self.log_access(id, "promote");
 
         // v1.9.0: Set waking SWR tag for preferential dream replay
+        let _ = self.set_waking_tag(id);
+
+        self.get_node(id)?
+            .ok_or_else(|| StorageError::NotFound(id.to_string()))
+    }
+
+    /// Backfill-specific promote: identical retrieval/retention boost to
+    /// `promote_memory`, but the stability multiply is CAPPED at an additive
+    /// +365-day ceiling: `MIN(stability * 1.5, stability + 365.0)`. The `1.5`
+    /// factor preserves the multiplier `promote_memory` already applied; the
+    /// `+365` ceiling is the same additive bound `retroactive_backfill.rs`
+    /// uses for its reason string (that module pairs +365 with a 2.5 factor
+    /// for display only — this DB write intentionally keeps 1.5 so backfill
+    /// promotion strength is unchanged, just bounded). Repeated per-(cause,
+    /// failure) backfill promotions therefore cannot inflate stability without
+    /// bound. Used by the step-8.5 auto-fire path and the manual `backfill` tool.
+    pub fn promote_memory_backfill(&self, id: &str) -> Result<KnowledgeNode> {
+        let now = Utc::now();
+
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            writer.execute(
+                "UPDATE knowledge_nodes SET
+                    last_accessed = ?1,
+                    retrieval_strength = MIN(1.0, retrieval_strength + 0.20),
+                    retention_strength = MIN(1.0, retention_strength + 0.10),
+                    stability = MIN(stability * 1.5, stability + 365.0)
+                WHERE id = ?2",
+                params![now.to_rfc3339(), id],
+            )?;
+        }
+
+        let _ = self.log_access(id, "promote");
         let _ = self.set_waking_tag(id);
 
         self.get_node(id)?
@@ -1599,6 +1819,75 @@ impl Storage {
 
         self.get_node(id)?
             .ok_or_else(|| StorageError::NotFound(id.to_string()))
+    }
+
+    /// Release a memory from quarantine **unconditionally** (no labile-window
+    /// limit), used when a Memory PR is approved.
+    ///
+    /// Unlike [`Self::reverse_suppression`] (which models a time-bounded "undo"
+    /// of an active-forgetting decision and refuses after the labile window),
+    /// approving a quarantined risky write is an explicit reviewer decision that
+    /// must always restore the memory's retrieval influence — even days later.
+    /// Fully clears the suppression (count → 0, `suppressed_at` → NULL) and
+    /// restores strengths. A no-op (returns the node) if it isn't suppressed.
+    pub fn release_quarantine(&self, id: &str) -> Result<KnowledgeNode> {
+        let node = self
+            .get_node(id)?
+            .ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+
+        if node.suppression_count == 0 && node.suppressed_at.is_none() {
+            // Nothing to release — idempotent.
+            return Ok(node);
+        }
+
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            writer.execute(
+                "UPDATE knowledge_nodes SET
+                    suppression_count = 0,
+                    suppressed_at = NULL,
+                    retrieval_strength = MIN(1.0, retrieval_strength + 0.15),
+                    retention_strength = MIN(1.0, retention_strength + 0.10),
+                    stability = stability * 1.25
+                WHERE id = ?1",
+                params![id],
+            )?;
+        }
+
+        let _ = self.log_access(id, "release_quarantine");
+
+        self.get_node(id)?
+            .ok_or_else(|| StorageError::NotFound(id.to_string()))
+    }
+
+    /// Test-only: backdate a node's `suppressed_at` to simulate a suppression
+    /// that happened long ago (e.g. to verify release works past the labile
+    /// window). `pub(crate)` so sibling test modules can reach it.
+    #[cfg(test)]
+    pub(crate) fn set_suppressed_at_for_test(&self, id: &str, when: DateTime<Utc>) {
+        if let Ok(writer) = self.writer.lock() {
+            let _ = writer.execute(
+                "UPDATE knowledge_nodes SET suppressed_at = ?1 WHERE id = ?2",
+                params![when.to_rfc3339(), id],
+            );
+        }
+    }
+
+    /// Backdate a node's `created_at`. Intended for tests and demo seeding (e.g.
+    /// to simulate a memory formed days ago so Retroactive Salience Backfill can
+    /// reach back to it). Cross-crate `pub` so the MCP backfill test + demo
+    /// harness can plant a dated cause. Returns Ok(()) on success.
+    pub fn set_created_at(&self, id: &str, when: DateTime<Utc>) -> Result<()> {
+        if let Ok(writer) = self.writer.lock() {
+            writer.execute(
+                "UPDATE knowledge_nodes SET created_at = ?1 WHERE id = ?2",
+                params![when.to_rfc3339(), id],
+            )?;
+        }
+        Ok(())
     }
 
     /// Count memories currently in a suppressed state (suppression_count > 0).
@@ -1890,6 +2179,100 @@ impl Storage {
         })
     }
 
+    /// Introspect the live SQLite schema: schema version + per-table row/column
+    /// shape + embedding-coverage convenience fields.
+    ///
+    /// This is the v2.1.24+ replacement for the direct-SQLite reads that
+    /// audit scripts and migration guards previously had to perform. The set
+    /// of tables walked matches `PORTABLE_USER_DATA_TABLES` — the same
+    /// canonical set used by portable export / import — so the surface stays
+    /// stable across migrations rather than chasing arbitrary
+    /// `sqlite_master` rows.
+    ///
+    /// Cost: O(N_tables) `COUNT(*)` queries + one PRAGMA per table. Negligible
+    /// at the table cardinalities Vestige carries (~15 tables, all indexed).
+    /// Safe to call on every MCP `system_status` invocation when the flag is
+    /// set; callers wanting to limit cost should leave the flag off (default).
+    pub fn schema_introspection(&self) -> Result<crate::SchemaIntrospection> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+
+        let schema_version = Self::current_schema_version(&reader)?;
+
+        // schema_version has the row (version PK + applied_at TEXT). Read the
+        // applied_at for the current version row; tolerate failure (legacy
+        // databases may have skipped the applied_at fill on early upgrades).
+        let applied_at_str: Option<String> = reader
+            .query_row(
+                "SELECT applied_at FROM schema_version WHERE version = ?1",
+                params![schema_version as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let schema_version_applied_at = applied_at_str.and_then(|s| {
+            // The migration scripts use `datetime('now')` which yields
+            // SQLite's "YYYY-MM-DD HH:MM:SS" UTC form (NOT RFC3339).
+            // Try the SQLite form first, fall back to RFC3339 for any
+            // future migrations that switch.
+            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                .map(|naive| naive.and_utc())
+                .or_else(|_| DateTime::parse_from_rfc3339(&s).map(|dt| dt.with_timezone(&Utc)))
+                .ok()
+        });
+
+        let mut tables = Vec::with_capacity(PORTABLE_USER_DATA_TABLES.len());
+        for table_name in PORTABLE_USER_DATA_TABLES {
+            if Self::table_exists(&reader, table_name)? {
+                let rows = Self::table_row_count(&reader, table_name)?;
+                let columns = Self::table_columns(&reader, table_name)?;
+                tables.push(crate::TableIntrospection {
+                    name: (*table_name).to_string(),
+                    rows,
+                    columns,
+                });
+            }
+        }
+
+        // Convenience: embedding-coverage NULL count. Defined as the number
+        // of knowledge_nodes with NO matching row in node_embeddings. This is
+        // distinct from `nodes_with_embeddings` in MemoryStats (which uses
+        // the `has_embedding` column flag); we compute the join-based truth
+        // here so audit scripts can detect drift between the flag and the
+        // actual embeddings table.
+        let embedding_null_count: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_nodes kn
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM node_embeddings ne WHERE ne.node_id = kn.id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        #[cfg(feature = "embeddings")]
+        let active_embedding_model = Some(self.embedding_service.model_name().to_string());
+        #[cfg(not(feature = "embeddings"))]
+        let active_embedding_model: Option<String> = None;
+
+        #[cfg(feature = "embeddings")]
+        let active_embedding_dimensions: Option<u32> =
+            Some(self.embedding_service.dimensions() as u32);
+        #[cfg(not(feature = "embeddings"))]
+        let active_embedding_dimensions: Option<u32> = None;
+
+        Ok(crate::SchemaIntrospection {
+            schema_version,
+            schema_version_applied_at,
+            tables,
+            embedding_null_count,
+            active_embedding_model,
+            active_embedding_dimensions,
+        })
+    }
+
     /// Delete a node
     pub fn delete_node(&self, id: &str) -> Result<bool> {
         let mut writer = self
@@ -1906,7 +2289,8 @@ impl Storage {
         // Clean up vector index to prevent stale search results
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         if rows > 0
-            && let Ok(mut index) = self.vector_index.lock()
+            && let Some(index) = self.vector_index.as_ref()
+            && let Ok(mut index) = index.lock()
         {
             let _ = index.remove(id);
         }
@@ -1988,6 +2372,11 @@ impl Storage {
             params![id],
         )? as i64;
 
+        tx.execute(
+            "UPDATE composition_members SET preview = NULL WHERE memory_id = ?1",
+            params![id],
+        )?;
+
         let tags_json = serde_json::to_string(&node.tags).unwrap_or_else(|_| "[]".to_string());
         tx.execute(
             "INSERT INTO deletion_tombstones (
@@ -2022,7 +2411,9 @@ impl Storage {
         tx.commit()?;
 
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        if let Ok(mut index) = self.vector_index.lock() {
+        if let Some(index) = self.vector_index.as_ref()
+            && let Ok(mut index) = index.lock()
+        {
             let _ = index.remove(id);
         }
 
@@ -2065,7 +2456,12 @@ impl Storage {
 
     /// Search with full-text search
     pub fn search(&self, query: &str, limit: i32) -> Result<Vec<KnowledgeNode>> {
-        let sanitized_query = sanitize_fts5_query(query);
+        // OR-of-tokens + BM25 rank: matches rows sharing ANY distinctive token,
+        // ranked by lexical relevance. (The old whole-string phrase match required
+        // all tokens adjacent and in order, so multi-word queries returned nothing.)
+        let Some(sanitized_query) = sanitize_fts5_or_query(query) else {
+            return Ok(Vec::new());
+        };
 
         let reader = self
             .reader
@@ -2420,9 +2816,11 @@ impl Storage {
     fn get_query_embedding(&self, query: &str) -> Result<Vec<f32>> {
         let cache_key = format!("{}\0{}", self.embedding_service.model_name(), query);
         // Check cache first
+        let Some(index_cache) = self.query_cache.as_ref() else {
+            return Err(StorageError::Init("Query cache unavailable".to_string()));
+        };
         {
-            let mut cache = self
-                .query_cache
+            let mut cache = index_cache
                 .lock()
                 .map_err(|_| StorageError::Init("Query cache lock poisoned".to_string()))?;
             if let Some(cached) = cache.get(&cache_key) {
@@ -2438,8 +2836,7 @@ impl Storage {
 
         // Store in cache
         {
-            let mut cache = self
-                .query_cache
+            let mut cache = index_cache
                 .lock()
                 .map_err(|_| StorageError::Init("Query cache lock poisoned".to_string()))?;
             cache.put(cache_key, embedding.vector.clone());
@@ -2456,14 +2853,19 @@ impl Storage {
         limit: i32,
         min_similarity: f32,
     ) -> Result<Vec<SimilarityResult>> {
+        let Some(index_lock) = self.vector_index.as_ref() else {
+            return Err(StorageError::Init(
+                "Vector search unavailable: disabled for this machine".to_string(),
+            ));
+        };
+
         if !self.embedding_service.is_ready() {
             return Err(StorageError::Init("Embedding model not ready".to_string()));
         }
 
         let query_embedding = self.get_query_embedding(query)?;
 
-        let index = self
-            .vector_index
+        let index = index_lock
             .lock()
             .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
 
@@ -2523,19 +2925,22 @@ impl Storage {
             exclude_types,
         )?;
 
-        let semantic_results = if self.embedding_service.is_ready() {
-            self.semantic_search_raw(query, limit * overfetch_factor)?
-        } else {
-            vec![]
-        };
+        let semantic_results =
+            if self.vector_search_available() && self.embedding_service.is_ready() {
+                self.semantic_search_raw(query, limit * overfetch_factor)?
+            } else {
+                vec![]
+            };
 
+        // Reciprocal Rank Fusion (k=60) when both lists are present: it is scale-free
+        // and rewards a memory that appears in BOTH the keyword and semantic lists —
+        // exactly the structurally-similar-different-words paraphrase that linear
+        // max-norm fusion buried. Falls back to linear when only one list exists.
+        // (keyword_weight/semantic_weight retained in the signature for compatibility;
+        // RRF is rank-based so the weights no longer scale the fused score.)
+        let _ = (keyword_weight, semantic_weight);
         let combined = if !semantic_results.is_empty() {
-            linear_combination(
-                &keyword_results,
-                &semantic_results,
-                keyword_weight,
-                semantic_weight,
-            )
+            reciprocal_rank_fusion(&keyword_results, &semantic_results, 60.0)
         } else {
             keyword_results.clone()
         };
@@ -2777,6 +3182,9 @@ impl Storage {
     /// Semantic search returning scores
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn semantic_search_raw(&self, query: &str, limit: i32) -> Result<Vec<(String, f32)>> {
+        if !self.vector_search_available() {
+            return Ok(vec![]);
+        }
         if !self.embedding_service.is_ready() {
             return Ok(vec![]);
         }
@@ -2803,8 +3211,8 @@ impl Storage {
             _ => self.get_query_embedding(query)?,
         };
 
-        let index = self
-            .vector_index
+        let index = self.vector_index.as_ref().unwrap();
+        let index = index
             .lock()
             .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
 
@@ -3276,6 +3684,149 @@ impl Storage {
             }
         }
 
+        // 8.5. Retroactive Salience Backfill — memory with hindsight (auto-fire).
+        //
+        // The dream pass (step 8) replays memories forward to synthesize insights.
+        // This is its backward twin: when a recent memory is a salient FAILURE,
+        // reach BACKWARD across history and PROMOTE the quiet earlier memory that
+        // caused it — the root cause a semantic search structurally cannot surface
+        // because it is causally upstream, not *similar*. Faithful port of the
+        // offline ensemble co-reactivation in Zaki/Cai et al. 2024 Nature; the
+        // consolidation pass IS the offline window. Bounded on every axis so a
+        // noisy day cannot trigger a promotion storm, and idempotent across cycles
+        // via a durable causal edge (so the same cause is promoted once per
+        // failure, not every cycle).
+        //
+        // OPT-OUT (backfill-safety, v2.2.1): auto-fire is ON by default — it shipped
+        // and was documented in v2.2.0, so we keep the behavior — but is now bounded
+        // and disableable. It mutates FSRS scores on the canonical store and can lift
+        // a memory across a downstream consolidation floor, so a consumer that reads
+        // `stability` as a durability gate can turn it off with
+        // VESTIGE_BACKFILL_AUTOFIRE=0 (or false/off/no). The `backfill` MCP tool + CLI
+        // remain available for on-demand, operator-driven backfill regardless of the
+        // gate. The promote is bounded: both the auto-fire and manual paths call
+        // promote_memory_backfill (stability = MIN(stability*1.5, stability+365)) so
+        // repeated per-(cause, failure) promotions cannot inflate without bound (the
+        // prior comment claimed promote_memory was capped — it was not).
+        let backfill_autofire = std::env::var("VESTIGE_BACKFILL_AUTOFIRE")
+            .map(|v| {
+                let v = v.trim();
+                !(v.eq_ignore_ascii_case("false")
+                    || v.eq_ignore_ascii_case("off")
+                    || v.eq_ignore_ascii_case("no")
+                    || v == "0")
+            })
+            .unwrap_or(true);
+        let mut backfilled_causes = 0i64;
+        if backfill_autofire {
+            use crate::advanced::retroactive_backfill::{
+                self as rb, BackfillCandidate, FailureEvent, RetroactiveBackfill,
+            };
+            const MAX_FAILURES_PER_CYCLE: usize = 5;
+            const CANDIDATE_SCAN: i32 = 500;
+
+            let recent = self.get_all_nodes(CANDIDATE_SCAN, 0).unwrap_or_default();
+            let failures: Vec<&KnowledgeNode> = recent
+                .iter()
+                .filter(|n| rb::looks_like_failure(&n.content, &n.tags))
+                .take(MAX_FAILURES_PER_CYCLE)
+                .collect();
+
+            if !failures.is_empty() {
+                let backfill = RetroactiveBackfill::new();
+                let mut already_promoted: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+
+                for failure_node in failures {
+                    let failure = FailureEvent {
+                        id: failure_node.id.clone(),
+                        content: failure_node.content.clone(),
+                        entities: rb::extract_entities(&failure_node.content, &failure_node.tags),
+                        tags: failure_node.tags.clone(),
+                        prediction_error: 0.9,
+                        manual: false,
+                    };
+                    // candidates = every OTHER memory strictly older than the
+                    // failure, EXCLUDING other failures (a root cause is the quiet
+                    // upstream change, not an earlier crash).
+                    let candidates: Vec<BackfillCandidate> = recent
+                        .iter()
+                        .filter(|c| c.id != failure_node.id)
+                        .filter(|c| !rb::looks_like_failure(&c.content, &c.tags))
+                        .filter_map(|c| {
+                            let age = (failure_node.created_at - c.created_at).num_seconds()
+                                as f64
+                                / 86_400.0;
+                            if age <= 0.0 {
+                                return None;
+                            }
+                            Some(BackfillCandidate {
+                                id: c.id.clone(),
+                                content: c.content.clone(),
+                                entities: rb::extract_entities(&c.content, &c.tags),
+                                age_days_before_failure: age,
+                                stability: c.stability,
+                                similarity_to_failure: None,
+                            })
+                        })
+                        .collect();
+
+                    let result = backfill.run(&failure, &candidates);
+                    if !result.triggered {
+                        continue;
+                    }
+                    for cause in &result.causes {
+                        if !already_promoted
+                            .insert((cause.memory_id.clone(), failure_node.id.clone()))
+                        {
+                            continue;
+                        }
+                        // Cross-cycle idempotency: a durable causal edge is both the
+                        // dedup key and a first-class artifact. Write it FIRST, only
+                        // promote if it persisted (a failed edge write => retry next
+                        // cycle cleanly, never double-inflate).
+                        let link_type = crate::memory::EdgeType::Causal.to_string();
+                        let already_linked = self
+                            .get_connections_for_memory(&cause.memory_id)
+                            .map(|conns| {
+                                conns.iter().any(|c| {
+                                    c.source_id == cause.memory_id
+                                        && c.target_id == failure_node.id
+                                        && c.link_type == link_type
+                                })
+                            })
+                            .unwrap_or(false);
+                        if already_linked {
+                            continue;
+                        }
+                        let conn = ConnectionRecord {
+                            source_id: cause.memory_id.clone(),
+                            target_id: failure_node.id.clone(),
+                            strength: 1.0,
+                            link_type,
+                            created_at: Utc::now(),
+                            last_activated: Utc::now(),
+                            activation_count: 0,
+                        };
+                        if self.save_connection(&conn).is_err() {
+                            continue;
+                        }
+                        if self.promote_memory_backfill(&cause.memory_id).is_ok() {
+                            backfilled_causes += 1;
+                        }
+                    }
+                }
+                if backfilled_causes > 0 {
+                    tracing::info!(
+                        backfilled_causes,
+                        "Retroactive Salience Backfill: promoted {} root-cause memor{} a semantic search would miss",
+                        backfilled_causes,
+                        if backfilled_causes == 1 { "y" } else { "ies" }
+                    );
+                }
+            }
+        }
+
         // 9. Memory Compression (old memories → summaries)
         let mut _memories_compressed = 0i64;
         {
@@ -3449,6 +4000,7 @@ impl Storage {
             neighbors_reinforced: 0,
             activations_computed,
             w20_optimized,
+            backfilled_causes,
         })
     }
 
@@ -3917,7 +4469,1006 @@ pub struct DreamHistoryRecord {
     pub creative_connections_found: Option<i32>,
 }
 
-impl Storage {
+/// Composition event envelope for ComposedGraph.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionEventRecord {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub tool: String,
+    pub mode: String,
+    pub query: Option<String>,
+    pub query_hash: Option<String>,
+    pub confidence: Option<f64>,
+    pub status: Option<String>,
+    pub output_preview: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Memory participating in a composition event.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionMemberRecord {
+    pub event_id: String,
+    pub memory_id: String,
+    pub role: String,
+    pub rank: i32,
+    pub trust: Option<f64>,
+    pub score: Option<f64>,
+    pub preview: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Outcome label attached to a composition event.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionOutcomeRecord {
+    pub id: String,
+    pub event_id: String,
+    pub outcome_type: String,
+    pub labeled_at: DateTime<Utc>,
+    pub label_source: String,
+    pub confidence_delta: Option<f64>,
+    pub notes: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Memory most often composed with another memory.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionNeighborRecord {
+    pub memory_id: String,
+    pub composed_count: i64,
+    pub latest_event_at: DateTime<Utc>,
+}
+
+/// Candidate memory pair that shares useful shape but has never been composed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeverComposedCandidate {
+    pub first_id: String,
+    pub second_id: String,
+    pub score: f64,
+    pub novelty_score: f64,
+    pub bridge_score: f64,
+    pub trust_score: f64,
+    pub outcome_score_adjustment: f64,
+    pub shared_tags: Vec<String>,
+    pub boundary_tags: Vec<String>,
+    pub shared_terms: Vec<String>,
+    pub prior_outcomes: Vec<String>,
+    pub outcome_signal: String,
+    pub first_node_type: String,
+    pub second_node_type: String,
+    pub first_preview: String,
+    pub second_preview: String,
+    pub reason: String,
+    pub composition_question: String,
+}
+
+impl SqliteMemoryStore {
+    // ========================================================================
+    // COMPOSEDGRAPH PERSISTENCE
+    // ========================================================================
+
+    /// Save a complete composition event with members and optional outcomes in one transaction.
+    pub fn save_composition(
+        &self,
+        event: &CompositionEventRecord,
+        members: &[CompositionMemberRecord],
+        outcomes: &[CompositionOutcomeRecord],
+    ) -> Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        let tx = writer.transaction()?;
+
+        let metadata_json =
+            serde_json::to_string(&event.metadata).unwrap_or_else(|_| "{}".to_string());
+        tx.execute(
+            "INSERT OR REPLACE INTO composition_events (
+                id, created_at, tool, mode, query, query_hash, confidence, status,
+                output_preview, metadata
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.id,
+                event.created_at.to_rfc3339(),
+                event.tool,
+                event.mode,
+                event.query,
+                event.query_hash,
+                event.confidence,
+                event.status,
+                event.output_preview,
+                metadata_json,
+            ],
+        )?;
+
+        for member in members {
+            let mut member = member.clone();
+            Self::snapshot_composition_member_tags(&tx, &mut member)?;
+            Self::insert_composition_member(&tx, &member)?;
+        }
+        for outcome in outcomes {
+            Self::insert_composition_outcome(&tx, outcome)?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Add one outcome label to an existing composition event.
+    pub fn record_composition_outcome(&self, outcome: &CompositionOutcomeRecord) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        Self::insert_composition_outcome(&writer, outcome)
+    }
+
+    /// Get one composition event by id.
+    pub fn get_composition_event(&self, id: &str) -> Result<Option<CompositionEventRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare("SELECT * FROM composition_events WHERE id = ?1")?;
+        stmt.query_row(params![id], Self::row_to_composition_event)
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    /// Get recent composition events.
+    pub fn get_recent_composition_events(&self, limit: i32) -> Result<Vec<CompositionEventRecord>> {
+        self.get_recent_composition_events_page(limit, 0)
+    }
+
+    /// Get recent composition events with explicit pagination.
+    pub fn get_recent_composition_events_page(
+        &self,
+        limit: i32,
+        offset: i32,
+    ) -> Result<Vec<CompositionEventRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT * FROM composition_events
+             ORDER BY created_at DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![limit.max(1), offset.max(0)],
+            Self::row_to_composition_event,
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get all members for a composition event.
+    pub fn get_composition_members(&self, event_id: &str) -> Result<Vec<CompositionMemberRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT * FROM composition_members
+             WHERE event_id = ?1
+             ORDER BY rank ASC, role ASC, memory_id ASC",
+        )?;
+        let rows = stmt.query_map(params![event_id], Self::row_to_composition_member)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get all outcomes for a composition event.
+    pub fn get_composition_outcomes(
+        &self,
+        event_id: &str,
+    ) -> Result<Vec<CompositionOutcomeRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT * FROM composition_outcomes
+             WHERE event_id = ?1
+             ORDER BY labeled_at DESC",
+        )?;
+        let rows = stmt.query_map(params![event_id], Self::row_to_composition_outcome)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get composition events containing a memory id.
+    pub fn get_compositions_for_memory(
+        &self,
+        memory_id: &str,
+        limit: i32,
+    ) -> Result<Vec<CompositionEventRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT DISTINCT e.*
+             FROM composition_events e
+             JOIN composition_members m ON m.event_id = e.id
+             WHERE m.memory_id = ?1
+             ORDER BY e.created_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![memory_id, limit.max(1)],
+            Self::row_to_composition_event,
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Return memories most frequently composed with the requested memory.
+    pub fn get_composition_neighbors(
+        &self,
+        memory_id: &str,
+        limit: i32,
+    ) -> Result<Vec<CompositionNeighborRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "WITH distinct_members AS (
+                SELECT DISTINCT event_id, memory_id FROM composition_members
+             )
+             SELECT other.memory_id, COUNT(DISTINCT other.event_id) AS composed_count, MAX(e.created_at) AS latest_event_at
+             FROM distinct_members self
+             JOIN distinct_members other
+               ON other.event_id = self.event_id AND other.memory_id != self.memory_id
+             JOIN composition_events e ON e.id = self.event_id
+             WHERE self.memory_id = ?1
+             GROUP BY other.memory_id
+             ORDER BY composed_count DESC, latest_event_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![memory_id, limit.max(1)], |row| {
+            Ok(CompositionNeighborRecord {
+                memory_id: row.get(0)?,
+                composed_count: row.get(1)?,
+                latest_event_at: Self::parse_timestamp(
+                    &row.get::<_, String>(2)?,
+                    "latest_event_at",
+                )?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Generate ranked memory pairs that share useful tags but have not yet been composed.
+    pub fn get_never_composed_candidates(
+        &self,
+        limit: i32,
+        tag_filter: Option<&[String]>,
+    ) -> Result<Vec<NeverComposedCandidate>> {
+        let nodes = self.composition_candidate_nodes(tag_filter)?;
+        let composed_pairs = self.composed_pair_set()?;
+        let composition_degrees = self.composition_degree_map()?;
+        let outcome_map = self.composition_outcome_map()?;
+
+        // SEMANTIC-BAND GATE (the composition generativity unlock): load embeddings so a pair
+        // that shares NO literal tag/word but lives in the "distant-but-relatable" cosine band
+        // can still surface as a never-composed insight — exactly the non-obvious combination
+        // a keyword/exact-overlap gate (and cosine-NN search) can never return. The band excludes
+        // near-duplicates (>= 0.85, those are the same idea) and unrelated noise (< 0.45).
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        let embedding_map: std::collections::HashMap<String, Vec<f32>> = self
+            .get_all_embeddings()
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        const COMPOSE_BAND_LO: f32 = 0.45;
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        const COMPOSE_BAND_HI: f32 = 0.85;
+
+        let mut candidates = Vec::new();
+
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                let a = &nodes[i];
+                let b = &nodes[j];
+                let pair = Self::pair_key(&a.id, &b.id);
+                if composed_pairs.contains(&pair) {
+                    continue;
+                }
+
+                if let Some(filter) = tag_filter
+                    && !filter.is_empty()
+                    && !Self::node_pair_matches_tag_filter(a, b, filter)
+                {
+                    continue;
+                }
+
+                let shared_tags = Self::shared_tags(&a.tags, &b.tags);
+                let shared_terms = Self::shared_content_terms(&a.content, &b.content, 8);
+
+                // Semantic-band cosine: lets a pair with NO shared surface tokens but a
+                // related MEANING through the gate (the generative cross-domain combination).
+                #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+                let band_cos: Option<f32> = match (embedding_map.get(&a.id), embedding_map.get(&b.id))
+                {
+                    (Some(ea), Some(eb)) => {
+                        let c = crate::embeddings::cosine_similarity(ea, eb);
+                        if (COMPOSE_BAND_LO..COMPOSE_BAND_HI).contains(&c) {
+                            Some(c)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+                let band_cos: Option<f32> = None;
+
+                // Admit the pair if it shares surface signal OR it sits in the semantic band.
+                if shared_tags.is_empty() && shared_terms.is_empty() && band_cos.is_none() {
+                    continue;
+                }
+
+                let boundary_tags = Self::boundary_tags_for_pair(&a.tags, &b.tags);
+                let trust_score =
+                    ((a.retention_strength + b.retention_strength) / 2.0).clamp(0.0, 1.0);
+                let degree_a = composition_degrees.get(&a.id).copied().unwrap_or(0) as f64;
+                let degree_b = composition_degrees.get(&b.id).copied().unwrap_or(0) as f64;
+                let novelty_score = ((1.0 / (1.0 + degree_a)) + (1.0 / (1.0 + degree_b))) / 2.0;
+                let bridge_score = Self::composition_bridge_score(
+                    a,
+                    b,
+                    &shared_tags,
+                    &shared_terms,
+                    &boundary_tags,
+                );
+                let anchor_score =
+                    (shared_tags.len() as f64 * 0.45) + (shared_terms.len().min(5) as f64 * 0.25);
+                // Semantic-band pairs (no surface overlap) get an anchor from cosine so they
+                // clear the cutoff: a mid-band 0.45-0.85 meaning-match is a strong compose signal.
+                let band_anchor = band_cos.map(|c| 1.0 + (c as f64 - 0.45) * 2.0).unwrap_or(0.0);
+                let prior_outcomes = Self::pair_prior_outcomes(&outcome_map, &a.id, &b.id);
+                let outcome_signal = Self::outcome_signal(&prior_outcomes);
+                let outcome_score_adjustment = Self::outcome_score_adjustment(&prior_outcomes);
+                let score = anchor_score
+                    + band_anchor
+                    + (bridge_score * 2.0)
+                    + (novelty_score * 1.5)
+                    + trust_score
+                    + outcome_score_adjustment;
+                if score < 1.6 {
+                    continue;
+                }
+
+                let reason = if !boundary_tags.is_empty() {
+                    format!(
+                        "Untried bridge across {} with {}",
+                        boundary_tags.join(", "),
+                        Self::anchor_summary(&shared_tags, &shared_terms)
+                    )
+                } else if a.node_type != b.node_type {
+                    format!(
+                        "Untried {} -> {} composition with {}",
+                        a.node_type,
+                        b.node_type,
+                        Self::anchor_summary(&shared_tags, &shared_terms)
+                    )
+                } else {
+                    format!(
+                        "Never composed despite {}",
+                        Self::anchor_summary(&shared_tags, &shared_terms)
+                    )
+                };
+                let composition_question =
+                    Self::composition_question(a, b, &shared_tags, &shared_terms, &boundary_tags);
+                candidates.push(NeverComposedCandidate {
+                    first_id: a.id.clone(),
+                    second_id: b.id.clone(),
+                    score,
+                    novelty_score,
+                    bridge_score,
+                    trust_score,
+                    outcome_score_adjustment,
+                    shared_tags,
+                    boundary_tags,
+                    shared_terms,
+                    prior_outcomes,
+                    outcome_signal,
+                    first_node_type: a.node_type.clone(),
+                    second_node_type: b.node_type.clone(),
+                    first_preview: preview(&a.content, 160),
+                    second_preview: preview(&b.content, 160),
+                    reason,
+                    composition_question,
+                });
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(limit.max(1) as usize);
+        Ok(candidates)
+    }
+
+    fn insert_composition_member(
+        conn: &Connection,
+        member: &CompositionMemberRecord,
+    ) -> Result<()> {
+        let metadata_json =
+            serde_json::to_string(&member.metadata).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "INSERT OR REPLACE INTO composition_members (
+                event_id, memory_id, role, rank, trust, score, preview, metadata
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                member.event_id,
+                member.memory_id,
+                member.role,
+                member.rank,
+                member.trust,
+                member.score,
+                member.preview,
+                metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn snapshot_composition_member_tags(
+        conn: &Connection,
+        member: &mut CompositionMemberRecord,
+    ) -> Result<()> {
+        if member.metadata.get("tags").is_some() {
+            return Ok(());
+        }
+
+        let tags_json: Option<String> = conn
+            .query_row(
+                "SELECT tags FROM knowledge_nodes WHERE id = ?1",
+                params![member.memory_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(tags_json) = tags_json else {
+            return Ok(());
+        };
+        let Ok(tags) = serde_json::from_str::<Vec<String>>(&tags_json) else {
+            return Ok(());
+        };
+        if tags.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(object) = member.metadata.as_object_mut() {
+            object.insert("tags".to_string(), serde_json::json!(tags));
+        } else {
+            member.metadata = serde_json::json!({ "tags": tags });
+        }
+        Ok(())
+    }
+
+    fn insert_composition_outcome(
+        conn: &Connection,
+        outcome: &CompositionOutcomeRecord,
+    ) -> Result<()> {
+        let metadata_json =
+            serde_json::to_string(&outcome.metadata).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "INSERT OR REPLACE INTO composition_outcomes (
+                id, event_id, outcome_type, labeled_at, label_source,
+                confidence_delta, notes, metadata
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                outcome.id,
+                outcome.event_id,
+                outcome.outcome_type,
+                outcome.labeled_at.to_rfc3339(),
+                outcome.label_source,
+                outcome.confidence_delta,
+                outcome.notes,
+                metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn row_to_composition_event(row: &rusqlite::Row) -> rusqlite::Result<CompositionEventRecord> {
+        let metadata_json: String = row.get("metadata")?;
+        Ok(CompositionEventRecord {
+            id: row.get("id")?,
+            created_at: Self::parse_timestamp(&row.get::<_, String>("created_at")?, "created_at")?,
+            tool: row.get("tool")?,
+            mode: row.get("mode")?,
+            query: row.get("query").ok().flatten(),
+            query_hash: row.get("query_hash").ok().flatten(),
+            confidence: row.get("confidence").ok().flatten(),
+            status: row.get("status").ok().flatten(),
+            output_preview: row.get("output_preview").ok().flatten(),
+            metadata: serde_json::from_str(&metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+    }
+
+    fn row_to_composition_member(row: &rusqlite::Row) -> rusqlite::Result<CompositionMemberRecord> {
+        let metadata_json: String = row.get("metadata")?;
+        Ok(CompositionMemberRecord {
+            event_id: row.get("event_id")?,
+            memory_id: row.get("memory_id")?,
+            role: row.get("role")?,
+            rank: row.get("rank").unwrap_or(0),
+            trust: row.get("trust").ok().flatten(),
+            score: row.get("score").ok().flatten(),
+            preview: row.get("preview").ok().flatten(),
+            metadata: serde_json::from_str(&metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+    }
+
+    fn row_to_composition_outcome(
+        row: &rusqlite::Row,
+    ) -> rusqlite::Result<CompositionOutcomeRecord> {
+        let metadata_json: String = row.get("metadata")?;
+        Ok(CompositionOutcomeRecord {
+            id: row.get("id")?,
+            event_id: row.get("event_id")?,
+            outcome_type: row.get("outcome_type")?,
+            labeled_at: Self::parse_timestamp(&row.get::<_, String>("labeled_at")?, "labeled_at")?,
+            label_source: row
+                .get("label_source")
+                .unwrap_or_else(|_| "tool".to_string()),
+            confidence_delta: row.get("confidence_delta").ok().flatten(),
+            notes: row.get("notes").ok().flatten(),
+            metadata: serde_json::from_str(&metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+    }
+
+    fn composition_event_exists(conn: &Connection, id: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM composition_events WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn composed_pair_set(&self) -> Result<HashSet<(String, String)>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT event_id, memory_id
+             FROM composition_members
+             ORDER BY event_id, memory_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (event_id, memory_id) = row?;
+            grouped.entry(event_id).or_default().push(memory_id);
+        }
+
+        let mut pairs = HashSet::new();
+        for ids in grouped.values_mut() {
+            ids.sort();
+            ids.dedup();
+            for i in 0..ids.len() {
+                for j in (i + 1)..ids.len() {
+                    pairs.insert(Self::pair_key(&ids[i], &ids[j]));
+                }
+            }
+        }
+        Ok(pairs)
+    }
+
+    fn pair_key(a: &str, b: &str) -> (String, String) {
+        if a <= b {
+            (a.to_string(), b.to_string())
+        } else {
+            (b.to_string(), a.to_string())
+        }
+    }
+
+    fn shared_tags(a: &[String], b: &[String]) -> Vec<String> {
+        let b_set: HashSet<&str> = b.iter().map(String::as_str).collect();
+        let mut shared = a
+            .iter()
+            .filter(|tag| b_set.contains(tag.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        shared.sort();
+        shared.dedup();
+        shared
+    }
+
+    fn node_pair_matches_tag_filter(
+        a: &KnowledgeNode,
+        b: &KnowledgeNode,
+        tag_filter: &[String],
+    ) -> bool {
+        a.tags.iter().chain(b.tags.iter()).any(|tag| {
+            tag_filter
+                .iter()
+                .any(|wanted| wanted == tag || tag.starts_with(&format!("{wanted}:")))
+        })
+    }
+
+    fn boundary_tags_for_pair(a: &[String], b: &[String]) -> Vec<String> {
+        let mut tags = a
+            .iter()
+            .chain(b.iter())
+            .filter(|tag| Self::is_boundary_tag(tag))
+            .cloned()
+            .collect::<Vec<_>>();
+        tags.sort();
+        tags.dedup();
+        tags
+    }
+
+    fn composition_bridge_score(
+        a: &KnowledgeNode,
+        b: &KnowledgeNode,
+        shared_tags: &[String],
+        shared_terms: &[String],
+        boundary_tags: &[String],
+    ) -> f64 {
+        let tag_distance = Self::tag_distance(&a.tags, &b.tags);
+        let node_type_bridge = if a.node_type != b.node_type { 1.0 } else { 0.0 };
+        let boundary_bridge = (boundary_tags.len() as f64 / 4.0).min(1.0);
+        let lexical_anchor = if shared_terms.is_empty() { 0.0 } else { 1.0 };
+        let tag_anchor = if shared_tags.is_empty() { 0.0 } else { 1.0 };
+
+        (tag_distance * 0.30
+            + node_type_bridge * 0.20
+            + boundary_bridge * 0.25
+            + lexical_anchor * 0.15
+            + tag_anchor * 0.10)
+            .clamp(0.0, 1.0)
+    }
+
+    fn tag_distance(a: &[String], b: &[String]) -> f64 {
+        let a_set = a.iter().map(String::as_str).collect::<HashSet<_>>();
+        let b_set = b.iter().map(String::as_str).collect::<HashSet<_>>();
+        let union = a_set.union(&b_set).count();
+        if union == 0 {
+            return 0.0;
+        }
+        let intersection = a_set.intersection(&b_set).count();
+        1.0 - (intersection as f64 / union as f64)
+    }
+
+    fn shared_content_terms(a: &str, b: &str, limit: usize) -> Vec<String> {
+        let a_terms = Self::content_terms(a);
+        let b_terms = Self::content_terms(b);
+        let mut shared = a_terms
+            .intersection(&b_terms)
+            .cloned()
+            .collect::<Vec<String>>();
+        shared.sort_by(|left, right| {
+            Self::term_specificity_score(right)
+                .cmp(&Self::term_specificity_score(left))
+                .then_with(|| left.cmp(right))
+        });
+        shared.truncate(limit);
+        shared
+    }
+
+    fn content_terms(content: &str) -> HashSet<String> {
+        const STOPWORDS: &[&str] = &[
+            "about", "after", "again", "against", "because", "before", "between", "could", "every",
+            "first", "from", "have", "into", "memory", "needs", "should", "their", "there",
+            "these", "thing", "through", "using", "where", "which", "while", "would",
+        ];
+        content
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            .filter(|term| term.len() >= 5 && !STOPWORDS.contains(term))
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn term_specificity_score(term: &str) -> usize {
+        term.len()
+            + term.chars().filter(|ch| ch.is_ascii_digit()).count() * 2
+            + usize::from(term.contains('-')) * 2
+            + usize::from(term.contains('_')) * 2
+    }
+
+    fn anchor_summary(shared_tags: &[String], shared_terms: &[String]) -> String {
+        if !shared_tags.is_empty() && !shared_terms.is_empty() {
+            format!(
+                "shared tags ({}) and shared terms ({})",
+                shared_tags.join(", "),
+                shared_terms
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else if !shared_tags.is_empty() {
+            format!("shared tags ({})", shared_tags.join(", "))
+        } else {
+            format!(
+                "shared terms ({})",
+                shared_terms
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
+
+    fn composition_question(
+        a: &KnowledgeNode,
+        b: &KnowledgeNode,
+        shared_tags: &[String],
+        shared_terms: &[String],
+        boundary_tags: &[String],
+    ) -> String {
+        let anchor = if !boundary_tags.is_empty() {
+            boundary_tags.join(", ")
+        } else if !shared_tags.is_empty() {
+            shared_tags.join(", ")
+        } else {
+            shared_terms
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "What changes if a {} memory and a {} memory are composed through {}?",
+            a.node_type, b.node_type, anchor
+        )
+    }
+
+    fn composition_degree_map(&self) -> Result<HashMap<String, i64>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT memory_id, COUNT(DISTINCT event_id) AS composition_count
+             FROM composition_members
+             GROUP BY memory_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (memory_id, count) = row?;
+            result.insert(memory_id, count);
+        }
+        Ok(result)
+    }
+
+    fn composition_candidate_nodes(
+        &self,
+        tag_filter: Option<&[String]>,
+    ) -> Result<Vec<KnowledgeNode>> {
+        const BASE_SCAN_LIMIT: i32 = 750;
+        const TAGGED_SCAN_LIMIT: i32 = 1500;
+
+        let mut nodes = self.get_all_nodes(BASE_SCAN_LIMIT, 0)?;
+        if let Some(filter) = tag_filter
+            && !filter.is_empty()
+        {
+            let tagged_nodes = self.get_nodes_matching_any_tag_prefix(filter, TAGGED_SCAN_LIMIT)?;
+            let mut by_id = HashMap::new();
+            for node in nodes.into_iter().chain(tagged_nodes) {
+                by_id.entry(node.id.clone()).or_insert(node);
+            }
+            nodes = by_id.into_values().collect();
+            nodes.sort_by(|a, b| {
+                b.retention_strength
+                    .partial_cmp(&a.retention_strength)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            });
+        }
+        Ok(nodes)
+    }
+
+    fn get_nodes_matching_any_tag_prefix(
+        &self,
+        tag_filter: &[String],
+        limit: i32,
+    ) -> Result<Vec<KnowledgeNode>> {
+        let mut patterns = Vec::new();
+        for wanted in tag_filter
+            .iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+        {
+            patterns.push(format!("%\"{}\"%", wanted));
+            patterns.push(format!("%\"{}:%", wanted));
+        }
+        if patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let clauses = std::iter::repeat_n("tags LIKE ?", patterns.len())
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT * FROM knowledge_nodes
+             WHERE {clauses}
+             ORDER BY retention_strength DESC, created_at DESC
+             LIMIT {}",
+            limit.clamp(1, 5000)
+        );
+
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(patterns.iter()), Self::row_to_node)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    fn composition_outcome_map(&self) -> Result<HashMap<String, HashSet<String>>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT DISTINCT m.memory_id, o.outcome_type
+             FROM composition_members m
+             JOIN composition_outcomes o ON o.event_id = m.event_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut result: HashMap<String, HashSet<String>> = HashMap::new();
+        for row in rows {
+            let (memory_id, outcome) = row?;
+            result.entry(memory_id).or_default().insert(outcome);
+        }
+        Ok(result)
+    }
+
+    fn pair_prior_outcomes(
+        outcome_map: &HashMap<String, HashSet<String>>,
+        first_id: &str,
+        second_id: &str,
+    ) -> Vec<String> {
+        let mut outcomes = outcome_map
+            .get(first_id)
+            .into_iter()
+            .chain(outcome_map.get(second_id))
+            .flat_map(|values| values.iter().cloned())
+            .collect::<Vec<_>>();
+        outcomes.sort();
+        outcomes.dedup();
+        outcomes
+    }
+
+    fn outcome_signal(prior_outcomes: &[String]) -> String {
+        if prior_outcomes.is_empty() {
+            return "clean".to_string();
+        }
+
+        let has_closed = prior_outcomes.iter().any(|outcome| {
+            matches!(
+                outcome.as_str(),
+                "dead_end"
+                    | "rejected"
+                    | "bad_severity"
+                    | "user_demoted"
+                    | "closed_by_scope"
+                    | "closed_by_false_assumption"
+                    | "closed_by_user"
+                    | "expired_lane"
+            )
+        });
+        let has_duplicate = prior_outcomes
+            .iter()
+            .any(|outcome| matches!(outcome.as_str(), "duplicate_risk" | "closed_by_duplicate"));
+        let has_success = prior_outcomes.iter().any(|outcome| {
+            matches!(
+                outcome.as_str(),
+                "accepted" | "helpful" | "submitted" | "user_promoted"
+            )
+        });
+        let has_needs_poc = prior_outcomes.iter().any(|outcome| outcome == "needs_poc");
+
+        if (has_closed || has_duplicate) && has_success {
+            "mixed_prior_outcomes".to_string()
+        } else if has_closed {
+            "prior_closed_door".to_string()
+        } else if has_duplicate {
+            "prior_duplicate_risk".to_string()
+        } else if has_success {
+            "prior_success".to_string()
+        } else if has_needs_poc {
+            "prior_needs_poc".to_string()
+        } else {
+            "prior_outcome".to_string()
+        }
+    }
+
+    fn outcome_score_adjustment(prior_outcomes: &[String]) -> f64 {
+        let mut adjustment: f64 = 0.0;
+        for outcome in prior_outcomes {
+            adjustment += match outcome.as_str() {
+                "accepted" => 0.35,
+                "helpful" => 0.25,
+                "submitted" => 0.15,
+                "user_promoted" => 0.20,
+                "needs_poc" => -0.05,
+                "duplicate_risk" => -0.35,
+                "closed_by_duplicate" => -0.40,
+                "dead_end"
+                | "rejected"
+                | "bad_severity"
+                | "closed_by_scope"
+                | "closed_by_false_assumption"
+                | "closed_by_user"
+                | "expired_lane" => -0.45,
+                "user_demoted" => -0.20,
+                _ => 0.0,
+            };
+        }
+        adjustment.clamp(-0.8, 0.5)
+    }
+
+    fn is_boundary_tag(tag: &str) -> bool {
+        let lowered = tag.to_ascii_lowercase();
+        lowered.starts_with("boundary-")
+            || matches!(
+                lowered.as_str(),
+                "time"
+                    | "chain"
+                    | "role"
+                    | "oracle"
+                    | "queue"
+                    | "settlement"
+                    | "keeper"
+                    | "upgrade"
+                    | "pause"
+                    | "accounting"
+                    | "scope"
+            )
+    }
+
     // ========================================================================
     // INTENTIONS PERSISTENCE
     // ========================================================================
@@ -5080,6 +6631,29 @@ impl Storage {
         self.sync_portable_archive(&backend)
     }
 
+    /// Synchronize this database with the hosted Vestige Cloud managed-sync
+    /// service. `endpoint` is the base URL (e.g. `https://sync.vestige.dev`) and
+    /// `sync_key` is the per-user key issued at purchase. Pull-merge-push is
+    /// identical to file sync — only the transport differs.
+    ///
+    /// When `encryption_key` is `Some`, the archive is encrypted client-side
+    /// (XChaCha20-Poly1305) before upload, so the server only stores ciphertext
+    /// (zero-knowledge). The passphrase never leaves this process.
+    #[cfg(feature = "cloud-sync")]
+    pub fn sync_portable_archive_cloud(
+        &self,
+        endpoint: &str,
+        sync_key: &str,
+        encryption_key: Option<String>,
+    ) -> Result<PortableSyncReport> {
+        let backend = super::cloud_sync::HttpPortableSyncBackend::new_with_encryption(
+            endpoint,
+            sync_key,
+            encryption_key,
+        )?;
+        self.sync_portable_archive(&backend)
+    }
+
     fn merge_portable_table(
         tx: &rusqlite::Transaction<'_>,
         table_name: &str,
@@ -5095,6 +6669,17 @@ impl Storage {
             | "consolidation_history"
             | "dream_history"
             | "retention_snapshots" => Self::merge_append_only_table(tx, table_name, table, report),
+            "composition_events" | "composition_outcomes" => {
+                Self::merge_keyed_table(tx, table_name, table, &["id"], report, state)
+            }
+            "composition_members" => Self::merge_keyed_table(
+                tx,
+                table_name,
+                table,
+                &["event_id", "memory_id", "role"],
+                report,
+                state,
+            ),
             "node_embeddings" => {
                 Self::merge_keyed_table(tx, table_name, table, &["node_id"], report, state)
             }
@@ -5245,6 +6830,10 @@ impl Storage {
                     (None, _) => false,
                 };
                 if should_delete {
+                    tx.execute(
+                        "UPDATE composition_members SET preview = NULL WHERE memory_id = ?1",
+                        params![row_id],
+                    )?;
                     let deleted =
                         tx.execute("DELETE FROM knowledge_nodes WHERE id = ?1", params![row_id])?;
                     report.rows_deleted += deleted;
@@ -5416,6 +7005,20 @@ impl Storage {
                     .unwrap_or(false);
                 Ok(source_exists && target_exists)
             }
+            "composition_members" => {
+                let event_exists = Self::portable_text(table, row, "event_id")
+                    .map(|id| Self::composition_event_exists(tx, id))
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(event_exists)
+            }
+            "composition_outcomes" => {
+                let event_exists = Self::portable_text(table, row, "event_id")
+                    .map(|id| Self::composition_event_exists(tx, id))
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(event_exists)
+            }
             _ => Ok(true),
         }
     }
@@ -5439,6 +7042,8 @@ impl Storage {
     fn merge_key_columns(table_name: &str) -> &'static [&'static str] {
         match table_name {
             "knowledge_nodes" | "intentions" | "insights" | "sessions" => &["id"],
+            "composition_events" | "composition_outcomes" => &["id"],
+            "composition_members" => &["event_id", "memory_id", "role"],
             "node_embeddings" => &["node_id"],
             "fsrs_cards" | "memory_states" | "deletion_tombstones" => &["memory_id"],
             "memory_connections" => &["source_id", "target_id"],
@@ -5975,7 +7580,8 @@ impl Storage {
         // Clean up vector index
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         if deleted > 0
-            && let Ok(mut index) = self.vector_index.lock()
+            && let Some(index) = self.vector_index.as_ref()
+            && let Ok(mut index) = index.lock()
         {
             for id in &doomed_ids {
                 let _ = index.remove(id);
@@ -6182,6 +7788,2335 @@ impl Storage {
         }
         Ok(result)
     }
+
+    // ========================================================================
+    // Merge / Supersede controls (Phase 3 — v2.1.25)
+    //
+    // Diff-previewed, confidence-gated, reversible, self-explaining
+    // combine/dedupe/supersede on a never-delete (bitemporal) store.
+    // Pure scoring/plan/op types live in `advanced::merge_supersede`.
+    // ========================================================================
+
+    /// Mark a memory protected (pinned) or unprotected. A protected memory can
+    /// never be auto-merged, superseded, or garbage-collected.
+    pub fn set_protected(&self, id: &str, protected: bool) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        let affected = writer.execute(
+            "UPDATE knowledge_nodes SET protected = ?1 WHERE id = ?2",
+            params![if protected { 1 } else { 0 }, id],
+        )?;
+        if affected == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Is this memory protected (pinned)?
+    pub fn is_protected(&self, id: &str) -> Result<bool> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let v: Option<i64> = reader
+            .query_row(
+                "SELECT protected FROM knowledge_nodes WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match v {
+            Some(p) => Ok(p != 0),
+            None => Err(StorageError::NotFound(id.to_string())),
+        }
+    }
+
+    /// Read the per-project merge policy (two Fellegi-Sunter thresholds +
+    /// auto_apply). Persisted in `fsrs_config` so it survives restarts without a
+    /// new table; falls back to defaults (env-overridable) when unset.
+    pub fn get_merge_policy(&self) -> Result<crate::advanced::MergePolicy> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let read_key = |key: &str| -> Option<f64> {
+            reader
+                .query_row(
+                    "SELECT value FROM fsrs_config WHERE key = ?1",
+                    params![key],
+                    |row| row.get::<_, f64>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        };
+        let default = crate::advanced::MergePolicy::default();
+        let env_f32 = |name: &str, fallback: f32| -> f32 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(fallback)
+        };
+        let match_threshold = read_key("merge_match_threshold")
+            .map(|v| v as f32)
+            .unwrap_or_else(|| env_f32("VESTIGE_MERGE_MATCH_THRESHOLD", default.match_threshold));
+        let possible_threshold = read_key("merge_possible_threshold")
+            .map(|v| v as f32)
+            .unwrap_or_else(|| {
+                env_f32(
+                    "VESTIGE_MERGE_POSSIBLE_THRESHOLD",
+                    default.possible_threshold,
+                )
+            });
+        let auto_apply = match read_key("merge_auto_apply") {
+            Some(v) => v != 0.0,
+            None => std::env::var("VESTIGE_MERGE_AUTO_APPLY")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(default.auto_apply),
+        };
+        Ok(crate::advanced::MergePolicy::new(
+            match_threshold,
+            possible_threshold,
+            auto_apply,
+        ))
+    }
+
+    /// Persist the per-project merge policy into `fsrs_config`.
+    pub fn set_merge_policy(&self, policy: crate::advanced::MergePolicy) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        let now = Utc::now().to_rfc3339();
+        let put = |key: &str, value: f64| -> Result<()> {
+            writer.execute(
+                "INSERT OR REPLACE INTO fsrs_config (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                params![key, value, now],
+            )?;
+            Ok(())
+        };
+        put("merge_match_threshold", policy.match_threshold as f64)?;
+        put("merge_possible_threshold", policy.possible_threshold as f64)?;
+        put(
+            "merge_auto_apply",
+            if policy.auto_apply { 1.0 } else { 0.0 },
+        )?;
+        Ok(())
+    }
+
+    /// Surface likely duplicate/overlapping memory clusters with confidence
+    /// scores and the signals behind each (Fellegi-Sunter classified).
+    ///
+    /// Only clusters whose weakest pair scores at or above the policy's
+    /// `possible_threshold` are returned. Protected members are flagged so the
+    /// caller never auto-merges a pin.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    pub fn merge_candidates(
+        &self,
+        policy: crate::advanced::MergePolicy,
+        limit: usize,
+        tag_filter: &[String],
+    ) -> Result<Vec<crate::advanced::MergeCandidate>> {
+        use crate::advanced::{MatchClass, MergeCandidate, score_pair};
+
+        let all_embeddings = self.get_all_embeddings()?;
+        if all_embeddings.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Load nodes for metadata. Exclude already-superseded nodes — they are
+        // historical and must not be re-offered for merge.
+        let mut node_map: std::collections::HashMap<String, KnowledgeNode> =
+            std::collections::HashMap::new();
+        let superseded: std::collections::HashSet<String> = self.superseded_node_ids()?;
+        let protected: std::collections::HashSet<String> = self.protected_node_ids()?;
+
+        let mut offset = 0;
+        loop {
+            let batch = self.get_all_nodes(500, offset)?;
+            let n = batch.len();
+            for node in batch {
+                node_map.insert(node.id.clone(), node);
+            }
+            if n < 500 {
+                break;
+            }
+            offset += 500;
+        }
+
+        // Candidate embeddings, filtered by tag and excluding superseded.
+        let items: Vec<(String, Vec<f32>)> = all_embeddings
+            .into_iter()
+            .filter(|(id, _)| !superseded.contains(id))
+            .filter(|(id, _)| {
+                if tag_filter.is_empty() {
+                    return true;
+                }
+                node_map
+                    .get(id)
+                    .map(|n| tag_filter.iter().any(|t| n.tags.contains(t)))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let n = items.len();
+        if n > 2000 {
+            return Err(StorageError::Init(format!(
+                "Too many memories to scan ({n} with embeddings). Filter by tags to reduce scope."
+            )));
+        }
+
+        // Union-find clustering over pairs above the possible threshold.
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            let mut root = x;
+            while parent[root] != root {
+                root = parent[root];
+            }
+            let mut cur = x;
+            while parent[cur] != root {
+                let next = parent[cur];
+                parent[cur] = root;
+                cur = next;
+            }
+            root
+        }
+
+        // Best pair score per resulting cluster member, for the explanation.
+        let mut pair_score: std::collections::HashMap<
+            (usize, usize),
+            crate::advanced::MatchSignals,
+        > = std::collections::HashMap::new();
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let sim = crate::cosine_similarity(&items[i].1, &items[j].1);
+                let (a_node, b_node) = (node_map.get(&items[i].0), node_map.get(&items[j].0));
+                let signals = score_pair(
+                    sim,
+                    a_node.map(|n| n.tags.as_slice()).unwrap_or(&[]),
+                    b_node.map(|n| n.tags.as_slice()).unwrap_or(&[]),
+                    a_node.map(|n| n.content.as_str()).unwrap_or(""),
+                    b_node.map(|n| n.content.as_str()).unwrap_or(""),
+                );
+                if signals.combined_score >= policy.possible_threshold {
+                    let ri = find(&mut parent, i);
+                    let rj = find(&mut parent, j);
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                    pair_score.insert((i, j), signals);
+                }
+            }
+        }
+
+        // Group indices by root.
+        let mut clusters: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for i in 0..n {
+            let r = find(&mut parent, i);
+            clusters.entry(r).or_default().push(i);
+        }
+
+        let mut out: Vec<MergeCandidate> = Vec::new();
+        for members in clusters.into_values() {
+            if members.len() < 2 {
+                continue;
+            }
+            // Cluster confidence = weakest recorded pair (the loosest link).
+            let mut min_score = 1.0f32;
+            let mut best_signals: Option<crate::advanced::MatchSignals> = None;
+            for a in 0..members.len() {
+                for b in (a + 1)..members.len() {
+                    let key = (members[a].min(members[b]), members[a].max(members[b]));
+                    if let Some(sig) = pair_score.get(&key) {
+                        if sig.combined_score < min_score {
+                            min_score = sig.combined_score;
+                        }
+                        if best_signals
+                            .as_ref()
+                            .map(|s| sig.combined_score > s.combined_score)
+                            .unwrap_or(true)
+                        {
+                            best_signals = Some(sig.clone());
+                        }
+                    }
+                }
+            }
+            let signals = match best_signals {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Survivor = highest retention member.
+            let mut member_ids: Vec<String> =
+                members.iter().map(|&idx| items[idx].0.clone()).collect();
+            member_ids.sort_by(|a, b| {
+                let ra = node_map.get(a).map(|n| n.retention_strength).unwrap_or(0.0);
+                let rb = node_map.get(b).map(|n| n.retention_strength).unwrap_or(0.0);
+                rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let survivor_id = member_ids[0].clone();
+            let has_protected_member = member_ids.iter().any(|id| protected.contains(id));
+            let previews: Vec<String> = member_ids
+                .iter()
+                .map(|id| {
+                    node_map
+                        .get(id)
+                        .map(|n| preview(&n.content, 120))
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            let classification = match policy.classify(min_score) {
+                MatchClass::NonMatch => continue,
+                c => c,
+            };
+
+            out.push(MergeCandidate {
+                member_ids,
+                previews,
+                survivor_id,
+                confidence: min_score,
+                classification,
+                signals,
+                has_protected_member,
+            });
+        }
+
+        out.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// IDs of nodes that have been bitemporally superseded (kept, but invalid).
+    pub fn superseded_node_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt =
+            reader.prepare("SELECT id FROM knowledge_nodes WHERE superseded_by IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut set = std::collections::HashSet::new();
+        for r in rows {
+            set.insert(r?);
+        }
+        Ok(set)
+    }
+
+    /// IDs of protected (pinned) nodes.
+    pub fn protected_node_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare("SELECT id FROM knowledge_nodes WHERE protected = 1")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut set = std::collections::HashSet::new();
+        for r in rows {
+            set.insert(r?);
+        }
+        Ok(set)
+    }
+
+    /// Build a previewable MERGE plan (a diff) WITHOUT applying it.
+    ///
+    /// The survivor is the first id (or highest retention if unspecified). The
+    /// plan is persisted to `merge_plans` with status `pending` and returned for
+    /// inspection. Nothing about the nodes changes until `apply_plan`.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    pub fn plan_merge(
+        &self,
+        member_ids: &[String],
+        survivor_id: Option<&str>,
+        policy: crate::advanced::MergePolicy,
+    ) -> Result<crate::advanced::MergePlan> {
+        use crate::advanced::{
+            MatchClass, PlanKind, compose_merged_content, compose_merged_tags, score_pair,
+        };
+
+        if member_ids.len() < 2 {
+            return Err(StorageError::Init(
+                "plan_merge needs at least 2 member ids".into(),
+            ));
+        }
+
+        let mut nodes: Vec<KnowledgeNode> = Vec::new();
+        for id in member_ids {
+            let node = self
+                .get_node(id)?
+                .ok_or_else(|| StorageError::NotFound(id.clone()))?;
+            nodes.push(node);
+        }
+
+        // Protected nodes can never be absorbed. They may only be the survivor.
+        let survivor = match survivor_id {
+            Some(s) => s.to_string(),
+            None => {
+                // highest retention
+                nodes
+                    .iter()
+                    .max_by(|a, b| {
+                        a.retention_strength
+                            .partial_cmp(&b.retention_strength)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|n| n.id.clone())
+                    .unwrap_or_else(|| member_ids[0].clone())
+            }
+        };
+        for node in &nodes {
+            if node.id != survivor && self.is_protected(&node.id)? {
+                return Err(StorageError::Init(format!(
+                    "Memory {} is protected and cannot be merged away. Unprotect it first or make it the survivor.",
+                    node.id
+                )));
+            }
+        }
+
+        // Order: survivor first, then others.
+        nodes.sort_by_key(|n| if n.id == survivor { 0 } else { 1 });
+
+        let members: Vec<(String, String)> = nodes
+            .iter()
+            .map(|n| (n.id.clone(), n.content.clone()))
+            .collect();
+        let result_content = compose_merged_content(&members);
+        let result_tags =
+            compose_merged_tags(&nodes.iter().map(|n| n.tags.clone()).collect::<Vec<_>>());
+        let result_source = nodes
+            .iter()
+            .find(|n| n.id == survivor)
+            .and_then(|n| n.source.clone());
+        let invalidated_ids: Vec<String> = nodes
+            .iter()
+            .filter(|n| n.id != survivor)
+            .map(|n| n.id.clone())
+            .collect();
+
+        // Confidence = weakest pair survivor↔absorbed.
+        let survivor_node = nodes.iter().find(|n| n.id == survivor).unwrap();
+        let mut min_score = 1.0f32;
+        let mut best_signals = score_pair(
+            1.0,
+            &survivor_node.tags,
+            &survivor_node.tags,
+            &survivor_node.content,
+            &survivor_node.content,
+        );
+        for node in nodes.iter().filter(|n| n.id != survivor) {
+            let sim = self.pair_similarity(&survivor, &node.id)?;
+            let sig = score_pair(
+                sim,
+                &survivor_node.tags,
+                &node.tags,
+                &survivor_node.content,
+                &node.content,
+            );
+            if sig.combined_score < min_score {
+                min_score = sig.combined_score;
+                best_signals = sig;
+            }
+        }
+        let classification = policy.classify(min_score);
+
+        let plan = crate::advanced::MergePlan {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: PlanKind::Merge,
+            survivor_id: survivor.clone(),
+            member_ids: member_ids.to_vec(),
+            result_content,
+            result_tags,
+            result_source,
+            invalidated_ids,
+            confidence: min_score,
+            classification,
+            signals: best_signals,
+            explanation: format!(
+                "Merge {} memories into {survivor} ({}). {} memory(ies) will be bitemporally invalidated (kept for audit, marked superseded_by={survivor}).",
+                member_ids.len(),
+                match classification {
+                    MatchClass::Match => "strong duplicate",
+                    MatchClass::Possible => "possible duplicate — review advised",
+                    MatchClass::NonMatch => "weak match — review strongly advised",
+                },
+                member_ids.len() - 1
+            ),
+        };
+
+        self.persist_plan(&plan)?;
+        Ok(plan)
+    }
+
+    /// Build a previewable SUPERSEDE plan: invalidate `old_id` in favour of
+    /// `new_id` (bitemporal, audit-preserving) WITHOUT applying it.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    pub fn plan_supersede(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        policy: crate::advanced::MergePolicy,
+    ) -> Result<crate::advanced::MergePlan> {
+        use crate::advanced::{PlanKind, score_pair};
+
+        let old = self
+            .get_node(old_id)?
+            .ok_or_else(|| StorageError::NotFound(old_id.to_string()))?;
+        let new = self
+            .get_node(new_id)?
+            .ok_or_else(|| StorageError::NotFound(new_id.to_string()))?;
+
+        if self.is_protected(old_id)? {
+            return Err(StorageError::Init(format!(
+                "Memory {old_id} is protected and cannot be superseded. Unprotect it first."
+            )));
+        }
+
+        let sim = self.pair_similarity(old_id, new_id)?;
+        let signals = score_pair(sim, &old.tags, &new.tags, &old.content, &new.content);
+        let classification = policy.classify(signals.combined_score);
+
+        let plan = crate::advanced::MergePlan {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: PlanKind::Supersede,
+            survivor_id: new_id.to_string(),
+            member_ids: vec![old_id.to_string(), new_id.to_string()],
+            result_content: new.content.clone(),
+            result_tags: new.tags.clone(),
+            result_source: new.source.clone(),
+            invalidated_ids: vec![old_id.to_string()],
+            confidence: signals.combined_score,
+            classification,
+            signals,
+            explanation: format!(
+                "Supersede {old_id} with {new_id}. {old_id} is kept and remains queryable for audit, but stamped valid_until=now and superseded_by={new_id} (invalidate, don't delete)."
+            ),
+        };
+
+        self.persist_plan(&plan)?;
+        Ok(plan)
+    }
+
+    /// Cosine similarity between two nodes' stored embeddings (0 if missing).
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn pair_similarity(&self, a: &str, b: &str) -> Result<f32> {
+        let ea = self.get_node_embedding(a)?;
+        let eb = self.get_node_embedding(b)?;
+        match (ea, eb) {
+            (Some(ea), Some(eb)) => Ok(crate::cosine_similarity(&ea, &eb)),
+            _ => Ok(0.0),
+        }
+    }
+
+    /// Persist a plan row (status pending). Idempotent on plan id.
+    fn persist_plan(&self, plan: &crate::advanced::MergePlan) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        let payload = serde_json::to_string(plan)
+            .map_err(|e| StorageError::Init(format!("plan serialize failed: {e}")))?;
+        let member_ids = serde_json::to_string(&plan.member_ids).unwrap_or_else(|_| "[]".into());
+        writer.execute(
+            "INSERT OR REPLACE INTO merge_plans
+                (id, kind, status, created_at, applied_at, survivor_id, member_ids, confidence, classification, payload)
+             VALUES (?1, ?2, 'pending', ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                plan.id,
+                plan.kind.as_str(),
+                Utc::now().to_rfc3339(),
+                plan.survivor_id,
+                member_ids,
+                plan.confidence as f64,
+                plan.classification.as_str(),
+                payload,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a stored plan by id.
+    pub fn get_plan(&self, plan_id: &str) -> Result<Option<crate::advanced::MergePlan>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let row: Option<(String, String)> = reader
+            .query_row(
+                "SELECT status, payload FROM merge_plans WHERE id = ?1",
+                params![plan_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((_status, payload)) => {
+                let plan: crate::advanced::MergePlan = serde_json::from_str(&payload)
+                    .map_err(|e| StorageError::Init(format!("plan deserialize failed: {e}")))?;
+                Ok(Some(plan))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Plan status string (pending | applied | cancelled), if the plan exists.
+    pub fn plan_status(&self, plan_id: &str) -> Result<Option<String>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let status: Option<String> = reader
+            .query_row(
+                "SELECT status FROM merge_plans WHERE id = ?1",
+                params![plan_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status)
+    }
+
+    /// Execute a previously-generated plan by id. Everything it does is recorded
+    /// as a reversible [`MergeOperation`] in `merge_operations`. Returns the
+    /// recorded operation id.
+    ///
+    /// - **merge**: survivor content/tags are rewritten to the merged result;
+    ///   each absorbed node is bitemporally invalidated (valid_until=now,
+    ///   superseded_by=survivor) and kept queryable.
+    /// - **supersede**: old node is bitemporally invalidated in favour of new.
+    ///
+    /// `auto_apply` must be true in the policy to apply a `Match` plan without an
+    /// explicit `confirm`; non-`Match` plans always require `confirm=true`.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    pub fn apply_plan(
+        &self,
+        plan_id: &str,
+        confirm: bool,
+    ) -> Result<crate::advanced::MergeOperation> {
+        use crate::advanced::{MatchClass, PlanKind};
+
+        let plan = self
+            .get_plan(plan_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("plan {plan_id}")))?;
+
+        match self.plan_status(plan_id)?.as_deref() {
+            Some("applied") => {
+                return Err(StorageError::Init(format!(
+                    "plan {plan_id} was already applied"
+                )));
+            }
+            Some("cancelled") => {
+                return Err(StorageError::Init(format!("plan {plan_id} was cancelled")));
+            }
+            _ => {}
+        }
+
+        // Confirmation gate: only auto-applyable Match plans may skip confirm.
+        let needs_confirm = !(plan.classification == MatchClass::Match);
+        if needs_confirm && !confirm {
+            return Err(StorageError::Init(format!(
+                "plan {plan_id} is classified '{}' (confidence {:.3}) and requires confirm=true to apply",
+                plan.classification.as_str(),
+                plan.confidence
+            )));
+        }
+
+        let now = Utc::now();
+        let op_id = uuid::Uuid::new_v4().to_string();
+
+        // Snapshot everything we need to undo, BEFORE mutating.
+        let mut undo = serde_json::Map::new();
+        undo.insert("plan_id".into(), serde_json::json!(plan_id));
+        undo.insert("kind".into(), serde_json::json!(plan.kind.as_str()));
+        undo.insert("survivor_id".into(), serde_json::json!(plan.survivor_id));
+
+        match plan.kind {
+            PlanKind::Merge => {
+                let survivor = self
+                    .get_node(&plan.survivor_id)?
+                    .ok_or_else(|| StorageError::NotFound(plan.survivor_id.clone()))?;
+                undo.insert(
+                    "survivor_prev_content".into(),
+                    serde_json::json!(survivor.content),
+                );
+                undo.insert(
+                    "survivor_prev_tags".into(),
+                    serde_json::json!(survivor.tags),
+                );
+
+                // Capture prior valid_until / superseded_by of each absorbed node.
+                let mut absorbed = Vec::new();
+                for id in &plan.invalidated_ids {
+                    let (vu, sb) = self.read_bitemporal(id)?;
+                    absorbed.push(serde_json::json!({
+                        "id": id,
+                        "prev_valid_until": vu,
+                        "prev_superseded_by": sb,
+                    }));
+                }
+                undo.insert("absorbed".into(), serde_json::json!(absorbed));
+
+                // Apply: rewrite survivor, invalidate absorbed.
+                self.rewrite_survivor(&plan.survivor_id, &plan.result_content, &plan.result_tags)?;
+                for id in &plan.invalidated_ids {
+                    self.invalidate_node(id, &plan.survivor_id, now)?;
+                }
+            }
+            PlanKind::Supersede => {
+                let old_id = &plan.member_ids[0];
+                let (vu, sb) = self.read_bitemporal(old_id)?;
+                undo.insert(
+                    "absorbed".into(),
+                    serde_json::json!([{
+                        "id": old_id,
+                        "prev_valid_until": vu,
+                        "prev_superseded_by": sb,
+                    }]),
+                );
+                self.invalidate_node(old_id, &plan.survivor_id, now)?;
+            }
+        }
+
+        // Record the reversible operation.
+        let affected: Vec<String> = {
+            let mut v = vec![plan.survivor_id.clone()];
+            v.extend(plan.invalidated_ids.clone());
+            v
+        };
+        let signals = serde_json::to_string(&plan.signals).unwrap_or_else(|_| "{}".into());
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            writer.execute(
+                "INSERT INTO merge_operations
+                    (id, plan_id, op_type, status, created_at, reverted_at, reverts_op_id,
+                     survivor_id, affected_ids, confidence, signals, reason, undo_payload)
+                 VALUES (?1, ?2, ?3, 'applied', ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    op_id,
+                    plan_id,
+                    plan.kind.as_str(),
+                    now.to_rfc3339(),
+                    plan.survivor_id,
+                    serde_json::to_string(&affected).unwrap_or_else(|_| "[]".into()),
+                    plan.confidence as f64,
+                    signals,
+                    plan.explanation,
+                    serde_json::Value::Object(undo).to_string(),
+                ],
+            )?;
+            writer.execute(
+                "UPDATE merge_plans SET status = 'applied', applied_at = ?1 WHERE id = ?2",
+                params![now.to_rfc3339(), plan_id],
+            )?;
+        }
+
+        self.read_operation(&op_id)?
+            .ok_or_else(|| StorageError::Init("operation vanished after insert".into()))
+    }
+
+    /// Reverse a prior merge/supersede operation by id (the "memory reflog").
+    /// Restores survivor content/tags and clears the bitemporal invalidation on
+    /// every node the operation touched, then records a compensating `undo` op.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    pub fn merge_undo(&self, op_id: &str) -> Result<crate::advanced::MergeOperation> {
+        let op = self
+            .read_operation(op_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("operation {op_id}")))?;
+        if op.status == "reverted" {
+            return Err(StorageError::Init(format!(
+                "operation {op_id} was already reverted"
+            )));
+        }
+        if op.op_type == "undo" {
+            return Err(StorageError::Init("cannot undo an undo operation".into()));
+        }
+
+        let undo: serde_json::Value = {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            let payload: String = reader.query_row(
+                "SELECT undo_payload FROM merge_operations WHERE id = ?1",
+                params![op_id],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str(&payload)
+                .map_err(|e| StorageError::Init(format!("undo payload parse failed: {e}")))?
+        };
+
+        let kind = undo.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let survivor_id = undo
+            .get("survivor_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Restore survivor content/tags if this was a merge.
+        if kind == "merge"
+            && let (Some(content), Some(tags)) = (
+                undo.get("survivor_prev_content").and_then(|v| v.as_str()),
+                undo.get("survivor_prev_tags").and_then(|v| v.as_array()),
+            )
+        {
+            let tags: Vec<String> = tags
+                .iter()
+                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                .collect();
+            self.rewrite_survivor(&survivor_id, content, &tags)?;
+        }
+
+        // Clear invalidation on every absorbed node, restoring prior values.
+        if let Some(absorbed) = undo.get("absorbed").and_then(|v| v.as_array()) {
+            for entry in absorbed {
+                let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                if id.is_empty() {
+                    continue;
+                }
+                let prev_vu = entry.get("prev_valid_until").and_then(|v| v.as_str());
+                let prev_sb = entry.get("prev_superseded_by").and_then(|v| v.as_str());
+                self.restore_bitemporal(id, prev_vu, prev_sb)?;
+            }
+        }
+
+        let now = Utc::now();
+        let new_op_id = uuid::Uuid::new_v4().to_string();
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            // Mark original reverted.
+            writer.execute(
+                "UPDATE merge_operations SET status = 'reverted', reverted_at = ?1 WHERE id = ?2",
+                params![now.to_rfc3339(), op_id],
+            )?;
+            // Re-open the plan so it could be re-applied if desired.
+            if let Some(plan_id) = op.plan_id.as_deref() {
+                writer.execute(
+                    "UPDATE merge_plans SET status = 'pending', applied_at = NULL WHERE id = ?1",
+                    params![plan_id],
+                )?;
+            }
+            // Record compensating undo op.
+            writer.execute(
+                "INSERT INTO merge_operations
+                    (id, plan_id, op_type, status, created_at, reverted_at, reverts_op_id,
+                     survivor_id, affected_ids, confidence, signals, reason, undo_payload)
+                 VALUES (?1, ?2, 'undo', 'applied', ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, '{}')",
+                params![
+                    new_op_id,
+                    op.plan_id,
+                    now.to_rfc3339(),
+                    op_id,
+                    survivor_id,
+                    serde_json::to_string(&op.affected_ids).unwrap_or_else(|_| "[]".into()),
+                    format!("Reverted {} operation {op_id}", op.op_type),
+                ],
+            )?;
+        }
+
+        self.read_operation(&new_op_id)?
+            .ok_or_else(|| StorageError::Init("undo operation vanished after insert".into()))
+    }
+
+    /// List recent merge/supersede operations (the reflog), newest first.
+    pub fn list_merge_operations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::advanced::MergeOperation>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT id, plan_id, op_type, status, created_at, reverted_at, reverts_op_id,
+                    survivor_id, affected_ids, confidence, reason
+             FROM merge_operations ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], Self::row_to_operation)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Read a single operation by id.
+    fn read_operation(&self, op_id: &str) -> Result<Option<crate::advanced::MergeOperation>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let op = reader
+            .query_row(
+                "SELECT id, plan_id, op_type, status, created_at, reverted_at, reverts_op_id,
+                        survivor_id, affected_ids, confidence, reason
+                 FROM merge_operations WHERE id = ?1",
+                params![op_id],
+                Self::row_to_operation,
+            )
+            .optional()?;
+        Ok(op)
+    }
+
+    fn row_to_operation(row: &rusqlite::Row) -> rusqlite::Result<crate::advanced::MergeOperation> {
+        let affected: String = row.get("affected_ids")?;
+        let affected_ids: Vec<String> = serde_json::from_str(&affected).unwrap_or_default();
+        Ok(crate::advanced::MergeOperation {
+            id: row.get("id")?,
+            plan_id: row.get("plan_id").ok().flatten(),
+            op_type: row.get("op_type")?,
+            status: row.get("status")?,
+            created_at: row.get("created_at")?,
+            reverted_at: row.get("reverted_at").ok().flatten(),
+            reverts_op_id: row.get("reverts_op_id").ok().flatten(),
+            survivor_id: row.get("survivor_id").ok().flatten(),
+            affected_ids,
+            confidence: row
+                .get::<_, Option<f64>>("confidence")
+                .ok()
+                .flatten()
+                .map(|v| v as f32),
+            reason: row.get("reason").ok().flatten(),
+        })
+    }
+
+    /// Read (valid_until, superseded_by) for a node.
+    fn read_bitemporal(&self, id: &str) -> Result<(Option<String>, Option<String>)> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let res = reader
+            .query_row(
+                "SELECT valid_until, superseded_by FROM knowledge_nodes WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        res.ok_or_else(|| StorageError::NotFound(id.to_string()))
+    }
+
+    /// Bitemporally invalidate a node: stamp valid_until=now and superseded_by,
+    /// keeping the row fully queryable (Graphiti-style invalidate, don't delete).
+    fn invalidate_node(&self, id: &str, superseded_by: &str, now: DateTime<Utc>) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        writer.execute(
+            "UPDATE knowledge_nodes
+             SET valid_until = ?1, superseded_by = ?2, updated_at = ?1
+             WHERE id = ?3",
+            params![now.to_rfc3339(), superseded_by, id],
+        )?;
+        Ok(())
+    }
+
+    /// Restore a node's bitemporal columns (used by undo).
+    fn restore_bitemporal(
+        &self,
+        id: &str,
+        valid_until: Option<&str>,
+        superseded_by: Option<&str>,
+    ) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        writer.execute(
+            "UPDATE knowledge_nodes
+             SET valid_until = ?1, superseded_by = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![valid_until, superseded_by, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Rewrite a survivor's content and tags (used by merge apply + undo).
+    /// Content rewrite regenerates the embedding via `update_node_content`.
+    fn rewrite_survivor(&self, id: &str, content: &str, tags: &[String]) -> Result<()> {
+        self.update_node_content(id, content)?;
+        let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        writer.execute(
+            "UPDATE knowledge_nodes SET tags = ?1, updated_at = ?2 WHERE id = ?3",
+            params![tags_json, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+}
+
+/// Truncate `content` to `max` chars on a char boundary, collapsing newlines.
+fn preview(content: &str, max: usize) -> String {
+    let c = content.replace('\n', " ");
+    if c.len() > max {
+        format!("{}...", &c[..c.floor_char_boundary(max)])
+    } else {
+        c
+    }
+}
+
+// ============================================================================
+// LOCAL MEMORY STORE TRAIT IMPL
+// ============================================================================
+
+impl SqliteMemoryStore {
+    /// Convert a `KnowledgeNode` (plus optional embedding vector read separately)
+    /// into a `MemoryRecord` for the trait surface.
+    fn node_to_record(
+        node: KnowledgeNode,
+        embedding: Option<Vec<f32>>,
+    ) -> crate::storage::memory_store::MemoryRecord {
+        use crate::storage::memory_store::MemoryRecord;
+        let id = uuid::Uuid::parse_str(&node.id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+        MemoryRecord {
+            id,
+            domains: Vec::new(),
+            domain_scores: std::collections::HashMap::new(),
+            content: node.content,
+            node_type: node.node_type,
+            tags: node.tags,
+            embedding,
+            created_at: node.created_at,
+            updated_at: node.updated_at,
+            metadata: serde_json::json!({
+                "source": node.source,
+                "stability": node.stability,
+                "difficulty": node.difficulty,
+                "reps": node.reps,
+                "lapses": node.lapses,
+                "retention_strength": node.retention_strength,
+            }),
+        }
+    }
+
+    /// Read domains and domain_scores JSON columns for a node by id.
+    fn read_domain_columns(
+        &self,
+        id: &str,
+    ) -> (Vec<String>, std::collections::HashMap<String, f64>) {
+        let reader = match self.reader.lock() {
+            Ok(r) => r,
+            Err(_) => return (Vec::new(), std::collections::HashMap::new()),
+        };
+        let result = reader.query_row(
+            "SELECT domains, domain_scores FROM knowledge_nodes WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                let d: Option<String> = row.get(0).ok().flatten();
+                let ds: Option<String> = row.get(1).ok().flatten();
+                Ok((d, ds))
+            },
+        );
+        match result {
+            Ok((d, ds)) => {
+                let domains: Vec<String> = d
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let domain_scores: std::collections::HashMap<String, f64> = ds
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                (domains, domain_scores)
+            }
+            Err(_) => (Vec::new(), std::collections::HashMap::new()),
+        }
+    }
+
+    /// Enforce the registered embedding model. Returns `Ok(())` if:
+    /// - no vector is being written (`incoming.is_none()`) and nothing is registered
+    /// - the incoming signature matches the registered signature
+    ///
+    /// Auto-registers on the first embedded write.
+    fn enforce_model(
+        &self,
+        incoming: Option<&crate::storage::memory_store::ModelSignature>,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::{MemoryStoreError, ModelSignature};
+        let Some(incoming) = incoming else {
+            return Ok(());
+        };
+        // Try from cache first
+        {
+            let guard = self
+                .registered_model
+                .read()
+                .map_err(|_| MemoryStoreError::Init("registered_model rwlock poisoned".into()))?;
+            if let Some(ref reg) = *guard {
+                if reg == incoming {
+                    return Ok(());
+                }
+                return Err(MemoryStoreError::ModelMismatch {
+                    registered_name: reg.name.clone(),
+                    registered_dim: reg.dimension,
+                    registered_hash: reg.hash.clone(),
+                    actual_name: incoming.name.clone(),
+                    actual_dim: incoming.dimension,
+                    actual_hash: incoming.hash.clone(),
+                });
+            }
+        }
+        // Not registered yet -- auto-register
+        let now = Utc::now().to_rfc3339();
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        // Try INSERT OR IGNORE
+        writer.execute(
+            "INSERT OR IGNORE INTO embedding_model (id, name, dimension, hash, created_at) VALUES (1, ?1, ?2, ?3, ?4)",
+            rusqlite::params![incoming.name, incoming.dimension as i64, incoming.hash, now],
+        ).map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        // Read back what was stored
+        let stored: Option<ModelSignature> = writer
+            .query_row(
+                "SELECT name, dimension, hash FROM embedding_model WHERE id = 1",
+                [],
+                |row| {
+                    let name: String = row.get(0)?;
+                    let dim: i64 = row.get(1)?;
+                    let hash: String = row.get(2)?;
+                    Ok(ModelSignature {
+                        name,
+                        dimension: dim as usize,
+                        hash,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        drop(writer);
+        if let Some(stored) = stored {
+            if stored != *incoming {
+                return Err(MemoryStoreError::ModelMismatch {
+                    registered_name: stored.name,
+                    registered_dim: stored.dimension,
+                    registered_hash: stored.hash,
+                    actual_name: incoming.name.clone(),
+                    actual_dim: incoming.dimension,
+                    actual_hash: incoming.hash.clone(),
+                });
+            }
+            // Populate cache
+            let mut guard = self
+                .registered_model
+                .write()
+                .map_err(|_| MemoryStoreError::Init("registered_model rwlock poisoned".into()))?;
+            *guard = Some(stored);
+        }
+        Ok(())
+    }
+}
+
+impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
+    async fn init(&self) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        // Migrations run in `new`; this is a no-op for the SQLite backend.
+        Ok(())
+    }
+
+    async fn health_check(
+        &self,
+    ) -> crate::storage::memory_store::MemoryStoreResult<crate::storage::memory_store::HealthStatus>
+    {
+        use crate::storage::memory_store::HealthStatus;
+        let reader = self.reader.lock().map_err(|_| {
+            crate::storage::memory_store::MemoryStoreError::Init("Reader lock poisoned".into())
+        })?;
+        let ok: rusqlite::Result<i64> = reader.query_row("SELECT 1", [], |row| row.get(0));
+        if ok.is_ok() {
+            Ok(HealthStatus::Healthy)
+        } else {
+            Ok(HealthStatus::Degraded {
+                reason: "SQLite connectivity check failed".to_string(),
+            })
+        }
+    }
+
+    async fn registered_model(
+        &self,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Option<crate::storage::memory_store::ModelSignature>,
+    > {
+        use crate::storage::memory_store::MemoryStoreError;
+        // Check cache first
+        {
+            let guard = self
+                .registered_model
+                .read()
+                .map_err(|_| MemoryStoreError::Init("registered_model rwlock poisoned".into()))?;
+            if guard.is_some() {
+                return Ok(guard.clone());
+            }
+        }
+        // Fall through to DB read
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let stored: Option<crate::storage::memory_store::ModelSignature> = reader
+            .query_row(
+                "SELECT name, dimension, hash FROM embedding_model WHERE id = 1",
+                [],
+                |row| {
+                    let name: String = row.get(0)?;
+                    let dim: i64 = row.get(1)?;
+                    let hash: String = row.get(2)?;
+                    Ok(crate::storage::memory_store::ModelSignature {
+                        name,
+                        dimension: dim as usize,
+                        hash,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        drop(reader);
+        // Populate cache if we read something
+        if stored.is_some() {
+            let mut guard = self
+                .registered_model
+                .write()
+                .map_err(|_| MemoryStoreError::Init("registered_model rwlock poisoned".into()))?;
+            *guard = stored.clone();
+        }
+        Ok(stored)
+    }
+
+    async fn register_model(
+        &self,
+        sig: &crate::storage::memory_store::ModelSignature,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        self.enforce_model(Some(sig))
+    }
+
+    async fn insert(
+        &self,
+        record: &crate::storage::memory_store::MemoryRecord,
+    ) -> crate::storage::memory_store::MemoryStoreResult<uuid::Uuid> {
+        use crate::storage::memory_store::{MemoryStoreError, ModelSignature};
+        // Enforce model registry if embedding is provided
+        if let Some(vec) = &record.embedding {
+            // Derive a signature from metadata if present, or use a generic sentinel
+            let sig: Option<ModelSignature> = record
+                .metadata
+                .get("model_name")
+                .and_then(|v| v.as_str())
+                .zip(
+                    record
+                        .metadata
+                        .get("model_dim")
+                        .and_then(|v| v.as_u64())
+                        .map(|d| d as usize),
+                )
+                .zip(record.metadata.get("model_hash").and_then(|v| v.as_str()))
+                .map(|((name, dim), hash)| ModelSignature {
+                    name: name.to_string(),
+                    dimension: dim,
+                    hash: hash.to_string(),
+                });
+            if let Some(ref s) = sig {
+                self.enforce_model(Some(s))?;
+                if vec.len() != s.dimension {
+                    return Err(MemoryStoreError::InvalidInput(format!(
+                        "embedding length {} != registered dimension {}",
+                        vec.len(),
+                        s.dimension
+                    )));
+                }
+            }
+        }
+        // Insert directly using the record's own id so the caller-supplied UUID is
+        // preserved (unlike ingest() which always generates a fresh UUID).
+        let id_str = record.id.to_string();
+        let now = chrono::Utc::now();
+        let tags_json = serde_json::to_string(&record.tags).unwrap_or_else(|_| "[]".to_string());
+        let domains_json =
+            serde_json::to_string(&record.domains).unwrap_or_else(|_| "[]".to_string());
+        let scores_json =
+            serde_json::to_string(&record.domain_scores).unwrap_or_else(|_| "{}".to_string());
+        let source: Option<String> = record
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+            writer
+                .execute(
+                    "INSERT INTO knowledge_nodes (
+                    id, content, node_type, created_at, updated_at, last_accessed,
+                    stability, difficulty, reps, lapses, learning_state,
+                    storage_strength, retrieval_strength, retention_strength,
+                    sentiment_score, sentiment_magnitude, next_review, scheduled_days,
+                    source, tags, has_embedding, embedding_model,
+                    domains, domain_scores
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    1.0, 0.3, 0, 0, 'new',
+                    1.0, 1.0, 1.0,
+                    0.0, 0.0, ?7, 1,
+                    ?8, ?9, 0, NULL,
+                    ?10, ?11
+                )",
+                    rusqlite::params![
+                        id_str,
+                        record.content,
+                        record.node_type,
+                        record.created_at.to_rfc3339(),
+                        record.updated_at.to_rfc3339(),
+                        now.to_rfc3339(),
+                        (now + chrono::Duration::days(1)).to_rfc3339(),
+                        source,
+                        tags_json,
+                        domains_json,
+                        scores_json,
+                    ],
+                )
+                .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        }
+        Ok(record.id)
+    }
+
+    async fn get(
+        &self,
+        id: uuid::Uuid,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Option<crate::storage::memory_store::MemoryRecord>,
+    > {
+        use crate::storage::memory_store::MemoryStoreError;
+        let node = self
+            .get_node(&id.to_string())
+            .map_err(MemoryStoreError::from)?;
+        let Some(node) = node else {
+            return Ok(None);
+        };
+        let (domains, domain_scores) = self.read_domain_columns(&id.to_string());
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        let embedding = self.get_node_embedding(&id.to_string()).ok().flatten();
+        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        let embedding: Option<Vec<f32>> = None;
+        let mut rec = Self::node_to_record(node, embedding);
+        rec.domains = domains;
+        rec.domain_scores = domain_scores;
+        Ok(Some(rec))
+    }
+
+    async fn update(
+        &self,
+        record: &crate::storage::memory_store::MemoryRecord,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        self.update_node_content(&record.id.to_string(), &record.content)
+            .map_err(MemoryStoreError::from)?;
+        // Update domains/domain_scores
+        let domains_json =
+            serde_json::to_string(&record.domains).unwrap_or_else(|_| "[]".to_string());
+        let scores_json =
+            serde_json::to_string(&record.domain_scores).unwrap_or_else(|_| "{}".to_string());
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute(
+                "UPDATE knowledge_nodes SET domains = ?1, domain_scores = ?2 WHERE id = ?3",
+                rusqlite::params![domains_json, scores_json, record.id.to_string()],
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete(&self, id: uuid::Uuid) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        self.delete_node(&id.to_string())
+            .map_err(MemoryStoreError::from)?;
+        Ok(())
+    }
+
+    async fn search(
+        &self,
+        query: &crate::storage::memory_store::SearchQuery,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<crate::storage::memory_store::SearchResult>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SearchResult};
+        // For Phase 1 we delegate to hybrid_search or keyword_search based on what is provided.
+        let limit = if query.limit == 0 { 10 } else { query.limit };
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        {
+            if let Some(ref text) = query.text {
+                let results = self
+                    .hybrid_search(text, limit as i32, 0.3, 0.7)
+                    .map_err(MemoryStoreError::from)?;
+                let out = results
+                    .into_iter()
+                    .map(|r| {
+                        let (domains, domain_scores) = self.read_domain_columns(&r.node.id);
+                        let mut rec = Self::node_to_record(r.node, None);
+                        rec.domains = domains;
+                        rec.domain_scores = domain_scores;
+                        SearchResult {
+                            score: r.combined_score as f64,
+                            fts_score: r.keyword_score.map(|s| s as f64),
+                            vector_score: r.semantic_score.map(|s| s as f64),
+                            record: rec,
+                        }
+                    })
+                    .collect();
+                return Ok(out);
+            }
+        }
+        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        {
+            if let Some(ref text) = query.text {
+                // Use individual-term matching so multi-word queries find documents
+                // where all words appear anywhere (not necessarily as a phrase).
+                let nodes = self
+                    .search_terms(text, limit as i32)
+                    .map_err(MemoryStoreError::from)?;
+                let out = nodes
+                    .into_iter()
+                    .map(|node| {
+                        let (domains, domain_scores) = self.read_domain_columns(&node.id);
+                        let mut rec = Self::node_to_record(node, None);
+                        rec.domains = domains;
+                        rec.domain_scores = domain_scores;
+                        SearchResult {
+                            record: rec,
+                            score: 1.0,
+                            fts_score: Some(1.0),
+                            vector_score: None,
+                        }
+                    })
+                    .collect();
+                return Ok(out);
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn fts_search(
+        &self,
+        text: &str,
+        limit: usize,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<crate::storage::memory_store::SearchResult>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SearchResult};
+        // Use individual-term matching so multi-word queries find documents
+        // where all words appear anywhere (not necessarily as a phrase).
+        let nodes = self
+            .search_terms(text, limit as i32)
+            .map_err(MemoryStoreError::from)?;
+        let out = nodes
+            .into_iter()
+            .map(|node| {
+                let (domains, domain_scores) = self.read_domain_columns(&node.id);
+                let mut rec = Self::node_to_record(node, None);
+                rec.domains = domains;
+                rec.domain_scores = domain_scores;
+                SearchResult {
+                    record: rec,
+                    score: 1.0,
+                    fts_score: Some(1.0),
+                    vector_score: None,
+                }
+            })
+            .collect();
+        Ok(out)
+    }
+
+    async fn vector_search(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<crate::storage::memory_store::SearchResult>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SearchResult};
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        {
+            let Some(index) = self.vector_index.as_ref() else {
+                return Ok(vec![]);
+            };
+            let index = index
+                .lock()
+                .map_err(|_| MemoryStoreError::Init("Vector index lock poisoned".into()))?;
+            let raw_results = index
+                .search_with_threshold(embedding, limit, 0.0_f32)
+                .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+            drop(index);
+            let out = raw_results
+                .into_iter()
+                .filter_map(|(node_id, score)| {
+                    let node = self.get_node(&node_id).ok().flatten()?;
+                    let (domains, domain_scores) = self.read_domain_columns(&node_id);
+                    let mut rec = Self::node_to_record(node, None);
+                    rec.domains = domains;
+                    rec.domain_scores = domain_scores;
+                    Some(SearchResult {
+                        record: rec,
+                        score: score as f64,
+                        fts_score: None,
+                        vector_score: Some(score as f64),
+                    })
+                })
+                .collect();
+            Ok(out)
+        }
+        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        {
+            let _ = (embedding, limit);
+            Ok(vec![])
+        }
+    }
+
+    async fn get_scheduling(
+        &self,
+        memory_id: uuid::Uuid,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Option<crate::storage::memory_store::SchedulingState>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SchedulingState};
+        let node = self
+            .get_node(&memory_id.to_string())
+            .map_err(MemoryStoreError::from)?;
+        let Some(node) = node else {
+            return Ok(None);
+        };
+        Ok(Some(SchedulingState {
+            memory_id,
+            stability: node.stability,
+            difficulty: node.difficulty,
+            retrievability: node.retention_strength,
+            last_review: Some(node.last_accessed),
+            next_review: node.next_review,
+            reps: node.reps as u32,
+            lapses: node.lapses as u32,
+        }))
+    }
+
+    async fn update_scheduling(
+        &self,
+        state: &crate::storage::memory_store::SchedulingState,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        let next_review_str = state.next_review.map(|dt| dt.to_rfc3339());
+        let last_review_str = state.last_review.map(|dt| dt.to_rfc3339());
+        writer
+            .execute(
+                "UPDATE knowledge_nodes SET stability=?1, difficulty=?2, retention_strength=?3,
+                 last_accessed=?4, next_review=?5, reps=?6, lapses=?7
+                 WHERE id=?8",
+                rusqlite::params![
+                    state.stability,
+                    state.difficulty,
+                    state.retrievability,
+                    last_review_str.as_deref().unwrap_or(""),
+                    next_review_str,
+                    state.reps as i64,
+                    state.lapses as i64,
+                    state.memory_id.to_string(),
+                ],
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_due_memories(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<(
+            crate::storage::memory_store::MemoryRecord,
+            crate::storage::memory_store::SchedulingState,
+        )>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SchedulingState};
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let before_str = before.to_rfc3339();
+        let mut stmt = reader
+            .prepare(
+                "SELECT * FROM knowledge_nodes WHERE next_review <= ?1 ORDER BY next_review ASC LIMIT ?2",
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let nodes: Vec<KnowledgeNode> = stmt
+            .query_map(
+                rusqlite::params![before_str, limit as i64],
+                Self::row_to_node,
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        drop(stmt);
+        drop(reader);
+        let out = nodes
+            .into_iter()
+            .map(|node| {
+                let id_str = node.id.clone();
+                let (domains, domain_scores) = self.read_domain_columns(&id_str);
+                let id_uuid =
+                    uuid::Uuid::parse_str(&id_str).unwrap_or_else(|_| uuid::Uuid::new_v4());
+                let state = SchedulingState {
+                    memory_id: id_uuid,
+                    stability: node.stability,
+                    difficulty: node.difficulty,
+                    retrievability: node.retention_strength,
+                    last_review: Some(node.last_accessed),
+                    next_review: node.next_review,
+                    reps: node.reps as u32,
+                    lapses: node.lapses as u32,
+                };
+                let mut rec = Self::node_to_record(node, None);
+                rec.domains = domains;
+                rec.domain_scores = domain_scores;
+                (rec, state)
+            })
+            .collect();
+        Ok(out)
+    }
+
+    async fn add_edge(
+        &self,
+        edge: &crate::storage::memory_store::MemoryEdge,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let conn = ConnectionRecord {
+            source_id: edge.source_id.to_string(),
+            target_id: edge.target_id.to_string(),
+            strength: edge.weight,
+            link_type: edge.edge_type.clone(),
+            created_at: edge.created_at,
+            last_activated: edge.created_at,
+            activation_count: 0,
+        };
+        self.save_connection(&conn).map_err(MemoryStoreError::from)
+    }
+
+    async fn get_edges(
+        &self,
+        node_id: uuid::Uuid,
+        edge_type: Option<&str>,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<crate::storage::memory_store::MemoryEdge>,
+    > {
+        use crate::storage::memory_store::{MemoryEdge, MemoryStoreError};
+        let conns = self
+            .get_connections_for_memory(&node_id.to_string())
+            .map_err(MemoryStoreError::from)?;
+        let edges = conns
+            .into_iter()
+            .filter(|c| edge_type.is_none_or(|t| c.link_type == t))
+            .filter_map(|c| {
+                let src = uuid::Uuid::parse_str(&c.source_id).ok()?;
+                let tgt = uuid::Uuid::parse_str(&c.target_id).ok()?;
+                Some(MemoryEdge {
+                    source_id: src,
+                    target_id: tgt,
+                    edge_type: c.link_type,
+                    weight: c.strength,
+                    created_at: c.created_at,
+                })
+            })
+            .collect();
+        Ok(edges)
+    }
+
+    async fn remove_edge(
+        &self,
+        source: uuid::Uuid,
+        target: uuid::Uuid,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute(
+                "DELETE FROM memory_connections WHERE source_id = ?1 AND target_id = ?2",
+                rusqlite::params![source.to_string(), target.to_string()],
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_neighbors(
+        &self,
+        node_id: uuid::Uuid,
+        depth: usize,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<(crate::storage::memory_store::MemoryRecord, f64)>,
+    > {
+        use crate::storage::memory_store::MemoryStoreError;
+        // Depth 0: return just the node itself if it exists.
+        if depth == 0 {
+            let node = self
+                .get_node(&node_id.to_string())
+                .map_err(MemoryStoreError::from)?
+                .ok_or_else(|| MemoryStoreError::NotFound(node_id.to_string()))?;
+            let (domains, domain_scores) = self.read_domain_columns(&node_id.to_string());
+            let mut rec = Self::node_to_record(node, None);
+            rec.domains = domains;
+            rec.domain_scores = domain_scores;
+            return Ok(vec![(rec, 1.0)]);
+        }
+        // BFS up to `depth` levels, capped at 256 nodes.
+        const MAX_NODES: usize = 256;
+        let mut visited: std::collections::HashMap<uuid::Uuid, f64> =
+            std::collections::HashMap::new();
+        let mut frontier: Vec<(uuid::Uuid, f64)> = vec![(node_id, 1.0)];
+        visited.insert(node_id, 1.0);
+        for _ in 0..depth {
+            if visited.len() >= MAX_NODES {
+                break;
+            }
+            let mut next_frontier = Vec::new();
+            for (current, current_weight) in frontier.iter() {
+                let conns = self
+                    .get_connections_for_memory(&current.to_string())
+                    .unwrap_or_default();
+                for conn in conns {
+                    let neighbor_id_str = if conn.source_id == current.to_string() {
+                        conn.target_id
+                    } else {
+                        conn.source_id
+                    };
+                    let Ok(nid) = uuid::Uuid::parse_str(&neighbor_id_str) else {
+                        continue;
+                    };
+                    if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(nid) {
+                        let w = current_weight * conn.strength;
+                        e.insert(w);
+                        next_frontier.push((nid, w));
+                        if visited.len() >= MAX_NODES {
+                            break;
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        let mut result = Vec::with_capacity(visited.len());
+        for (nid, weight) in visited {
+            let Some(node) = self.get_node(&nid.to_string()).ok().flatten() else {
+                continue;
+            };
+            let (domains, domain_scores) = self.read_domain_columns(&nid.to_string());
+            let mut rec = Self::node_to_record(node, None);
+            rec.domains = domains;
+            rec.domain_scores = domain_scores;
+            result.push((rec, weight));
+        }
+        Ok(result)
+    }
+
+    async fn list_domains(
+        &self,
+    ) -> crate::storage::memory_store::MemoryStoreResult<Vec<crate::storage::memory_store::Domain>>
+    {
+        use crate::storage::memory_store::{Domain, MemoryStoreError};
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader
+            .prepare("SELECT id, label, centroid, top_terms, memory_count, created_at FROM domains ORDER BY created_at ASC")
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let label: String = row.get(1)?;
+                let centroid_bytes: Option<Vec<u8>> = row.get(2)?;
+                let top_terms_json: String = row.get(3)?;
+                let memory_count: i64 = row.get(4)?;
+                let created_at_str: String = row.get(5)?;
+                Ok((
+                    id,
+                    label,
+                    centroid_bytes,
+                    top_terms_json,
+                    memory_count,
+                    created_at_str,
+                ))
+            })
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, label, centroid_bytes, top_terms_json, memory_count, created_at_str) =
+                row.map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+            let centroid: Vec<f32> = centroid_bytes
+                .map(|b| {
+                    b.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let top_terms: Vec<String> = serde_json::from_str(&top_terms_json).unwrap_or_default();
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| Utc::now());
+            result.push(Domain {
+                id,
+                label,
+                centroid,
+                top_terms,
+                memory_count: memory_count as usize,
+                created_at,
+            });
+        }
+        Ok(result)
+    }
+
+    async fn get_domain(
+        &self,
+        id: &str,
+    ) -> crate::storage::memory_store::MemoryStoreResult<Option<crate::storage::memory_store::Domain>>
+    {
+        use crate::storage::memory_store::{Domain, MemoryStoreError};
+        type DomainRow = (String, String, Option<Vec<u8>>, String, i64, String);
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let result: Option<DomainRow> = reader
+            .query_row(
+                "SELECT id, label, centroid, top_terms, memory_count, created_at FROM domains WHERE id = ?1",
+                rusqlite::params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let Some((id, label, centroid_bytes, top_terms_json, memory_count, created_at_str)) =
+            result
+        else {
+            return Ok(None);
+        };
+        let centroid: Vec<f32> = centroid_bytes
+            .map(|b| {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let top_terms: Vec<String> = serde_json::from_str(&top_terms_json).unwrap_or_default();
+        let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| Utc::now());
+        Ok(Some(Domain {
+            id,
+            label,
+            centroid,
+            top_terms,
+            memory_count: memory_count as usize,
+            created_at,
+        }))
+    }
+
+    async fn upsert_domain(
+        &self,
+        domain: &crate::storage::memory_store::Domain,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let centroid_bytes: Vec<u8> = domain
+            .centroid
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let top_terms_json =
+            serde_json::to_string(&domain.top_terms).unwrap_or_else(|_| "[]".to_string());
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute(
+                "INSERT INTO domains (id, label, centroid, top_terms, memory_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                   label = excluded.label,
+                   centroid = excluded.centroid,
+                   top_terms = excluded.top_terms,
+                   memory_count = excluded.memory_count",
+                rusqlite::params![
+                    domain.id,
+                    domain.label,
+                    centroid_bytes,
+                    top_terms_json,
+                    domain.memory_count as i64,
+                    domain.created_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_domain(&self, id: &str) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute("DELETE FROM domains WHERE id = ?1", rusqlite::params![id])
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn classify(
+        &self,
+        _embedding: &[f32],
+    ) -> crate::storage::memory_store::MemoryStoreResult<Vec<(String, f64)>> {
+        // Phase 1 stub: no centroids yet. Phase 4 wires the full soft-assignment pass.
+        Ok(vec![])
+    }
+
+    async fn count(&self) -> crate::storage::memory_store::MemoryStoreResult<usize> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let n: i64 = reader
+            .query_row("SELECT COUNT(*) FROM knowledge_nodes", [], |row| row.get(0))
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(n as usize)
+    }
+
+    async fn get_stats(
+        &self,
+    ) -> crate::storage::memory_store::MemoryStoreResult<crate::storage::memory_store::StoreStats>
+    {
+        use crate::storage::memory_store::{MemoryStoreError, StoreStats};
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let total: i64 = reader
+            .query_row("SELECT COUNT(*) FROM knowledge_nodes", [], |row| row.get(0))
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let with_emb: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_nodes WHERE has_embedding = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let total_edges: i64 = reader
+            .query_row("SELECT COUNT(*) FROM memory_connections", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        let total_domains: i64 = reader
+            .query_row("SELECT COUNT(*) FROM domains", [], |row| row.get(0))
+            .unwrap_or(0);
+        let model_row: Option<(String, i64)> = reader
+            .query_row(
+                "SELECT name, dimension FROM embedding_model WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let (model_name, model_dim) = model_row
+            .map(|(n, d)| (Some(n), Some(d as usize)))
+            .unwrap_or((None, None));
+        Ok(StoreStats {
+            total_memories: total as usize,
+            memories_with_embeddings: with_emb as usize,
+            total_edges: total_edges as usize,
+            total_domains: total_domains as usize,
+            registered_model_name: model_name,
+            registered_model_dim: model_dim,
+        })
+    }
+
+    async fn vacuum(&self) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute_batch("VACUUM;")
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// CONNECTOR SYNC (#57) — idempotent external-source ingestion
+// ============================================================================
+
+/// What `upsert_by_source` did with one external record. Drives the
+/// created/updated/unchanged/tombstoned counts a connector reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceUpsertOutcome {
+    /// No memory existed for this `(source_system, source_id)` — inserted.
+    Created,
+    /// A memory existed and the `content_hash` changed — body + envelope updated
+    /// and the embedding regenerated.
+    Updated,
+    /// A memory existed with the same `content_hash` — nothing rewritten except
+    /// `synced_at` (so an incremental re-scan is free).
+    Unchanged,
+}
+
+/// Result of one `upsert_by_source` call.
+#[derive(Debug, Clone)]
+pub struct SourceUpsertResult {
+    pub outcome: SourceUpsertOutcome,
+    /// Memory id of the affected node (new or existing).
+    pub node_id: String,
+}
+
+/// Incremental-sync checkpoint for one `(source_system, scope)`.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectorCursor {
+    pub source_system: String,
+    pub scope: String,
+    /// High-water mark on the source's update timestamp. `None` on first sync.
+    pub cursor_updated_at: Option<DateTime<Utc>>,
+    pub last_synced_at: Option<DateTime<Utc>>,
+    pub last_full_reconcile_at: Option<DateTime<Utc>>,
+    pub records_seen: i64,
+}
+
+/// Outcome of a tombstone reconciliation pass.
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileReport {
+    /// Memory ids that were tombstoned (no longer visible upstream).
+    pub tombstoned: Vec<String>,
+    /// Number of local records considered for this scope.
+    pub considered: usize,
+}
+
+impl SqliteMemoryStore {
+    /// Idempotently upsert one external-source record, keyed on the envelope's
+    /// `(source_system, source_id)` (#57).
+    ///
+    /// This is the core primitive every connector calls per record. It makes
+    /// re-running a sync safe and cheap:
+    ///
+    /// - **No existing memory** for the key → insert (`Created`).
+    /// - **Existing memory, `content_hash` changed** → update content + envelope,
+    ///   stamp `updated_at`, regenerate the embedding (`Updated`).
+    /// - **Existing memory, `content_hash` unchanged** → touch only `synced_at`
+    ///   so the reconcile pass knows the record is still live (`Unchanged`).
+    ///
+    /// The caller MUST set `source_system`, `source_id`, and `content_hash` on
+    /// the input's `source_envelope`; otherwise this falls back to a plain
+    /// `ingest` (an un-keyed record can't be deduplicated).
+    pub fn upsert_by_source(&self, input: IngestInput) -> Result<SourceUpsertResult> {
+        let env = match input.source_envelope.clone() {
+            Some(e) if e.has_key() => e,
+            // No idempotency key — behave like a normal create.
+            _ => {
+                let node = self.ingest(input)?;
+                return Ok(SourceUpsertResult {
+                    outcome: SourceUpsertOutcome::Created,
+                    node_id: node.id,
+                });
+            }
+        };
+
+        let source_system = env.source_system.clone().unwrap_or_default();
+        let source_id = env.source_id.clone().unwrap_or_default();
+        let now = Utc::now();
+
+        // Look up the existing memory for this external record, if any.
+        let existing: Option<(String, Option<String>)> = {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            reader
+                .query_row(
+                    "SELECT id, content_hash FROM knowledge_nodes \
+                     WHERE source_system = ?1 AND source_id = ?2 LIMIT 1",
+                    params![source_system, source_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?
+        };
+
+        let Some((node_id, stored_hash)) = existing else {
+            // First time we've seen this record — plain insert carries the
+            // envelope through the existing ingest path.
+            let node = self.ingest(input)?;
+            return Ok(SourceUpsertResult {
+                outcome: SourceUpsertOutcome::Created,
+                node_id: node.id,
+            });
+        };
+
+        let new_hash = env.content_hash.clone();
+        let unchanged = match (&stored_hash, &new_hash) {
+            // Both present and equal → genuinely unchanged.
+            (Some(a), Some(b)) => a == b,
+            // Either side missing a hash → be conservative and treat as changed
+            // so we never silently skip a real update.
+            _ => false,
+        };
+
+        let env_source_updated_at = env.source_updated_at.map(|dt| dt.to_rfc3339());
+        let synced_at = now.to_rfc3339();
+
+        if unchanged {
+            // Cheapest path: only advance liveness + the source cursor field.
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            writer.execute(
+                // Un-tombstone fully: a reappearing record clears BOTH bitemporal
+                // markers (valid_until AND superseded_by), otherwise it would be
+                // resurrected as currently-valid yet still flagged as superseded,
+                // which permanently excludes it from merge/consolidation.
+                "UPDATE knowledge_nodes \
+                 SET synced_at = ?1, source_updated_at = COALESCE(?2, source_updated_at), \
+                     source_url = COALESCE(?3, source_url), \
+                     valid_until = NULL, superseded_by = NULL \
+                 WHERE id = ?4",
+                params![synced_at, env_source_updated_at, env.source_url, node_id],
+            )?;
+            return Ok(SourceUpsertResult {
+                outcome: SourceUpsertOutcome::Unchanged,
+                node_id,
+            });
+        }
+
+        // Content changed upstream → update body + full envelope, clear any
+        // prior tombstone (`valid_until`), then regenerate the embedding.
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            writer.execute(
+                // Clear BOTH bitemporal markers on update (see Unchanged branch).
+                "UPDATE knowledge_nodes SET \
+                    content = ?1, updated_at = ?2, synced_at = ?3, \
+                    content_hash = ?4, source_url = ?5, source_updated_at = ?6, \
+                    source_project = ?7, source_type = ?8, source_author = ?9, \
+                    valid_until = NULL, superseded_by = NULL \
+                 WHERE id = ?10",
+                params![
+                    input.content,
+                    now.to_rfc3339(),
+                    synced_at,
+                    env.content_hash,
+                    env.source_url,
+                    env_source_updated_at,
+                    env.source_project,
+                    env.source_type,
+                    env.source_author,
+                    node_id,
+                ],
+            )?;
+        }
+
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        {
+            if let Some(index) = self.vector_index.as_ref()
+                && let Ok(mut index) = index.lock()
+            {
+                let _ = index.remove(&node_id);
+            }
+            if let Err(e) = self.generate_embedding_for_node(&node_id, &input.content) {
+                tracing::warn!("Failed to regenerate embedding for {}: {}", node_id, e);
+            }
+        }
+
+        Ok(SourceUpsertResult {
+            outcome: SourceUpsertOutcome::Updated,
+            node_id,
+        })
+    }
+
+    /// Read the incremental-sync checkpoint for a `(source_system, scope)`.
+    /// Returns a zeroed cursor (no high-water mark) if none has been saved yet.
+    pub fn get_connector_cursor(
+        &self,
+        source_system: &str,
+        scope: &str,
+    ) -> Result<ConnectorCursor> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let row = reader
+            .query_row(
+                "SELECT cursor_updated_at, last_synced_at, last_full_reconcile_at, records_seen \
+                 FROM connector_cursors WHERE source_system = ?1 AND scope = ?2",
+                params![source_system, scope],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let parse = |s: Option<String>| -> Option<DateTime<Utc>> {
+            s.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok()
+            })
+        };
+
+        Ok(match row {
+            Some((cur, last, recon, seen)) => ConnectorCursor {
+                source_system: source_system.to_string(),
+                scope: scope.to_string(),
+                cursor_updated_at: parse(cur),
+                last_synced_at: parse(last),
+                last_full_reconcile_at: parse(recon),
+                records_seen: seen,
+            },
+            None => ConnectorCursor {
+                source_system: source_system.to_string(),
+                scope: scope.to_string(),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Persist the incremental-sync checkpoint for a `(source_system, scope)`.
+    pub fn save_connector_cursor(&self, cursor: &ConnectorCursor) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        writer.execute(
+            "INSERT INTO connector_cursors \
+                (source_system, scope, cursor_updated_at, last_synced_at, \
+                 last_full_reconcile_at, records_seen) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(source_system, scope) DO UPDATE SET \
+                cursor_updated_at = excluded.cursor_updated_at, \
+                last_synced_at = excluded.last_synced_at, \
+                last_full_reconcile_at = excluded.last_full_reconcile_at, \
+                records_seen = excluded.records_seen",
+            params![
+                cursor.source_system,
+                cursor.scope,
+                cursor.cursor_updated_at.map(|d| d.to_rfc3339()),
+                cursor.last_synced_at.map(|d| d.to_rfc3339()),
+                cursor.last_full_reconcile_at.map(|d| d.to_rfc3339()),
+                cursor.records_seen,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Reconcile deletions for a scope: tombstone every local memory in
+    /// `(source_system, source_project = scope)` whose `source_id` is NOT in the
+    /// caller-supplied set of currently-live ids (#57).
+    ///
+    /// Neither Redmine nor GitHub exposes a deletion feed, so an incremental
+    /// `updated_at` sync can never see a delete. The connector therefore
+    /// periodically enumerates the full set of live ids and calls this. We
+    /// **invalidate, don't purge** (Graphiti-style): the memory keeps its
+    /// content for audit but gets `valid_until = now`, so it falls out of
+    /// "currently valid" retrieval without losing history. A record that
+    /// reappears upstream is un-tombstoned by the next `upsert_by_source`
+    /// (which clears `valid_until`).
+    pub fn reconcile_source_tombstones(
+        &self,
+        source_system: &str,
+        scope: &str,
+        live_ids: &[String],
+    ) -> Result<ReconcileReport> {
+        let live: std::collections::HashSet<&str> = live_ids.iter().map(|s| s.as_str()).collect();
+
+        // All currently-valid local records for this scope.
+        let local: Vec<(String, String)> = {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            let mut stmt = reader.prepare(
+                "SELECT id, source_id FROM knowledge_nodes \
+                 WHERE source_system = ?1 AND source_project = ?2 \
+                   AND source_id IS NOT NULL AND valid_until IS NULL",
+            )?;
+            let rows = stmt.query_map(params![source_system, scope], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let considered = local.len();
+        let now = Utc::now().to_rfc3339();
+        let mut tombstoned = Vec::new();
+
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            for (node_id, source_id) in &local {
+                if !live.contains(source_id.as_str()) {
+                    writer.execute(
+                        "UPDATE knowledge_nodes SET valid_until = ?1 WHERE id = ?2",
+                        params![now, node_id],
+                    )?;
+                    tombstoned.push(node_id.clone());
+                }
+            }
+        }
+
+        Ok(ReconcileReport {
+            tombstoned,
+            considered,
+        })
+    }
 }
 
 // ============================================================================
@@ -6191,7 +10126,16 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::advanced::{MatchClass, MergePolicy};
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use tempfile::tempdir;
+    // The public struct was renamed from Storage to SqliteMemoryStore; this
+    // alias keeps all existing tests compiling without modification.
+    use SqliteMemoryStore as Storage;
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn create_test_storage() -> Storage {
         let dir = tempdir().unwrap();
@@ -6201,6 +10145,344 @@ mod tests {
 
     fn create_test_storage_at(dir: &tempfile::TempDir, name: &str) -> Storage {
         Storage::new(Some(dir.path().join(name))).unwrap()
+    }
+
+    // ===================== Connector sync (#57) =========================
+
+    /// Build an `IngestInput` carrying a source envelope for a GitHub-ish issue.
+    fn source_input(id: &str, content: &str, hash: &str) -> IngestInput {
+        IngestInput {
+            content: content.to_string(),
+            node_type: "fact".to_string(),
+            source_envelope: Some(crate::memory::SourceEnvelope {
+                source_system: Some("github".to_string()),
+                source_id: Some(id.to_string()),
+                source_url: Some(format!("https://github.com/o/r/issues/{id}")),
+                content_hash: Some(hash.to_string()),
+                source_project: Some("o/r".to_string()),
+                source_type: Some("issue".to_string()),
+                source_author: Some("octocat".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn node_count(store: &Storage) -> i64 {
+        // Count rows for our test source so embeddings/other tests don't bleed in.
+        let reader = store.reader.lock().unwrap();
+        reader
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_nodes WHERE source_system = 'github'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn upsert_by_source_is_idempotent_across_reruns() {
+        let store = create_test_storage();
+
+        // First sync: a brand-new record → Created.
+        let r1 = store
+            .upsert_by_source(source_input("1", "Bug: crash on startup", "hash-a"))
+            .unwrap();
+        assert_eq!(r1.outcome, SourceUpsertOutcome::Created);
+        assert_eq!(node_count(&store), 1);
+
+        // Re-sync the SAME record with the SAME hash twice → Unchanged, no dupes.
+        for _ in 0..2 {
+            let r = store
+                .upsert_by_source(source_input("1", "Bug: crash on startup", "hash-a"))
+                .unwrap();
+            assert_eq!(r.outcome, SourceUpsertOutcome::Unchanged);
+            assert_eq!(r.node_id, r1.node_id, "must reuse the same memory id");
+        }
+        assert_eq!(
+            node_count(&store),
+            1,
+            "idempotent: still exactly one memory"
+        );
+    }
+
+    #[test]
+    fn upsert_by_source_updates_in_place_when_hash_changes() {
+        let store = create_test_storage();
+        let created = store
+            .upsert_by_source(source_input("7", "old body", "hash-old"))
+            .unwrap();
+
+        // Upstream edit: content + hash change → Updated, same id, new content.
+        let updated = store
+            .upsert_by_source(source_input("7", "new edited body", "hash-new"))
+            .unwrap();
+        assert_eq!(updated.outcome, SourceUpsertOutcome::Updated);
+        assert_eq!(updated.node_id, created.node_id);
+        assert_eq!(node_count(&store), 1, "update must not duplicate");
+
+        let node = store.get_node(&created.node_id).unwrap().unwrap();
+        assert_eq!(node.content, "new edited body");
+        let env = node.source_envelope.expect("envelope persisted");
+        assert_eq!(env.content_hash.as_deref(), Some("hash-new"));
+        assert_eq!(env.source_id.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn upsert_by_source_without_key_falls_back_to_create() {
+        let store = create_test_storage();
+        // Envelope present but missing source_id → not keyed → plain create.
+        let input = IngestInput {
+            content: "loose note".to_string(),
+            node_type: "fact".to_string(),
+            source_envelope: Some(crate::memory::SourceEnvelope {
+                source_url: Some("https://example.com/x".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = store.upsert_by_source(input).unwrap();
+        assert_eq!(r.outcome, SourceUpsertOutcome::Created);
+    }
+
+    #[test]
+    fn connector_cursor_round_trips() {
+        let store = create_test_storage();
+        // Unknown scope → zeroed cursor.
+        let empty = store.get_connector_cursor("github", "o/r").unwrap();
+        assert!(empty.cursor_updated_at.is_none());
+        assert_eq!(empty.records_seen, 0);
+
+        let ts = Utc::now();
+        let cursor = ConnectorCursor {
+            source_system: "github".to_string(),
+            scope: "o/r".to_string(),
+            cursor_updated_at: Some(ts),
+            last_synced_at: Some(ts),
+            last_full_reconcile_at: None,
+            records_seen: 42,
+        };
+        store.save_connector_cursor(&cursor).unwrap();
+
+        let back = store.get_connector_cursor("github", "o/r").unwrap();
+        assert_eq!(back.records_seen, 42);
+        assert_eq!(
+            back.cursor_updated_at.map(|d| d.to_rfc3339()),
+            Some(ts.to_rfc3339())
+        );
+
+        // Upsert semantics: saving again replaces, never duplicates.
+        let mut c2 = cursor.clone();
+        c2.records_seen = 99;
+        store.save_connector_cursor(&c2).unwrap();
+        assert_eq!(
+            store
+                .get_connector_cursor("github", "o/r")
+                .unwrap()
+                .records_seen,
+            99
+        );
+    }
+
+    #[test]
+    fn reconcile_tombstones_records_absent_from_live_set() {
+        let store = create_test_storage();
+        // Three synced issues in scope o/r.
+        for id in ["1", "2", "3"] {
+            store
+                .upsert_by_source(source_input(id, &format!("issue {id}"), &format!("h{id}")))
+                .unwrap();
+        }
+
+        // Reconcile: only 1 and 3 are still visible upstream → 2 is tombstoned.
+        let report = store
+            .reconcile_source_tombstones("github", "o/r", &["1".to_string(), "3".to_string()])
+            .unwrap();
+        assert_eq!(report.considered, 3);
+        assert_eq!(report.tombstoned.len(), 1, "exactly issue 2 tombstoned");
+
+        // Issue 2's memory is invalidated (valid_until set) but NOT purged —
+        // content retained for audit, just no longer currently-valid.
+        let two = {
+            let reader = store.reader.lock().unwrap();
+            reader
+                .query_row(
+                    "SELECT id, valid_until FROM knowledge_nodes WHERE source_id = '2'",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap()
+        };
+        assert!(
+            two.1.is_some(),
+            "tombstoned record must have valid_until set"
+        );
+        let node = store.get_node(&two.0).unwrap().unwrap();
+        assert!(
+            !node.is_currently_valid(),
+            "tombstoned node is not valid now"
+        );
+        assert_eq!(node.content, "issue 2", "content retained for audit");
+
+        // A reappearing record un-tombstones on next upsert (clears valid_until).
+        store
+            .upsert_by_source(source_input("2", "issue 2", "h2"))
+            .unwrap();
+        let revived = store.get_node(&two.0).unwrap().unwrap();
+        assert!(
+            revived.is_currently_valid(),
+            "re-synced record is valid again"
+        );
+    }
+
+    #[test]
+    fn upsert_clears_superseded_by_when_record_reappears() {
+        // Regression: un-tombstoning must clear BOTH bitemporal markers. A
+        // connector node that was superseded/merged (valid_until + superseded_by
+        // both set) and then re-observed upstream must come back fully clean,
+        // otherwise it is currently-valid yet still flagged superseded and is
+        // permanently excluded from merge candidacy.
+        let store = create_test_storage();
+        let created = store
+            .upsert_by_source(source_input("9", "body v1", "h9a"))
+            .unwrap();
+
+        // Simulate the node having been superseded (as merge/supersede would).
+        {
+            let writer = store.writer.lock().unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET valid_until = ?1, superseded_by = 'survivor-id' WHERE id = ?2",
+                    params![Utc::now().to_rfc3339(), created.node_id],
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .superseded_node_ids()
+                .unwrap()
+                .contains(&created.node_id),
+            "precondition: node is superseded"
+        );
+
+        // Re-sync with a content change → Updated branch must clear both markers.
+        let res = store
+            .upsert_by_source(source_input("9", "body v2 edited", "h9b"))
+            .unwrap();
+        assert_eq!(res.outcome, SourceUpsertOutcome::Updated);
+        assert!(
+            !store
+                .superseded_node_ids()
+                .unwrap()
+                .contains(&created.node_id),
+            "superseded_by must be cleared on re-sync (no bitemporal zombie)"
+        );
+        let node = store.get_node(&created.node_id).unwrap().unwrap();
+        assert!(node.is_currently_valid());
+
+        // Also exercise the Unchanged branch: supersede again, re-sync same hash.
+        {
+            let writer = store.writer.lock().unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET valid_until = ?1, superseded_by = 'survivor-id' WHERE id = ?2",
+                    params![Utc::now().to_rfc3339(), created.node_id],
+                )
+                .unwrap();
+        }
+        let res2 = store
+            .upsert_by_source(source_input("9", "body v2 edited", "h9b"))
+            .unwrap();
+        assert_eq!(res2.outcome, SourceUpsertOutcome::Unchanged);
+        assert!(
+            !store
+                .superseded_node_ids()
+                .unwrap()
+                .contains(&created.node_id),
+            "Unchanged branch must also clear superseded_by"
+        );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn with_vector_search_disabled<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os(VESTIGE_DISABLE_VECTOR_SEARCH);
+
+        // Tests serialize access with ENV_LOCK because process environment
+        // mutation is global and unsafe under Rust 2024.
+        unsafe {
+            std::env::set_var(VESTIGE_DISABLE_VECTOR_SEARCH, "1");
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(f));
+
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var(VESTIGE_DISABLE_VECTOR_SEARCH, value);
+            } else {
+                std::env::remove_var(VESTIGE_DISABLE_VECTOR_SEARCH);
+            }
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_runtime_vector_gate_env_disables_index_creation() {
+        with_vector_search_disabled(|| {
+            assert!(!Storage::vector_search_enabled_by_cpu());
+            assert_eq!(
+                Storage::vector_search_unavailable_reason(),
+                Some("disabled by VESTIGE_DISABLE_VECTOR_SEARCH")
+            );
+
+            let dir = tempdir().unwrap();
+            let storage = create_test_storage_at(&dir, "vector-disabled.db");
+
+            assert!(storage.vector_index.is_none());
+            assert!(storage.query_cache.is_none());
+
+            let stats = storage.get_stats().unwrap();
+            assert_eq!(stats.total_nodes, 0);
+
+            let schema = storage.schema_introspection().unwrap();
+            assert!(schema.schema_version >= 1);
+        });
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_runtime_vector_gate_disabled_hybrid_search_uses_keyword_fallback() {
+        with_vector_search_disabled(|| {
+            let dir = tempdir().unwrap();
+            let storage = create_test_storage_at(&dir, "vector-disabled-search.db");
+
+            storage
+                .ingest(IngestInput {
+                    content: "runtime gate fallback keyword anchor".to_string(),
+                    node_type: "fact".to_string(),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let results = storage
+                .hybrid_search("runtime gate fallback keyword", 10, 0.3, 0.7)
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].match_type, MatchType::Keyword);
+            assert!(results[0].semantic_score.is_none());
+            assert!(
+                results[0]
+                    .node
+                    .content
+                    .contains("runtime gate fallback keyword anchor")
+            );
+        });
     }
 
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
@@ -6297,6 +10579,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_timestamp_accepts_rfc3339_and_sqlite_native() {
+        use chrono::TimeZone;
+
+        // Canonical writer: RFC 3339 with fractional seconds + offset.
+        let rfc =
+            Storage::parse_timestamp("2026-06-12T15:07:59.730+00:00", "last_accessed").unwrap();
+        assert_eq!(rfc.to_rfc3339(), "2026-06-12T15:07:59.730+00:00");
+
+        // External writer: SQLite-native `datetime('now')` (space separator,
+        // no timezone, no fraction) — must be tolerated, assumed UTC.
+        let sqlite = Storage::parse_timestamp("2026-06-12 15:07:59", "last_accessed").unwrap();
+        assert_eq!(
+            sqlite,
+            Utc.with_ymd_and_hms(2026, 6, 12, 15, 7, 59).unwrap()
+        );
+
+        // SQLite-native with fractional seconds.
+        let sqlite_frac =
+            Storage::parse_timestamp("2026-06-12 15:07:59.730", "last_accessed").unwrap();
+        assert_eq!(sqlite_frac.timestamp_subsec_millis(), 730);
+
+        // Genuinely malformed input still errors.
+        assert!(Storage::parse_timestamp("not-a-timestamp", "last_accessed").is_err());
+    }
+
+    #[test]
     fn test_ingest_and_get() {
         let storage = create_test_storage();
 
@@ -6365,6 +10673,622 @@ mod tests {
         let deleted = storage.delete_node(&node.id).unwrap();
         assert!(deleted);
         assert!(storage.get_node(&node.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_composition_save_query_outcome_and_never_composed() {
+        let storage = create_test_storage();
+        let first = storage
+            .ingest(IngestInput {
+                content: "Oracle drift can break delayed settlement.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-oracle".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let second = storage
+            .ingest(IngestInput {
+                content: "Withdrawal queues can settle stale claims.".to_string(),
+                node_type: "pattern".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-queue".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let third = storage
+            .ingest(IngestInput {
+                content: "Keeper roles can drift from local validation paths.".to_string(),
+                node_type: "pattern".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-role".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let before = storage
+            .get_never_composed_candidates(10, Some(&["protocolgate".to_string()]))
+            .unwrap();
+        let first_second_before = before
+            .iter()
+            .find(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &second.id)
+            })
+            .expect("uncomposed first/second pair should be ranked before any event");
+        assert!(
+            first_second_before.bridge_score > 0.0,
+            "candidate should expose a bridge score"
+        );
+        assert!(
+            first_second_before.novelty_score > 0.0,
+            "candidate should expose a novelty score"
+        );
+        assert_eq!(
+            first_second_before.outcome_signal, "clean",
+            "new candidate should start without prior outcome context"
+        );
+        assert!(
+            first_second_before
+                .composition_question
+                .contains("composed through"),
+            "candidate should include a promptable composition question"
+        );
+
+        let event = CompositionEventRecord {
+            id: "composition-test-1".to_string(),
+            created_at: Utc::now(),
+            tool: "deep_reference".to_string(),
+            mode: "bounty".to_string(),
+            query: Some("oracle drift delayed settlement".to_string()),
+            query_hash: Some("sha256:test".to_string()),
+            confidence: Some(0.87),
+            status: Some("resolved".to_string()),
+            output_preview: Some("Compose oracle drift with withdrawal queue.".to_string()),
+            metadata: serde_json::json!({"workflow": "test"}),
+        };
+        let members = vec![
+            CompositionMemberRecord {
+                event_id: event.id.clone(),
+                memory_id: first.id.clone(),
+                role: "primary".to_string(),
+                rank: 0,
+                trust: Some(0.8),
+                score: Some(0.9),
+                preview: Some(preview(&first.content, 120)),
+                metadata: serde_json::json!({}),
+            },
+            CompositionMemberRecord {
+                event_id: event.id.clone(),
+                memory_id: second.id.clone(),
+                role: "supporting".to_string(),
+                rank: 1,
+                trust: Some(0.7),
+                score: Some(0.75),
+                preview: Some(preview(&second.content, 120)),
+                metadata: serde_json::json!({}),
+            },
+        ];
+        storage.save_composition(&event, &members, &[]).unwrap();
+
+        let outcome = CompositionOutcomeRecord {
+            id: "composition-outcome-1".to_string(),
+            event_id: event.id.clone(),
+            outcome_type: "submitted".to_string(),
+            labeled_at: Utc::now(),
+            label_source: "test".to_string(),
+            confidence_delta: Some(0.1),
+            notes: Some("Report submitted".to_string()),
+            metadata: serde_json::json!({"severity": "high"}),
+        };
+        storage.record_composition_outcome(&outcome).unwrap();
+
+        let fetched = storage.get_composition_event(&event.id).unwrap().unwrap();
+        assert_eq!(fetched.mode, "bounty");
+        assert_eq!(fetched.metadata["workflow"], "test");
+
+        let fetched_members = storage.get_composition_members(&event.id).unwrap();
+        assert_eq!(fetched_members.len(), 2);
+        assert_eq!(fetched_members[0].role, "primary");
+
+        let fetched_outcomes = storage.get_composition_outcomes(&event.id).unwrap();
+        assert_eq!(fetched_outcomes.len(), 1);
+        assert_eq!(fetched_outcomes[0].outcome_type, "submitted");
+
+        let for_memory = storage.get_compositions_for_memory(&first.id, 5).unwrap();
+        assert_eq!(for_memory.len(), 1);
+        assert_eq!(for_memory[0].id, event.id);
+
+        let neighbors = storage.get_composition_neighbors(&first.id, 5).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].memory_id, second.id);
+
+        let after = storage
+            .get_never_composed_candidates(10, Some(&["protocolgate".to_string()]))
+            .unwrap();
+        assert!(
+            !after.iter().any(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &second.id)
+            }),
+            "already-composed first/second pair should be removed"
+        );
+        assert!(
+            after.iter().any(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &third.id)
+                    || pair == Storage::pair_key(&second.id, &third.id)
+            }),
+            "other protocolgate pairs should remain candidates"
+        );
+    }
+
+    #[test]
+    fn test_composition_neighbors_count_distinct_events_not_member_roles() {
+        let storage = create_test_storage();
+        let first = storage
+            .ingest(IngestInput {
+                content: "Oracle role appears once in the event.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["protocolgate".to_string(), "settlement".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let second = storage
+            .ingest(IngestInput {
+                content: "Queue role appears under two evidence roles.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["protocolgate".to_string(), "settlement".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "multi-role-neighbor-event".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "bounty".to_string(),
+                    query: Some("multi role neighbor".to_string()),
+                    query_hash: Some("fnv1a64:neighbor".to_string()),
+                    confidence: Some(0.7),
+                    status: Some("resolved".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[
+                    CompositionMemberRecord {
+                        event_id: "multi-role-neighbor-event".to_string(),
+                        memory_id: first.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.8),
+                        score: Some(0.9),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "multi-role-neighbor-event".to_string(),
+                        memory_id: second.id.clone(),
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.7),
+                        score: Some(0.8),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "multi-role-neighbor-event".to_string(),
+                        memory_id: second.id.clone(),
+                        role: "related".to_string(),
+                        rank: 2,
+                        trust: Some(0.7),
+                        score: Some(0.6),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+
+        let neighbors = storage.get_composition_neighbors(&first.id, 10).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].memory_id, second.id);
+        assert_eq!(
+            neighbors[0].composed_count, 1,
+            "one event with multiple member roles should count as one composition"
+        );
+    }
+
+    #[test]
+    fn test_never_composed_tag_filter_includes_older_tagged_candidates() {
+        let storage = create_test_storage();
+        let first = storage
+            .ingest(IngestInput {
+                content: "Older Vestige composition frontier about outcome-shaped recall."
+                    .to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["project:vestige".to_string(), "composition".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let second = storage
+            .ingest(IngestInput {
+                content: "Older Vestige composition frontier about never-composed recall."
+                    .to_string(),
+                node_type: "pattern".to_string(),
+                tags: vec!["project:vestige".to_string(), "composition".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        for idx in 0..751 {
+            storage
+                .ingest(IngestInput {
+                    content: format!("Unrelated recent memory {idx} for scan-window pressure."),
+                    node_type: "fact".to_string(),
+                    tags: vec!["unrelated".to_string()],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let candidates = storage
+            .get_never_composed_candidates(10, Some(&["project".to_string()]))
+            .unwrap();
+        assert!(
+            candidates.iter().any(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &second.id)
+            }),
+            "tag-filtered frontier should include older namespaced-tag memories outside the base scan window"
+        );
+    }
+
+    #[test]
+    fn test_never_composed_carries_prior_outcome_signal() {
+        let storage = create_test_storage();
+        let first = storage
+            .ingest(IngestInput {
+                content: "Oracle drift lane previously looked duplicate-prone.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-oracle".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let second = storage
+            .ingest(IngestInput {
+                content: "Withdrawal queue lane had weak proof.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-queue".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let third = storage
+            .ingest(IngestInput {
+                content: "Keeper settlement lane has not been composed with oracle drift."
+                    .to_string(),
+                node_type: "pattern".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-role".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let event = CompositionEventRecord {
+            id: "prior-outcome-composition".to_string(),
+            created_at: Utc::now(),
+            tool: "deep_reference".to_string(),
+            mode: "bounty".to_string(),
+            query: Some("oracle withdrawal duplicate risk".to_string()),
+            query_hash: Some("fnv1a64:prior".to_string()),
+            confidence: Some(0.4),
+            status: Some("closed".to_string()),
+            output_preview: Some("Prior composition was labeled duplicate risk.".to_string()),
+            metadata: serde_json::json!({}),
+        };
+        storage
+            .save_composition(
+                &event,
+                &[
+                    CompositionMemberRecord {
+                        event_id: event.id.clone(),
+                        memory_id: first.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.7),
+                        score: Some(0.8),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: event.id.clone(),
+                        memory_id: second.id.clone(),
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.7),
+                        score: Some(0.8),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[CompositionOutcomeRecord {
+                    id: "prior-outcome-label".to_string(),
+                    event_id: event.id.clone(),
+                    outcome_type: "duplicate_risk".to_string(),
+                    labeled_at: Utc::now(),
+                    label_source: "test".to_string(),
+                    confidence_delta: Some(-0.2),
+                    notes: Some("Duplicate family in prior lane.".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .unwrap();
+
+        let candidates = storage
+            .get_never_composed_candidates(10, Some(&["protocolgate".to_string()]))
+            .unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &third.id)
+            })
+            .expect("untried first/third pair should remain a frontier candidate");
+
+        assert!(
+            candidate
+                .prior_outcomes
+                .iter()
+                .any(|outcome| outcome == "duplicate_risk"),
+            "frontier candidate should expose prior outcome labels from either member"
+        );
+        assert_eq!(candidate.outcome_signal, "prior_duplicate_risk");
+        assert!(
+            candidate.outcome_score_adjustment < 0.0,
+            "duplicate-risk history should reduce but not hide the untried lane"
+        );
+    }
+
+    #[test]
+    fn test_never_composed_marks_mixed_prior_outcomes() {
+        let storage = create_test_storage();
+        let successful = storage
+            .ingest(IngestInput {
+                content: "Accepted release lane linked rollback evidence to install telemetry."
+                    .to_string(),
+                node_type: "decision".to_string(),
+                tags: vec![
+                    "project:vestige".to_string(),
+                    "release".to_string(),
+                    "telemetry".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let closed = storage
+            .ingest(IngestInput {
+                content: "Closed release lane linked install telemetry to out-of-scope claims."
+                    .to_string(),
+                node_type: "incident".to_string(),
+                tags: vec![
+                    "project:vestige".to_string(),
+                    "release".to_string(),
+                    "telemetry".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let success_helper = storage
+            .ingest(IngestInput {
+                content: "Helper memory for an accepted release composition.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["project:vestige".to_string(), "release".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let closed_helper = storage
+            .ingest(IngestInput {
+                content: "Helper memory for a closed release composition.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["project:vestige".to_string(), "release".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "prior-success-composition".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "release".to_string(),
+                    query: Some("accepted release lane".to_string()),
+                    query_hash: Some("fnv1a64:success".to_string()),
+                    confidence: Some(0.9),
+                    status: Some("resolved".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[
+                    CompositionMemberRecord {
+                        event_id: "prior-success-composition".to_string(),
+                        memory_id: successful.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.9),
+                        score: Some(0.9),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "prior-success-composition".to_string(),
+                        memory_id: success_helper.id,
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.7),
+                        score: Some(0.6),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[CompositionOutcomeRecord {
+                    id: "prior-success-label".to_string(),
+                    event_id: "prior-success-composition".to_string(),
+                    outcome_type: "accepted".to_string(),
+                    labeled_at: Utc::now(),
+                    label_source: "test".to_string(),
+                    confidence_delta: Some(0.2),
+                    notes: None,
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .unwrap();
+
+        storage
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "prior-closed-composition".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "release".to_string(),
+                    query: Some("closed release lane".to_string()),
+                    query_hash: Some("fnv1a64:closed".to_string()),
+                    confidence: Some(0.3),
+                    status: Some("closed".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[
+                    CompositionMemberRecord {
+                        event_id: "prior-closed-composition".to_string(),
+                        memory_id: closed.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.8),
+                        score: Some(0.7),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "prior-closed-composition".to_string(),
+                        memory_id: closed_helper.id,
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.7),
+                        score: Some(0.6),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[CompositionOutcomeRecord {
+                    id: "prior-closed-label".to_string(),
+                    event_id: "prior-closed-composition".to_string(),
+                    outcome_type: "closed_by_scope".to_string(),
+                    labeled_at: Utc::now(),
+                    label_source: "test".to_string(),
+                    confidence_delta: Some(-0.3),
+                    notes: None,
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .unwrap();
+
+        let candidates = storage
+            .get_never_composed_candidates(10, Some(&["project".to_string()]))
+            .unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&successful.id, &closed.id)
+            })
+            .expect("untried success/closed pair should remain a frontier candidate");
+
+        assert_eq!(candidate.outcome_signal, "mixed_prior_outcomes");
+        assert!(
+            candidate
+                .prior_outcomes
+                .iter()
+                .any(|outcome| outcome == "accepted")
+        );
+        assert!(
+            candidate
+                .prior_outcomes
+                .iter()
+                .any(|outcome| outcome == "closed_by_scope")
+        );
+    }
+
+    #[test]
+    fn test_never_composed_surfaces_weak_tie_shared_terms_without_shared_tags() {
+        let storage = create_test_storage();
+        let incident = storage
+            .ingest(IngestInput {
+                content:
+                    "OpenCode handshake stalls when embedding startup blocks stdio negotiation."
+                        .to_string(),
+                node_type: "incident".to_string(),
+                tags: vec!["opencode".to_string(), "startup".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let mitigation = storage
+            .ingest(IngestInput {
+                content: "JetBrains startup should keep embedding backfill behind the handshake."
+                    .to_string(),
+                node_type: "mitigation".to_string(),
+                tags: vec!["jetbrains".to_string(), "background-work".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let candidates = storage.get_never_composed_candidates(10, None).unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&incident.id, &mitigation.id)
+            })
+            .expect("shared terms should surface a weak-tie candidate without shared tags");
+
+        assert!(
+            candidate.shared_tags.is_empty(),
+            "test fixture intentionally has no shared tags"
+        );
+        assert!(
+            candidate
+                .shared_terms
+                .iter()
+                .any(|term| term == "embedding" || term == "startup" || term == "handshake"),
+            "shared terms should explain the candidate"
+        );
+        assert!(
+            candidate.bridge_score > 0.5,
+            "different tags and node types should create a bridge signal"
+        );
     }
 
     #[test]
@@ -6463,6 +11387,54 @@ mod tests {
                 activation_count: 1,
             })
             .unwrap();
+        source
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "portable-composition-1".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "bounty".to_string(),
+                    query: Some("portable composition".to_string()),
+                    query_hash: Some("sha256:portable".to_string()),
+                    confidence: Some(0.9),
+                    status: Some("resolved".to_string()),
+                    output_preview: Some("Portable composition event".to_string()),
+                    metadata: serde_json::json!({}),
+                },
+                &[
+                    CompositionMemberRecord {
+                        event_id: "portable-composition-1".to_string(),
+                        memory_id: first.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.9),
+                        score: Some(1.0),
+                        preview: Some("alpha".to_string()),
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "portable-composition-1".to_string(),
+                        memory_id: second.id.clone(),
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.8),
+                        score: Some(0.8),
+                        preview: Some("beta".to_string()),
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[CompositionOutcomeRecord {
+                    id: "portable-composition-outcome-1".to_string(),
+                    event_id: "portable-composition-1".to_string(),
+                    outcome_type: "helpful".to_string(),
+                    labeled_at: Utc::now(),
+                    label_source: "test".to_string(),
+                    confidence_delta: None,
+                    notes: None,
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .unwrap();
 
         let archive = source.export_portable_archive().unwrap();
         assert_eq!(archive.archive_format, PORTABLE_ARCHIVE_FORMAT);
@@ -6473,6 +11445,16 @@ mod tests {
                 .iter()
                 .any(|table| table.name == "knowledge_nodes" && table.rows.len() == 2)
         );
+        for table_name in [
+            "composition_events",
+            "composition_members",
+            "composition_outcomes",
+        ] {
+            assert!(
+                archive.tables.iter().any(|table| table.name == table_name),
+                "{table_name} must be included in portable archive"
+            );
+        }
 
         let target = create_test_storage_at(&target_dir, "target.db");
         let report = target
@@ -6490,6 +11472,26 @@ mod tests {
         let connections = target.get_connections_for_memory(&first.id).unwrap();
         assert_eq!(connections.len(), 1);
         assert_eq!(connections[0].target_id, second.id);
+
+        let composition = target
+            .get_composition_event("portable-composition-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(composition.mode, "bounty");
+        assert_eq!(
+            target
+                .get_composition_members("portable-composition-1")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            target
+                .get_composition_outcomes("portable-composition-1")
+                .unwrap()
+                .len(),
+            1
+        );
 
         let results = target.search("alpha", 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -6797,6 +11799,84 @@ mod tests {
     }
 
     #[test]
+    fn test_portable_merge_import_keeps_composition_members_for_newer_local_memory() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Shared memory with historical composition".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["protocolgate".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        source
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "merge-composition-1".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "bounty".to_string(),
+                    query: Some("historical composition".to_string()),
+                    query_hash: Some("sha256:historical".to_string()),
+                    confidence: Some(0.7),
+                    status: Some("resolved".to_string()),
+                    output_preview: Some("Historical composition survives merge".to_string()),
+                    metadata: serde_json::json!({}),
+                },
+                &[CompositionMemberRecord {
+                    event_id: "merge-composition-1".to_string(),
+                    memory_id: node.id.clone(),
+                    role: "primary".to_string(),
+                    rank: 0,
+                    trust: Some(0.8),
+                    score: Some(0.9),
+                    preview: Some("historical".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+                &[],
+            )
+            .unwrap();
+
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+
+        let local_time = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        {
+            let writer = target.writer.lock().unwrap();
+            writer
+                .execute(
+                    "DELETE FROM composition_members WHERE event_id = ?1",
+                    params!["merge-composition-1"],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params!["Newer local content", &local_time, &node.id],
+                )
+                .unwrap();
+        }
+
+        target
+            .import_portable_archive(&archive, PortableImportMode::Merge)
+            .unwrap();
+
+        let restored = target.get_node(&node.id).unwrap().unwrap();
+        assert_eq!(restored.content, "Newer local content");
+        let members = target
+            .get_composition_members("merge-composition-1")
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].memory_id, node.id);
+    }
+
+    #[test]
     fn test_portable_merge_import_applies_delete_tombstones() {
         let source_dir = tempdir().unwrap();
         let target_dir = tempdir().unwrap();
@@ -6841,22 +11921,71 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        source
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "portable-purge-composition".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "sync".to_string(),
+                    query: Some("portable purge preview".to_string()),
+                    query_hash: Some("fnv1a64:portable-purge".to_string()),
+                    confidence: Some(0.7),
+                    status: Some("resolved".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[CompositionMemberRecord {
+                    event_id: "portable-purge-composition".to_string(),
+                    memory_id: node.id.clone(),
+                    role: "primary".to_string(),
+                    rank: 0,
+                    trust: Some(0.8),
+                    score: Some(0.8),
+                    preview: Some("Portable purge composition preview leak".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+                &[],
+            )
+            .unwrap();
         let archive = source.export_portable_archive().unwrap();
         target
             .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
             .unwrap();
         assert!(target.get_node(&node.id).unwrap().is_some());
+        assert_eq!(
+            target
+                .get_composition_members("portable-purge-composition")
+                .unwrap()[0]
+                .preview
+                .as_deref(),
+            Some("Portable purge composition preview leak")
+        );
 
         source
             .purge_node(&node.id, Some("sync purge test"))
             .unwrap();
         let purge_archive = source.export_portable_archive().unwrap();
+        assert!(
+            !serde_json::to_string(&purge_archive)
+                .unwrap()
+                .contains("Portable purge composition preview leak"),
+            "source portable archive should not retain purged composition previews"
+        );
         let report = target
             .import_portable_archive(&purge_archive, PortableImportMode::Merge)
             .unwrap();
 
         assert!(report.rows_deleted >= 1);
         assert!(target.get_node(&node.id).unwrap().is_none());
+        assert!(
+            target
+                .get_composition_members("portable-purge-composition")
+                .unwrap()[0]
+                .preview
+                .is_none(),
+            "portable purge merge should scrub target composition previews"
+        );
 
         let writer = target.writer.lock().unwrap();
         let tombstone_count: i64 = writer
@@ -7225,6 +12354,34 @@ mod tests {
                 .unwrap();
         }
 
+        storage
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "purge-composition-preview-test".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "audit".to_string(),
+                    query: Some("purge preview leak".to_string()),
+                    query_hash: Some("fnv1a64:purge".to_string()),
+                    confidence: Some(0.7),
+                    status: Some("resolved".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[CompositionMemberRecord {
+                    event_id: "purge-composition-preview-test".to_string(),
+                    memory_id: doomed.id.clone(),
+                    role: "primary".to_string(),
+                    rank: 0,
+                    trust: Some(0.8),
+                    score: Some(0.9),
+                    preview: Some("Sensitive purge target memory preview leak".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+                &[],
+            )
+            .unwrap();
+
         let report = storage
             .purge_node(&doomed.id, Some("user requested hard purge"))
             .unwrap();
@@ -7264,6 +12421,21 @@ mod tests {
             .unwrap();
         assert_eq!(tombstone_count, 1);
 
+        let members = storage
+            .get_composition_members("purge-composition-preview-test")
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert!(
+            members[0].preview.is_none(),
+            "purge should scrub composition member previews for the purged memory"
+        );
+        let archive_json =
+            serde_json::to_string(&storage.export_portable_archive().unwrap()).unwrap();
+        assert!(
+            !archive_json.contains("Sensitive purge target memory preview leak"),
+            "portable archive should not retain purged memory content through composition previews"
+        );
+
         let has_content_column: i64 = writer
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('deletion_tombstones') WHERE name = 'content'",
@@ -7272,5 +12444,939 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_content_column, 0);
+    }
+
+    // ========================================================================
+    // Merge / Supersede controls (Phase 3 — v2.1.25)
+    //
+    // These exercise the full lifecycle without the live embedding model by
+    // seeding the `node_embeddings` table directly with the ACTIVE model name,
+    // so `get_all_embeddings` / `get_node_embedding` accept them.
+    // ========================================================================
+
+    /// Ingest a node and seed it with a controllable embedding under the active
+    /// model so similarity is deterministic in tests.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn seed_node(storage: &Storage, content: &str, tags: &[&str], vector: Vec<f32>) -> String {
+        let node = storage
+            .ingest(IngestInput {
+                content: content.to_string(),
+                node_type: "fact".to_string(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let bytes = Embedding::new(vector).to_bytes();
+        let active = storage.embedding_service.model_name().to_string();
+        let writer = storage.writer.lock().unwrap();
+        writer
+            .execute(
+                "INSERT OR REPLACE INTO node_embeddings
+                 (node_id, embedding, dimensions, model, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    &node.id,
+                    &bytes,
+                    EMBEDDING_DIMENSIONS as i32,
+                    active,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE knowledge_nodes SET has_embedding = 1 WHERE id = ?1",
+                rusqlite::params![&node.id],
+            )
+            .unwrap();
+        node.id
+    }
+
+    /// A near-unit vector pointing mostly along `axis`, so two nodes sharing an
+    /// axis are highly similar and nodes on different axes are not.
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn axis_vector(axis: usize, jitter: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; EMBEDDING_DIMENSIONS];
+        v[axis % EMBEDDING_DIMENSIONS] = 1.0;
+        v[(axis + 1) % EMBEDDING_DIMENSIONS] = jitter;
+        v
+    }
+
+    // =========================================================================
+    // Phase 1 trait-method unit tests
+    // =========================================================================
+    use crate::storage::memory_store::{
+        MemoryEdge, MemoryRecord, MemoryStore, MemoryStoreError, ModelSignature, SchedulingState,
+    };
+
+    fn make_record(content: &str) -> MemoryRecord {
+        MemoryRecord {
+            id: uuid::Uuid::new_v4(),
+            domains: vec![],
+            domain_scores: Default::default(),
+            content: content.to_string(),
+            node_type: "fact".to_string(),
+            tags: vec!["test".to_string()],
+            embedding: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Runtime::new().unwrap()
+    }
+
+    #[test]
+    fn trait_init_is_idempotent() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            s.init().await.unwrap();
+            s.init().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn trait_health_check_reports_healthy_on_fresh_db() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let h = s.health_check().await.unwrap();
+            assert!(matches!(
+                h,
+                crate::storage::memory_store::HealthStatus::Healthy
+            ));
+        });
+    }
+
+    #[test]
+    fn trait_register_model_first_write_succeeds() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "test-model".to_string(),
+            dimension: 256,
+            hash: "a".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            s.register_model(&sig).await.unwrap();
+            let got = s.registered_model().await.unwrap();
+            assert_eq!(got, Some(sig));
+        });
+    }
+
+    #[test]
+    fn trait_register_model_mismatched_write_refused() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "model-a".to_string(),
+            dimension: 256,
+            hash: "a".repeat(64),
+        };
+        let sig2 = ModelSignature {
+            name: "model-b".to_string(),
+            dimension: 256,
+            hash: "b".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            s.register_model(&sig).await.unwrap();
+            let err = s.register_model(&sig2).await.unwrap_err();
+            assert!(matches!(err, MemoryStoreError::ModelMismatch { .. }));
+        });
+    }
+
+    #[test]
+    fn trait_register_model_same_signature_idempotent() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "test-model".to_string(),
+            dimension: 256,
+            hash: "a".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            s.register_model(&sig).await.unwrap();
+            s.register_model(&sig).await.unwrap(); // second call must not error
+        });
+    }
+
+    #[test]
+    fn trait_insert_returns_uuid() {
+        let s = create_test_storage();
+        let rec = make_record("test content");
+        let expected_id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            let got = s.insert(&rec).await.unwrap();
+            assert_eq!(got, expected_id);
+        });
+    }
+
+    #[test]
+    fn trait_get_missing_returns_none() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let got = s.get(uuid::Uuid::new_v4()).await.unwrap();
+            assert!(got.is_none());
+        });
+    }
+
+    #[test]
+    fn trait_get_after_insert_round_trip() {
+        let s = create_test_storage();
+        let rec = make_record("round trip content");
+        let id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            s.insert(&rec).await.unwrap();
+            let got = s.get(id).await.unwrap().unwrap();
+            assert_eq!(got.content, "round trip content");
+            assert_eq!(got.node_type, "fact");
+            assert!(got.domains.is_empty());
+            assert!(got.domain_scores.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_update_modifies_content() {
+        let s = create_test_storage();
+        let rec = make_record("original content");
+        let id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            s.insert(&rec).await.unwrap();
+            let mut updated = s.get(id).await.unwrap().unwrap();
+            updated.content = "updated content".to_string();
+            s.update(&updated).await.unwrap();
+            let got = s.get(id).await.unwrap().unwrap();
+            assert_eq!(got.content, "updated content");
+        });
+    }
+
+    #[test]
+    fn trait_delete_removes_record() {
+        let s = create_test_storage();
+        let rec = make_record("to be deleted");
+        let id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            s.insert(&rec).await.unwrap();
+            s.delete(id).await.unwrap();
+            let got = s.get(id).await.unwrap();
+            assert!(got.is_none());
+        });
+    }
+
+    #[test]
+    fn trait_fts_search_returns_tokens_match() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec = make_record("mitochondria powerhouse cell energy");
+            s.insert(&rec).await.unwrap();
+            let results = s.fts_search("mitochondria", 10).await.unwrap();
+            assert!(!results.is_empty());
+        });
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_merge_candidates_threshold_classification() {
+        let storage = create_test_storage();
+        // Two near-identical (same axis) — should be offered as a candidate.
+        let a = seed_node(
+            &storage,
+            "Use tokio runtime for async Rust services",
+            &["rust", "async"],
+            axis_vector(3, 0.02),
+        );
+        let b = seed_node(
+            &storage,
+            "Use the tokio runtime for async Rust services",
+            &["rust", "async"],
+            axis_vector(3, 0.01),
+        );
+        // One unrelated (different axis) — must not join the cluster.
+        let _c = seed_node(
+            &storage,
+            "Prefer postgres for relational data",
+            &["db"],
+            axis_vector(200, 0.0),
+        );
+
+        let policy = MergePolicy::default();
+        let candidates = storage.merge_candidates(policy, 20, &[]).unwrap();
+        assert_eq!(candidates.len(), 1, "exactly one duplicate cluster");
+        let cluster = &candidates[0];
+        assert_eq!(cluster.member_ids.len(), 2);
+        assert!(cluster.member_ids.contains(&a));
+        assert!(cluster.member_ids.contains(&b));
+        assert!(
+            cluster.confidence >= policy.possible_threshold,
+            "confidence above possible threshold"
+        );
+        assert!(!cluster.has_protected_member);
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_plan_merge_is_preview_only_no_mutation() {
+        let storage = create_test_storage();
+        let a = seed_node(
+            &storage,
+            "Fact A about caching",
+            &["perf"],
+            axis_vector(5, 0.02),
+        );
+        let b = seed_node(
+            &storage,
+            "Fact A about caching, expanded",
+            &["perf", "cache"],
+            axis_vector(5, 0.01),
+        );
+
+        let plan = storage
+            .plan_merge(&[a.clone(), b.clone()], None, MergePolicy::default())
+            .unwrap();
+
+        // Plan diff is populated...
+        assert!(plan.result_content.contains("Fact A about caching"));
+        assert!(plan.result_tags.contains(&"cache".to_string()));
+        assert_eq!(plan.invalidated_ids.len(), 1);
+
+        // ...but NOTHING changed: both nodes still valid, content untouched.
+        let na = storage.get_node(&a).unwrap().unwrap();
+        let nb = storage.get_node(&b).unwrap().unwrap();
+        assert_eq!(na.content, "Fact A about caching");
+        assert_eq!(nb.content, "Fact A about caching, expanded");
+        let (vu_a, sb_a) = storage.read_bitemporal(&a).unwrap();
+        let (vu_b, sb_b) = storage.read_bitemporal(&b).unwrap();
+        assert!(vu_a.is_none() && sb_a.is_none());
+        assert!(vu_b.is_none() && sb_b.is_none());
+
+        // Plan persisted as pending.
+        assert_eq!(
+            storage.plan_status(&plan.id).unwrap().as_deref(),
+            Some("pending")
+        );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_apply_then_undo_merge_is_reversible() {
+        let storage = create_test_storage();
+        let survivor = seed_node(
+            &storage,
+            "Keep this canonical note",
+            &["x"],
+            axis_vector(7, 0.02),
+        );
+        let absorbed = seed_node(
+            &storage,
+            "Extra detail to fold in",
+            &["x", "y"],
+            axis_vector(7, 0.01),
+        );
+
+        let plan = storage
+            .plan_merge(
+                &[survivor.clone(), absorbed.clone()],
+                Some(&survivor),
+                MergePolicy::default(),
+            )
+            .unwrap();
+        let op = storage.apply_plan(&plan.id, true).unwrap();
+        assert_eq!(op.op_type, "merge");
+
+        // After apply: survivor content merged, absorbed bitemporally invalidated
+        // but STILL QUERYABLE (never deleted).
+        let surv = storage.get_node(&survivor).unwrap().unwrap();
+        assert!(surv.content.contains("Keep this canonical note"));
+        assert!(surv.content.contains("Extra detail to fold in"));
+        assert!(surv.tags.contains(&"y".to_string()));
+
+        let (vu, sb) = storage.read_bitemporal(&absorbed).unwrap();
+        assert!(vu.is_some(), "absorbed node stamped valid_until");
+        assert_eq!(sb.as_deref(), Some(survivor.as_str()));
+        // Old node is still fully retrievable for audit.
+        assert!(
+            storage.get_node(&absorbed).unwrap().is_some(),
+            "superseded node remains queryable"
+        );
+        assert!(storage.superseded_node_ids().unwrap().contains(&absorbed));
+
+        // Undo restores everything.
+        let undo = storage.merge_undo(&op.id).unwrap();
+        assert_eq!(undo.op_type, "undo");
+        let surv_after = storage.get_node(&survivor).unwrap().unwrap();
+        assert_eq!(surv_after.content, "Keep this canonical note");
+        let (vu2, sb2) = storage.read_bitemporal(&absorbed).unwrap();
+        assert!(
+            vu2.is_none() && sb2.is_none(),
+            "invalidation cleared on undo"
+        );
+        assert!(!storage.superseded_node_ids().unwrap().contains(&absorbed));
+
+        // The original op is now marked reverted; double-undo is rejected.
+        assert!(storage.merge_undo(&op.id).is_err());
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_supersede_invalidates_old_but_keeps_it_queryable() {
+        let storage = create_test_storage();
+        let old = seed_node(&storage, "LR should be 1e-4", &["ml"], axis_vector(9, 0.02));
+        let new = seed_node(
+            &storage,
+            "Correction: LR should be 3e-4",
+            &["ml"],
+            axis_vector(9, 0.01),
+        );
+
+        let plan = storage
+            .plan_supersede(&old, &new, MergePolicy::default())
+            .unwrap();
+        // Preview did not mutate.
+        let (vu0, _) = storage.read_bitemporal(&old).unwrap();
+        assert!(vu0.is_none());
+
+        let op = storage.apply_plan(&plan.id, true).unwrap();
+        assert_eq!(op.op_type, "supersede");
+
+        let (vu, sb) = storage.read_bitemporal(&old).unwrap();
+        assert!(vu.is_some(), "old stamped valid_until");
+        assert_eq!(sb.as_deref(), Some(new.as_str()));
+        // New node untouched and valid.
+        let (vu_new, sb_new) = storage.read_bitemporal(&new).unwrap();
+        assert!(vu_new.is_none() && sb_new.is_none());
+        // Old still queryable for audit (invalidate, don't delete).
+        let old_node = storage.get_node(&old).unwrap().unwrap();
+        assert_eq!(old_node.content, "LR should be 1e-4");
+
+        // And reversible.
+        storage.merge_undo(&op.id).unwrap();
+        let (vu_r, sb_r) = storage.read_bitemporal(&old).unwrap();
+        assert!(vu_r.is_none() && sb_r.is_none());
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_protect_blocks_merge_away() {
+        let storage = create_test_storage();
+        let pinned = seed_node(
+            &storage,
+            "Load-bearing fact",
+            &["pin"],
+            axis_vector(11, 0.02),
+        );
+        let other = seed_node(
+            &storage,
+            "Load-bearing fact restated",
+            &["pin"],
+            axis_vector(11, 0.01),
+        );
+        storage.set_protected(&pinned, true).unwrap();
+        assert!(storage.is_protected(&pinned).unwrap());
+
+        // Protected node may not be merged AWAY (survivor=other).
+        let err = storage.plan_merge(
+            &[other.clone(), pinned.clone()],
+            Some(&other),
+            MergePolicy::default(),
+        );
+        assert!(err.is_err(), "merging a protected node away must fail");
+
+        // But it CAN be the survivor.
+        let ok = storage.plan_merge(
+            &[pinned.clone(), other.clone()],
+            Some(&pinned),
+            MergePolicy::default(),
+        );
+        assert!(ok.is_ok(), "protected node can be the survivor");
+
+        // Supersede of a protected node is also blocked.
+        assert!(
+            storage
+                .plan_supersede(&pinned, &other, MergePolicy::default())
+                .is_err(),
+            "superseding a protected node must fail"
+        );
+
+        // merge_candidates flags the protected member.
+        let cands = storage
+            .merge_candidates(MergePolicy::default(), 20, &[])
+            .unwrap();
+        assert!(cands.iter().all(|c| c.has_protected_member));
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_apply_requires_confirm_for_low_confidence() {
+        let storage = create_test_storage();
+        // Tighten thresholds so a moderate pair lands in 'possible' (needs confirm).
+        let strict = MergePolicy::new(0.99, 0.5, false);
+        storage.set_merge_policy(strict).unwrap();
+
+        let a = seed_node(&storage, "Topic alpha note", &["t"], axis_vector(13, 0.30));
+        let b = seed_node(&storage, "Topic alpha aside", &["t"], axis_vector(13, 0.60));
+        let plan = storage
+            .plan_merge(&[a, b], None, storage.get_merge_policy().unwrap())
+            .unwrap();
+        assert_ne!(plan.classification, MatchClass::Match);
+
+        // Without confirm => rejected.
+        assert!(storage.apply_plan(&plan.id, false).is_err());
+        // With confirm => applied.
+        assert!(storage.apply_plan(&plan.id, true).is_ok());
+        // Re-applying an applied plan => rejected.
+        assert!(storage.apply_plan(&plan.id, true).is_err());
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_merge_policy_roundtrip_persists() {
+        let storage = create_test_storage();
+        let p = MergePolicy::new(0.9, 0.6, true);
+        storage.set_merge_policy(p).unwrap();
+        let got = storage.get_merge_policy().unwrap();
+        assert!((got.match_threshold - 0.9).abs() < 1e-6);
+        assert!((got.possible_threshold - 0.6).abs() < 1e-6);
+        assert!(got.auto_apply);
+    }
+
+    #[test]
+    fn test_set_protected_unknown_node_errors() {
+        let storage = create_test_storage();
+        assert!(storage.set_protected("does-not-exist", true).is_err());
+    }
+
+    #[test]
+    fn trait_hybrid_search_multi_word_via_insert() {
+        // Verify that hybrid_search finds records inserted via the trait insert()
+        // even when no embedding is present (keyword path via terms matching).
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec = make_record("quantum entanglement superposition physics");
+            s.insert(&rec).await.unwrap();
+            let results = s.hybrid_search("quantum physics", 10, 0.3, 0.7).unwrap();
+            assert!(
+                !results.is_empty(),
+                "hybrid_search must find record containing 'quantum' and 'physics'"
+            );
+        });
+    }
+
+    #[test]
+    fn trait_scheduling_round_trip() {
+        let s = create_test_storage();
+        let rec = make_record("fsrs scheduling test");
+        let id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            s.insert(&rec).await.unwrap();
+            let state = SchedulingState {
+                memory_id: id,
+                stability: 5.0,
+                difficulty: 0.4,
+                retrievability: 0.8,
+                last_review: Some(chrono::Utc::now()),
+                next_review: Some(chrono::Utc::now() + chrono::Duration::days(7)),
+                reps: 3,
+                lapses: 1,
+            };
+            s.update_scheduling(&state).await.unwrap();
+            let got = s.get_scheduling(id).await.unwrap().unwrap();
+            assert!((got.stability - 5.0).abs() < 0.01);
+        });
+    }
+
+    #[test]
+    fn trait_get_scheduling_missing_returns_none() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let got = s.get_scheduling(uuid::Uuid::new_v4()).await.unwrap();
+            assert!(got.is_none());
+        });
+    }
+
+    #[test]
+    fn trait_get_due_memories_returns_in_order() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            for i in 0..3usize {
+                let rec = make_record(&format!("due memory {i}"));
+                let id = rec.id;
+                s.insert(&rec).await.unwrap();
+                let state = SchedulingState {
+                    memory_id: id,
+                    stability: 1.0,
+                    difficulty: 0.3,
+                    retrievability: 0.5,
+                    last_review: Some(chrono::Utc::now()),
+                    next_review: Some(chrono::Utc::now() - chrono::Duration::days(3 - i as i64)),
+                    reps: 1,
+                    lapses: 0,
+                };
+                s.update_scheduling(&state).await.unwrap();
+            }
+            let due = s.get_due_memories(chrono::Utc::now(), 10).await.unwrap();
+            assert_eq!(due.len(), 3);
+        });
+    }
+
+    #[test]
+    fn trait_add_edge_is_idempotent() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec_a = make_record("node a");
+            let rec_b = make_record("node b");
+            let id_a = rec_a.id;
+            let id_b = rec_b.id;
+            s.insert(&rec_a).await.unwrap();
+            s.insert(&rec_b).await.unwrap();
+            let edge = MemoryEdge {
+                source_id: id_a,
+                target_id: id_b,
+                edge_type: "semantic".to_string(),
+                weight: 0.9,
+                created_at: chrono::Utc::now(),
+            };
+            s.add_edge(&edge).await.unwrap();
+            s.add_edge(&edge).await.unwrap(); // idempotent
+            let edges = s.get_edges(id_a, None).await.unwrap();
+            let filtered: Vec<_> = edges
+                .iter()
+                .filter(|e| e.source_id == id_a && e.target_id == id_b)
+                .collect();
+            assert_eq!(filtered.len(), 1, "edge must not be duplicated");
+        });
+    }
+
+    #[test]
+    fn trait_get_edges_filters_by_type() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec_a = make_record("filter a");
+            let rec_b = make_record("filter b");
+            let id_a = rec_a.id;
+            let id_b = rec_b.id;
+            s.insert(&rec_a).await.unwrap();
+            s.insert(&rec_b).await.unwrap();
+            let edge = MemoryEdge {
+                source_id: id_a,
+                target_id: id_b,
+                edge_type: "causal".to_string(),
+                weight: 0.5,
+                created_at: chrono::Utc::now(),
+            };
+            s.add_edge(&edge).await.unwrap();
+            let causal = s.get_edges(id_a, Some("causal")).await.unwrap();
+            assert!(!causal.is_empty());
+            let semantic = s.get_edges(id_a, Some("semantic")).await.unwrap();
+            assert!(semantic.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_remove_edge_deletes_single() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec_a = make_record("rm edge a");
+            let rec_b = make_record("rm edge b");
+            let id_a = rec_a.id;
+            let id_b = rec_b.id;
+            s.insert(&rec_a).await.unwrap();
+            s.insert(&rec_b).await.unwrap();
+            let edge = MemoryEdge {
+                source_id: id_a,
+                target_id: id_b,
+                edge_type: "semantic".to_string(),
+                weight: 0.7,
+                created_at: chrono::Utc::now(),
+            };
+            s.add_edge(&edge).await.unwrap();
+            s.remove_edge(id_a, id_b).await.unwrap();
+            let edges = s.get_edges(id_a, None).await.unwrap();
+            assert!(edges.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_get_neighbors_bfs_depth_zero_returns_self_only() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec = make_record("depth zero");
+            let id = rec.id;
+            s.insert(&rec).await.unwrap();
+            let neighbors = s.get_neighbors(id, 0).await.unwrap();
+            assert_eq!(neighbors.len(), 1);
+            assert_eq!(neighbors[0].0.id, id);
+        });
+    }
+
+    #[test]
+    fn trait_get_neighbors_bfs_depth_two_expands() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec_a = make_record("bfs node a");
+            let rec_b = make_record("bfs node b");
+            let rec_c = make_record("bfs node c");
+            let id_a = rec_a.id;
+            let id_b = rec_b.id;
+            let id_c = rec_c.id;
+            s.insert(&rec_a).await.unwrap();
+            s.insert(&rec_b).await.unwrap();
+            s.insert(&rec_c).await.unwrap();
+            s.add_edge(&MemoryEdge {
+                source_id: id_a,
+                target_id: id_b,
+                edge_type: "semantic".to_string(),
+                weight: 1.0,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+            s.add_edge(&MemoryEdge {
+                source_id: id_b,
+                target_id: id_c,
+                edge_type: "semantic".to_string(),
+                weight: 1.0,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+            let neighbors = s.get_neighbors(id_a, 2).await.unwrap();
+            let ids: Vec<uuid::Uuid> = neighbors.iter().map(|(r, _)| r.id).collect();
+            assert!(ids.contains(&id_a));
+            assert!(ids.contains(&id_b));
+            assert!(ids.contains(&id_c));
+        });
+    }
+
+    #[test]
+    fn trait_list_domains_empty_in_phase_1() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let domains = s.list_domains().await.unwrap();
+            assert!(domains.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_upsert_then_get_domain_round_trip() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let domain = crate::storage::memory_store::Domain {
+                id: "dev".to_string(),
+                label: "Development".to_string(),
+                centroid: vec![0.1, 0.2, 0.3],
+                top_terms: vec!["rust".to_string(), "code".to_string()],
+                memory_count: 42,
+                created_at: chrono::Utc::now(),
+            };
+            s.upsert_domain(&domain).await.unwrap();
+            let got = s.get_domain("dev").await.unwrap().unwrap();
+            assert_eq!(got.id, "dev");
+            assert_eq!(got.memory_count, 42);
+        });
+    }
+
+    #[test]
+    fn trait_delete_domain_idempotent() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            s.delete_domain("nonexistent").await.unwrap();
+            s.delete_domain("nonexistent").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn trait_classify_with_no_domains_returns_empty() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let result = s.classify(&[0.1, 0.2, 0.3]).await.unwrap();
+            assert!(result.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_count_matches_insert_count() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            for i in 0..5usize {
+                let rec = make_record(&format!("count test {i}"));
+                s.insert(&rec).await.unwrap();
+            }
+            assert_eq!(s.count().await.unwrap(), 5);
+        });
+    }
+
+    #[test]
+    fn trait_get_stats_reports_registered_model() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "test-model".to_string(),
+            dimension: 256,
+            hash: "c".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            use crate::storage::memory_store::MemoryStore;
+            // Cast to &dyn MemoryStore so the async trait method is called
+            // instead of the inherent sync get_stats() on SqliteMemoryStore.
+            let dyn_s: &dyn MemoryStore = &s;
+            dyn_s.register_model(&sig).await.unwrap();
+            let stats = dyn_s.get_stats().await.unwrap();
+            assert_eq!(stats.registered_model_name, Some("test-model".to_string()));
+            assert_eq!(stats.registered_model_dim, Some(256));
+        });
+    }
+
+    #[test]
+    fn trait_vacuum_succeeds() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            s.vacuum().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn trait_insert_refuses_dimension_mismatch() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "test-model".to_string(),
+            dimension: 256,
+            hash: "d".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            s.register_model(&sig).await.unwrap();
+            // Build a record with wrong dimension (512 instead of 256) and
+            // declare the model signature in metadata
+            let mut rec = make_record("dimension mismatch");
+            rec.embedding = Some(vec![0.0f32; 512]);
+            rec.metadata = serde_json::json!({
+                "model_name": "test-model",
+                "model_dim": 256_u64,
+                "model_hash": "d".repeat(64),
+            });
+            let err = s.insert(&rec).await.unwrap_err();
+            assert!(
+                matches!(err, MemoryStoreError::InvalidInput(_)),
+                "expected InvalidInput, got {:?}",
+                err
+            );
+        });
+    }
+
+    // Seed a node's stability directly via the scheduling seam so the +365 cap
+    // in promote_memory_backfill is actually exercised (a freshly ingested node
+    // has low stability where the *1.5 multiply, not the additive ceiling, wins).
+    fn seed_stability(s: &Storage, id: &str, stability: f64) {
+        use crate::storage::memory_store::{MemoryStoreSend, SchedulingState};
+        rt().block_on(async {
+            let state = SchedulingState {
+                memory_id: uuid::Uuid::parse_str(id).unwrap(),
+                stability,
+                difficulty: 0.4,
+                retrievability: 0.8,
+                last_review: Some(chrono::Utc::now()),
+                next_review: Some(chrono::Utc::now() + chrono::Duration::days(7)),
+                reps: 3,
+                lapses: 0,
+            };
+            MemoryStoreSend::update_scheduling(s, &state)
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn promote_memory_backfill_caps_stability_at_plus_365() {
+        // Above the crossover (stability=730) the additive +365 ceiling must win
+        // over the *1.5 multiply, so repeated backfill promotions cannot inflate
+        // stability without bound. This is the bound issue #103 asked us to apply.
+        let s = create_test_storage();
+        let node = s
+            .ingest(IngestInput {
+                content: "high-stability cause memory".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        seed_stability(&s, &node.id, 1000.0);
+
+        let promoted = s.promote_memory_backfill(&node.id).unwrap();
+        // 1000 * 1.5 = 1500 (uncapped) vs 1000 + 365 = 1365 (capped). Cap wins.
+        assert!(
+            (promoted.stability - 1365.0).abs() < 1e-6,
+            "expected additive +365 cap (1365.0), got {} (uncapped would be 1500.0)",
+            promoted.stability
+        );
+    }
+
+    #[test]
+    fn promote_memory_backfill_uses_multiply_below_crossover() {
+        // Below the crossover the *1.5 multiply wins (the cap never binds), so
+        // backfill promotion strength is unchanged from the old promote_memory.
+        let s = create_test_storage();
+        let node = s
+            .ingest(IngestInput {
+                content: "low-stability cause memory".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        seed_stability(&s, &node.id, 10.0);
+
+        let promoted = s.promote_memory_backfill(&node.id).unwrap();
+        // 10 * 1.5 = 15 (multiply) vs 10 + 365 = 375 (cap). Multiply wins.
+        assert!(
+            (promoted.stability - 15.0).abs() < 1e-6,
+            "expected *1.5 multiply (15.0) below crossover, got {}",
+            promoted.stability
+        );
+    }
+
+    #[test]
+    fn backfill_autofire_gate_defaults_on_and_reads_opt_out() {
+        // v2.2.1 opt-out semantics: unset => ON (preserves shipped v2.2.0
+        // behavior); explicit 0/false/off/no => OFF; anything else => ON.
+        fn parse(v: Option<&str>) -> bool {
+            v.map(|v| {
+                let v = v.trim();
+                !(v.eq_ignore_ascii_case("false")
+                    || v.eq_ignore_ascii_case("off")
+                    || v.eq_ignore_ascii_case("no")
+                    || v == "0")
+            })
+            .unwrap_or(true)
+        }
+        assert!(parse(None), "unset must default ON");
+        assert!(parse(Some("1")), "1 is ON");
+        assert!(parse(Some("true")), "true is ON");
+        assert!(parse(Some("anything")), "unrecognized is ON");
+        assert!(!parse(Some("0")), "0 is OFF");
+        assert!(!parse(Some("false")), "false is OFF");
+        assert!(!parse(Some("OFF")), "OFF (case-insensitive) is OFF");
+        assert!(!parse(Some(" no ")), "whitespace-padded no is OFF (trim)");
     }
 }

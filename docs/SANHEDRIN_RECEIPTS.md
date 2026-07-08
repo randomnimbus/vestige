@@ -12,6 +12,8 @@ instead of opaque. The current schema is `vestige.sanhedrin.receipt.v1`.
 - Appeals: `~/.vestige/sanhedrin/appeals.jsonl`
 - Fail-open events: `~/.vestige/sanhedrin/fail-open.jsonl`
 
+Optional companion schema: [`SANHEDRIN_TEST_INTEGRITY_DELTAS.md`](SANHEDRIN_TEST_INTEGRITY_DELTAS.md) describes mechanical deltas for cases where a verifier command passed but the test artifact changed after implementation.
+
 ## v1 JSON Shape
 
 ```json

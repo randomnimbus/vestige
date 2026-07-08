@@ -20,7 +20,7 @@ use crate::protocol::messages::{
 use crate::protocol::types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, MCP_VERSION};
 use crate::resources;
 use crate::tools;
-use vestige_core::Storage;
+use vestige_core::{OutputConfig, Storage, VestigeConfig};
 
 /// Build the MCP `instructions` string injected into every connecting client's
 /// system prompt.
@@ -77,17 +77,31 @@ pub struct McpServer {
     tool_call_count: AtomicU64,
     /// Optional event broadcast channel for dashboard real-time updates.
     event_tx: Option<broadcast::Sender<VestigeEvent>>,
+    /// Resolved output config from `<data_dir>/vestige.toml` (Phase 2). Tools
+    /// use it as the fallback for detail/limit when no explicit MCP param is
+    /// given; explicit params always win.
+    output_config: Arc<OutputConfig>,
+}
+
+/// Load `vestige.toml` from the storage's data directory and resolve it to an
+/// effective [`OutputConfig`]. A missing/malformed file yields the built-in
+/// default, which preserves historical behavior.
+fn load_output_config(storage: &Arc<Storage>) -> Arc<OutputConfig> {
+    let config = VestigeConfig::load_from_data_dir(storage.data_dir());
+    Arc::new(config.output())
 }
 
 impl McpServer {
     #[allow(dead_code)]
     pub fn new(storage: Arc<Storage>, cognitive: Arc<Mutex<CognitiveEngine>>) -> Self {
+        let output_config = load_output_config(&storage);
         Self {
             storage,
             cognitive,
             initialized: false,
             tool_call_count: AtomicU64::new(0),
             event_tx: None,
+            output_config,
         }
     }
 
@@ -97,12 +111,14 @@ impl McpServer {
         cognitive: Arc<Mutex<CognitiveEngine>>,
         event_tx: broadcast::Sender<VestigeEvent>,
     ) -> Self {
+        let output_config = load_output_config(&storage);
         Self {
             storage,
             cognitive,
             initialized: false,
             tool_call_count: AtomicU64::new(0),
             event_tx: Some(event_tx),
+            output_config,
         }
     }
 
@@ -224,19 +240,25 @@ impl McpServer {
 
     /// Handle tools/list request
     async fn handle_tools_list(&self) -> Result<serde_json::Value, JsonRpcError> {
-        // v2.1.21: 25 tools (verified by the `tools.len() == 25` assertion in the
-        // handle_tools_list test below — the `suppress` tool landed in v2.0.5).
-        // Deprecated tools still work via redirects in handle_tools_call.
+        // v2.2: 12 advertised tools after Layer-1 Tool Consolidation
+        // (verified by `tools.len() == 12` in test_tools_list_returns_all_tools).
+        // 22 deprecated/folded names still work as hidden redirects in
+        // handle_tools_call. See docs/launch/tool-consolidation-v2.2.0.md.
         let mut tools = vec![
+            // ================================================================
+            // RECALL — unified retrieval tool (v2.2). HOT PATH.
+            // Folds search + deep_reference + cross_reference + contradictions.
+            // mode='lookup' (default) is a zero-overhead pass-through to search.
+            // ================================================================
+            ToolDescription {
+                name: "recall".to_string(),
+                description: Some("Retrieve from memory. Modes: 'lookup' (default — fast hybrid search: keyword + semantic + convex fusion, auto-strengthens on access; use for plain recall), 'reason' (deep cognitive reasoning across memories with FSRS-6 trust scoring, spreading activation, supersession, and contradiction analysis; use when accuracy matters, needs 'query'), 'contradictions' (surface trust-weighted disagreement pairs for a 'topic'). Default mode is fast — only 'reason' pays the deep-analysis cost.".to_string()),
+                input_schema: tools::recall::schema(),
+                ..Default::default()
+            },
             // ================================================================
             // UNIFIED TOOLS (v1.1+)
             // ================================================================
-            ToolDescription {
-                name: "search".to_string(),
-                description: Some("Unified search tool. Uses hybrid search (keyword + semantic + convex combination fusion) internally. Auto-strengthens memories on access (Testing Effect).".to_string()),
-                input_schema: tools::search_unified::schema(),
-                ..Default::default()
-            },
             ToolDescription {
                 name: "memory".to_string(),
                 description: Some("Unified memory management tool. Actions: 'get' (retrieve full node), 'purge' (irreversibly remove content/embeddings with confirm=true), 'delete' (legacy alias for purge), 'state' (get accessibility state), 'promote' (thumbs up — increases retrieval strength), 'demote' (thumbs down — decreases retrieval strength, does NOT delete), 'edit' (update content in-place, preserves FSRS state).".to_string()),
@@ -265,143 +287,85 @@ impl McpServer {
                 ..Default::default()
             },
             // ================================================================
-            // TEMPORAL TOOLS (v1.2+)
+            // EXTERNAL-SOURCE CONNECTORS (#57)
             // ================================================================
             ToolDescription {
-                name: "memory_timeline".to_string(),
-                description: Some("Browse memories chronologically. Returns memories in a time range, grouped by day. Defaults to last 7 days.".to_string()),
-                input_schema: tools::timeline::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "memory_changelog".to_string(),
-                description: Some("View audit trail of memory changes. Per-memory: state transitions. System-wide: consolidations + recent state changes.".to_string()),
-                input_schema: tools::changelog::schema(),
+                name: "source_sync".to_string(),
+                description: Some("Index an external system into Vestige as a durable, offline, semantically-searchable index that cites back to the canonical record. GitHub: source='github', repo='owner/name' (auth via GITHUB_TOKEN env). Redmine: source='redmine', project='<id>' (host via REDMINE_URL, auth via REDMINE_API_KEY env). Idempotent: re-running updates changed issues without duplicating; set reconcile=true to tombstone issues removed upstream.".to_string()),
+                input_schema: tools::source_sync::schema(),
                 ..Default::default()
             },
             // ================================================================
-            // MAINTENANCE TOOLS (v1.7: system_status replaces health_check + stats)
+            // STATUS / TEMPORAL — unified `memory_status` tool (v2.2)
+            // Folds system_status + memory_health + memory_timeline +
+            // memory_changelog into one view-dispatched surface.
             // ================================================================
             ToolDescription {
-                name: "system_status".to_string(),
-                description: Some("Combined system health and statistics. Returns status (healthy/degraded/critical/empty), full stats, FSRS preview, cognitive module health, state distribution, warnings, and recommendations.".to_string()),
-                input_schema: tools::maintenance::system_status_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "consolidate".to_string(),
-                description: Some("Run FSRS-6 memory consolidation cycle. Applies decay, generates embeddings, and performs maintenance. Use when memories seem stale.".to_string()),
-                input_schema: tools::maintenance::consolidate_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "backup".to_string(),
-                description: Some("Create a SQLite database backup. Returns the backup file path.".to_string()),
-                input_schema: tools::maintenance::backup_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "export".to_string(),
-                description: Some("Export memories as JSON or JSONL. Supports tag and date filters.".to_string()),
-                input_schema: tools::maintenance::export_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "gc".to_string(),
-                description: Some("Garbage collect stale memories below retention threshold. Defaults to dry_run=true for safety.".to_string()),
-                input_schema: tools::maintenance::gc_schema(),
+                name: "memory_status".to_string(),
+                description: Some("Memory status & history. Views: 'health' (default — full system health + stats + FSRS preview + cognitive-module health + warnings + recommendations), 'retention' (lightweight retention dashboard: avg, distribution, trend), 'timeline' (browse memories chronologically, grouped by day), 'changelog' (audit trail of memory state changes — per-memory transitions or system-wide).".to_string()),
+                input_schema: tools::memory_status::schema(),
                 ..Default::default()
             },
             // ================================================================
-            // AUTO-SAVE & DEDUP TOOLS (v1.3+)
+            // MAINTAIN — unified maintenance/lifecycle tool (v2.2)
+            // Folds consolidate + dream + gc + importance_score + backup +
+            // export + restore into one action-dispatched surface.
             // ================================================================
             ToolDescription {
-                name: "importance_score".to_string(),
-                description: Some("Score content importance using 4-channel neuroscience model (novelty/arousal/reward/attention). Returns composite score, channel breakdown, encoding boost, and explanations.".to_string()),
-                input_schema: tools::importance::schema(),
+                name: "maintain".to_string(),
+                description: Some("Memory maintenance & lifecycle. Actions: 'consolidate' (run FSRS-6 decay/embedding cycle), 'dream' (replay memories → insights/connections + strengthen patterns), 'gc' (garbage-collect stale memories; dry_run=true by default for safety), 'importance_score' (4-channel neuroscience score for 'content'), 'backup' (SQLite DB backup), 'export' (memories as JSON/JSONL with tag/date filters), 'restore' (restore from a JSON backup at 'path').".to_string()),
+                input_schema: tools::maintain::schema(),
                 ..Default::default()
             },
+            // ================================================================
+            // DEDUP / MERGE / SUPERSEDE — unified `dedup` tool (v2.2)
+            // Folds find_duplicates + the 7 Phase-3 merge tools into one
+            // action-dispatched surface. Diff-previewed, confidence-gated,
+            // reversible, never silent; bitemporal-never-delete preserved.
+            // ================================================================
             ToolDescription {
-                name: "find_duplicates".to_string(),
-                description: Some("Find duplicate and near-duplicate memory clusters using cosine similarity on embeddings. Returns clusters with suggested actions (merge/review). Use to clean up redundant memories.".to_string()),
-                input_schema: tools::dedup::schema(),
+                name: "dedup".to_string(),
+                description: Some("Deduplication & merge/supersede. Actions: 'scan' (default — surface duplicate clusters via cosine + merge candidates via Fellegi-Sunter, read-only), 'plan_merge' (preview a reversible merge plan for 2+ member_ids → plan_id), 'plan_supersede' (preview superseding old_id with new_id → plan_id), 'apply' (execute a plan_id; 'possible'/'non_match' need confirm=true), 'undo' (reverse an operation_id, or omit to list the reflog), 'protect' (pin a memory against auto-merge/supersede/forget), 'policy' (get/set Fellegi-Sunter thresholds). Old memories are invalidated, never deleted.".to_string()),
+                input_schema: tools::dedup::unified_schema(),
                 ..Default::default()
             },
             // ================================================================
             // COGNITIVE TOOLS (v1.5+)
+            // (dream folded into `maintain` action='dream' in v2.2)
+            // ================================================================
+            // ================================================================
+            // GRAPH — unified graph/association/prediction tool (v2.2)
+            // Folds explore_connections + predict + memory_graph + composed_graph.
             // ================================================================
             ToolDescription {
-                name: "dream".to_string(),
-                description: Some("Trigger memory dreaming — replays recent memories to discover hidden connections, synthesize insights, and strengthen important patterns. Returns insights, connections, and dream stats.".to_string()),
-                input_schema: tools::dream::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "explore_connections".to_string(),
-                description: Some("Graph exploration tool for memory connections. Actions: 'chain' (build reasoning path between memories), 'associations' (find related memories via spreading activation + hippocampal index), 'bridges' (find connecting memories between two nodes).".to_string()),
-                input_schema: tools::explore::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "predict".to_string(),
-                description: Some("Proactive memory prediction — predicts what memories you'll need next based on context, recent activity, and learned patterns. Returns predictions, suggestions, and speculative retrievals.".to_string()),
-                input_schema: tools::predict::schema(),
+                name: "graph".to_string(),
+                description: Some("Memory graph & associations. Actions: 'chain' (reasoning path from→to), 'associations' (related memories via spreading activation, needs 'from'), 'bridges' (connectors between from/to), 'predict' (what memories you'll need next, from 'context'), 'memory_graph' (force-directed subgraph for viz, from center_id or query), 'recent'/'get'/'memory'/'neighbors'/'never_composed'/'bounty_mode' (composition topology), 'label' (record a composition outcome — the only write).".to_string()),
+                input_schema: tools::graph_unified::schema(),
                 ..Default::default()
             },
             // ================================================================
             // RESTORE TOOL (v1.5+)
+            // (folded into `maintain` action='restore' in v2.2)
             // ================================================================
-            ToolDescription {
-                name: "restore".to_string(),
-                description: Some("Restore memories from a JSON backup file. Supports MCP wrapper format, RecallResult format, and direct memory array format.".to_string()),
-                input_schema: tools::restore::schema(),
-                ..Default::default()
-            },
             // ================================================================
             // CONTEXT PACKETS (v1.8+)
             // ================================================================
             ToolDescription {
-                name: "session_context".to_string(),
-                description: Some("One-call session initialization. Combines search, intentions, status, predictions, and codebase context into a single token-budgeted response. Replaces 5 separate calls at session start.".to_string()),
+                name: "session_start".to_string(),
+                description: Some("One-call session initialization. Combines search, intentions, status, predictions, and codebase context into a single token-budgeted response. Call this once at the start of a session instead of 5 separate calls. (Renamed from 'session_context' in v2.2.)".to_string()),
                 input_schema: tools::session_context::schema(),
                 ..Default::default()
             },
             // ================================================================
             // AUTONOMIC TOOLS (v1.9+)
+            // (memory_health → `memory_status` view='retention';
+            //  memory_graph + composed_graph → `graph`, all in v2.2)
             // ================================================================
-            ToolDescription {
-                name: "memory_health".to_string(),
-                description: Some("Retention dashboard. Returns avg retention, retention distribution (buckets: 0-20%, 20-40%, etc.), trend (improving/declining/stable), and recommendation. Lightweight alternative to full system_status focused on memory quality.".to_string()),
-                input_schema: tools::health::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "memory_graph".to_string(),
-                description: Some("Subgraph export for visualization. Input: center_id or query, depth (1-3), max_nodes. Returns nodes with force-directed layout positions and edges with weights. Powers memory graph visualization.".to_string()),
-                input_schema: tools::graph::schema(),
-                ..Default::default()
-            },
             // ================================================================
-            // DEEP REFERENCE (v2.0.4+) — replaces cross_reference
+            // DEEP REFERENCE (v2.0.4+) — folded into `recall` (mode='reason' /
+            // 'contradictions') in v2.2. deep_reference/cross_reference/
+            // contradictions remain hidden dispatch aliases.
             // ================================================================
-            ToolDescription {
-                name: "deep_reference".to_string(),
-                description: Some("Deep cognitive reasoning across memories. Combines FSRS-6 trust scoring, spreading activation, temporal supersession, dream insights, and contradiction analysis to build a complete understanding of a topic. Returns trust-scored evidence, fact evolution timeline, and a recommended answer. Use this when accuracy matters.".to_string()),
-                input_schema: tools::cross_reference::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "cross_reference".to_string(),
-                description: Some("Alias for deep_reference. Connect the dots across memories with cognitive reasoning.".to_string()),
-                input_schema: tools::cross_reference::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "contradictions".to_string(),
-                description: Some("Inspect memory disagreements directly. Scans a topic or recent memories for trust-weighted contradiction pairs using the same local logic as deep_reference.".to_string()),
-                input_schema: tools::contradictions::schema(),
-                ..Default::default()
-            },
             // ================================================================
             // ACTIVE FORGETTING (v2.0.5) — top-down suppression
             // Anderson et al. 2025 Nat Rev Neurosci + Davis Rac1
@@ -410,6 +374,19 @@ impl McpServer {
                 name: "suppress".to_string(),
                 description: Some("Actively suppress a memory via top-down inhibitory control (Anderson 2025 SIF + Davis Rac1). Distinct from delete: the memory persists but is inhibited from retrieval and actively decays. Each call compounds. A background Rac1 worker cascades decay to co-activated neighbors. Reversible within 24 hours via reverse=true.".to_string()),
                 input_schema: tools::suppress::schema(),
+                ..Default::default()
+            },
+            // ================================================================
+            // RETROACTIVE SALIENCE BACKFILL — Cai 2024 Nature
+            // "Memory with hindsight": failure -> backward causal reach.
+            // A flagship v2.2 capability, kept as its own advertised tool — it
+            // is a distinct cognitive primitive (backward causal promotion),
+            // not a maintenance op that folds into `maintain`.
+            // ================================================================
+            ToolDescription {
+                name: "backfill".to_string(),
+                description: Some("Memory with hindsight. When a FAILURE (bug/crash/regression) is recorded, reach BACKWARD in time and promote the quiet earlier memory that caused it — the root cause a vector search structurally cannot surface because it isn't similar to the failure, only causally upstream (shares an entity: same file/env-var/service). Faithful port of Cai 2024 Nature; backward-only by construction. Pass failure_id (or it auto-finds the latest failure), manual=true to force, promote=false for a dry run.".to_string()),
+                input_schema: tools::backfill::schema(),
                 ..Default::default()
             },
         ];
@@ -424,10 +401,11 @@ impl McpServer {
         // chunk-read them.
         //
         // Per-tool caps below are sized at ~2× observed peak with growth
-        // headroom; max permitted by Anthropic is 500_000. Only the four
-        // empirically-measured high-payload tools carry the annotation today;
-        // the remaining 21 tools deliberately do NOT (cargo-cult prevention —
-        // annotating a small-payload tool dilutes the signal).
+        // headroom; max permitted by Anthropic is 500_000. Only the
+        // high-payload tools carry the annotation (recall, memory_status,
+        // memory, codebase, dedup, graph); the remaining advertised tools
+        // deliberately do NOT (cargo-cult prevention — annotating a
+        // small-payload tool dilutes the signal).
         //
         // Other tools that COULD plausibly grow into the annotated set with
         // future workload (`deep_reference`, `cross_reference`, `memory_graph`,
@@ -435,10 +413,17 @@ impl McpServer {
         // empirical measurement shows truncation under realistic use.
         for tool in tools.iter_mut() {
             let max_chars: Option<u64> = match tool.name.as_str() {
-                "search" => Some(300_000),
-                "memory_timeline" => Some(200_000),
+                // v2.2: search folded into recall (mode='lookup'); annotation moved.
+                "recall" => Some(300_000),
+                "memory_status" => Some(200_000),
                 "memory" => Some(100_000),
                 "codebase" => Some(100_000),
+                // v2.2: dedup action='scan' returns duplicate clusters +
+                // merge candidates + policy in one payload.
+                "dedup" => Some(150_000),
+                // v2.2: graph action='memory_graph' (force-directed layout) and
+                // 'bounty_mode' pagination can both produce large payloads.
+                "graph" => Some(250_000),
                 _ => None,
             };
             if let Some(n) = max_chars {
@@ -490,17 +475,40 @@ impl McpServer {
             // ================================================================
             // UNIFIED TOOLS (v1.1+) - Preferred API
             // ================================================================
+            // RECALL — unified retrieval tool (v2.2). HOT PATH.
+            // mode = lookup (default, zero-overhead) | reason | contradictions
+            "recall" => {
+                tools::recall::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+            // DEPRECATED (v2.2): folded into `recall` (mode='lookup'). Hidden alias.
             "search" => {
-                tools::search_unified::execute(&self.storage, &self.cognitive, request.arguments)
-                    .await
+                warn!("Tool 'search' is deprecated in v2.2. Use 'recall' (mode='lookup', the default).");
+                tools::search_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
             }
             "memory" => {
                 tools::memory_unified::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
             }
             "codebase" => {
-                tools::codebase_unified::execute(&self.storage, &self.cognitive, request.arguments)
-                    .await
+                tools::codebase_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
             }
             "intention" => {
                 tools::intention_unified::execute(&self.storage, &self.cognitive, request.arguments)
@@ -514,6 +522,16 @@ impl McpServer {
                 tools::smart_ingest::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
             }
+
+            // ================================================================
+            // External-source connectors (#57)
+            // ================================================================
+            "source_sync" => tools::source_sync::execute(&self.storage, request.arguments).await,
+
+            // ================================================================
+            // Retroactive Salience Backfill (Cai 2024 Nature) — flagship v2.2
+            // ================================================================
+            "backfill" => tools::backfill::execute(&self.storage, request.arguments).await,
 
             // ================================================================
             // DEPRECATED (v1.7): ingest → smart_ingest
@@ -594,9 +612,23 @@ impl McpServer {
             }
 
             // ================================================================
-            // SYSTEM STATUS (v1.7: replaces health_check + stats)
+            // MEMORY STATUS — unified status/temporal tool (v2.2)
+            // view = health (default) | retention | timeline | changelog
             // ================================================================
+            "memory_status" => {
+                tools::memory_status::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+
+            // DEPRECATED (v2.2): folded into `memory_status`. Hidden aliases —
+            // each calls the same underlying handler verbatim.
             "system_status" => {
+                warn!("Tool 'system_status' is deprecated in v2.2. Use 'memory_status' (view='health').");
                 tools::maintenance::execute_system_status(
                     &self.storage,
                     &self.cognitive,
@@ -608,15 +640,21 @@ impl McpServer {
             "mark_reviewed" => tools::review::execute(&self.storage, request.arguments).await,
 
             // ================================================================
-            // DEPRECATED: Search tools - redirect to unified 'search'
+            // DEPRECATED: legacy search aliases — redirect to `recall` lookup.
+            // ('recall' itself is now the unified retrieval tool, handled above.)
             // ================================================================
-            "recall" | "semantic_search" | "hybrid_search" => {
+            "semantic_search" | "hybrid_search" => {
                 warn!(
-                    "Tool '{}' is deprecated. Use 'search' instead.",
+                    "Tool '{}' is deprecated. Use 'recall' (mode='lookup') instead.",
                     request.name
                 );
-                tools::search_unified::execute(&self.storage, &self.cognitive, request.arguments)
-                    .await
+                tools::search_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
             }
 
             // ================================================================
@@ -696,7 +734,13 @@ impl McpServer {
                     }
                     None => Some(serde_json::json!({"action": "remember_pattern"})),
                 };
-                tools::codebase_unified::execute(&self.storage, &self.cognitive, unified_args).await
+                tools::codebase_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    unified_args,
+                )
+                .await
             }
             "remember_decision" => {
                 warn!(
@@ -715,7 +759,13 @@ impl McpServer {
                     }
                     None => Some(serde_json::json!({"action": "remember_decision"})),
                 };
-                tools::codebase_unified::execute(&self.storage, &self.cognitive, unified_args).await
+                tools::codebase_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    unified_args,
+                )
+                .await
             }
             "get_codebase_context" => {
                 warn!(
@@ -731,7 +781,13 @@ impl McpServer {
                     }
                     None => Some(serde_json::json!({"action": "get_context"})),
                 };
-                tools::codebase_unified::execute(&self.storage, &self.cognitive, unified_args).await
+                tools::codebase_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    unified_args,
+                )
+                .await
             }
 
             // ================================================================
@@ -861,36 +917,115 @@ impl McpServer {
             }
 
             // ================================================================
-            // TEMPORAL TOOLS (v1.2+)
+            // TEMPORAL TOOLS (v1.2+) — DEPRECATED (v2.2): folded into
+            // `memory_status` (view='timeline' / view='changelog'). Hidden aliases.
             // ================================================================
-            "memory_timeline" => tools::timeline::execute(&self.storage, request.arguments).await,
-            "memory_changelog" => tools::changelog::execute(&self.storage, request.arguments).await,
+            "memory_timeline" => {
+                warn!("Tool 'memory_timeline' is deprecated in v2.2. Use 'memory_status' (view='timeline').");
+                tools::timeline::execute(&self.storage, &self.output_config, request.arguments)
+                    .await
+            }
+            "memory_changelog" => {
+                warn!("Tool 'memory_changelog' is deprecated in v2.2. Use 'memory_status' (view='changelog').");
+                tools::changelog::execute(&self.storage, request.arguments).await
+            }
 
             // ================================================================
-            // MAINTENANCE TOOLS (v1.2+, non-deprecated)
+            // MAINTAIN — unified maintenance/lifecycle tool (v2.2)
+            // action = consolidate | dream | gc | importance_score | backup
+            //        | export | restore
+            // ================================================================
+            "maintain" => {
+                // Mirror the pre-dispatch *Started* events that the standalone
+                // consolidate/dream arms emit, keyed off the action.
+                match request
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("action"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some("consolidate") => self.emit(VestigeEvent::ConsolidationStarted {
+                        timestamp: chrono::Utc::now(),
+                    }),
+                    Some("dream") => self.emit(VestigeEvent::DreamStarted {
+                        memory_count: self
+                            .storage
+                            .get_stats()
+                            .map(|s| s.total_nodes as usize)
+                            .unwrap_or(0),
+                        timestamp: chrono::Utc::now(),
+                    }),
+                    _ => {}
+                }
+                tools::maintain::execute(&self.storage, &self.cognitive, request.arguments).await
+            }
+
+            // ================================================================
+            // MAINTENANCE TOOLS (v1.2+) — DEPRECATED (v2.2): folded into
+            // `maintain`. Hidden aliases; pre-emit Started events preserved.
             // ================================================================
             "consolidate" => {
+                warn!("Tool 'consolidate' is deprecated in v2.2. Use 'maintain' (action='consolidate').");
                 self.emit(VestigeEvent::ConsolidationStarted {
                     timestamp: chrono::Utc::now(),
                 });
                 tools::maintenance::execute_consolidate(&self.storage, request.arguments).await
             }
-            "backup" => tools::maintenance::execute_backup(&self.storage, request.arguments).await,
-            "export" => tools::maintenance::execute_export(&self.storage, request.arguments).await,
-            "gc" => tools::maintenance::execute_gc(&self.storage, request.arguments).await,
+            "backup" => {
+                warn!("Tool 'backup' is deprecated in v2.2. Use 'maintain' (action='backup').");
+                tools::maintenance::execute_backup(&self.storage, request.arguments).await
+            }
+            "export" => {
+                warn!("Tool 'export' is deprecated in v2.2. Use 'maintain' (action='export').");
+                tools::maintenance::execute_export(&self.storage, request.arguments).await
+            }
+            "gc" => {
+                warn!("Tool 'gc' is deprecated in v2.2. Use 'maintain' (action='gc').");
+                tools::maintenance::execute_gc(&self.storage, request.arguments).await
+            }
 
             // ================================================================
             // AUTO-SAVE & DEDUP TOOLS (v1.3+)
             // ================================================================
+            // DEPRECATED (v2.2): folded into `maintain` (action='importance_score').
             "importance_score" => {
+                warn!("Tool 'importance_score' is deprecated in v2.2. Use 'maintain' (action='importance_score').");
                 tools::importance::execute(&self.storage, &self.cognitive, request.arguments).await
             }
-            "find_duplicates" => tools::dedup::execute(&self.storage, request.arguments).await,
+            // ================================================================
+            // DEDUP / MERGE / SUPERSEDE — unified `dedup` tool (v2.2)
+            // ================================================================
+            "dedup" => tools::dedup::execute_unified(&self.storage, request.arguments).await,
+
+            // DEPRECATED (v2.2): folded into `dedup`. Kept as hidden back-compat
+            // aliases (≥1 minor release) — they call the same underlying handlers
+            // verbatim, so envelopes/plan_id/confirm-gating/bitemporal are intact.
+            "find_duplicates" => {
+                warn!("Tool 'find_duplicates' is deprecated in v2.2. Use 'dedup' with action='scan'.");
+                tools::dedup::execute(&self.storage, request.arguments).await
+            }
+            "merge_candidates" | "plan_merge" | "plan_supersede" | "apply_plan" | "merge_undo"
+            | "protect" | "merge_policy" => {
+                warn!(
+                    "Tool '{}' is deprecated in v2.2. Use 'dedup' (action={}).",
+                    request.name,
+                    match request.name.as_str() {
+                        "merge_candidates" => "scan",
+                        "apply_plan" => "apply",
+                        "merge_undo" => "undo",
+                        "merge_policy" => "policy",
+                        other => other,
+                    }
+                );
+                tools::merge::execute(&self.storage, request.name.as_str(), request.arguments).await
+            }
 
             // ================================================================
-            // COGNITIVE TOOLS (v1.5+)
+            // COGNITIVE TOOLS (v1.5+) — DEPRECATED (v2.2): dream folded into
+            // `maintain` (action='dream'). Hidden alias; DreamStarted preserved.
             // ================================================================
             "dream" => {
+                warn!("Tool 'dream' is deprecated in v2.2. Use 'maintain' (action='dream').");
                 self.emit(VestigeEvent::DreamStarted {
                     memory_count: self
                         .storage
@@ -901,32 +1036,77 @@ impl McpServer {
                 });
                 tools::dream::execute(&self.storage, &self.cognitive, request.arguments).await
             }
+            // ================================================================
+            // GRAPH — unified graph/association/prediction tool (v2.2)
+            // ================================================================
+            "graph" => {
+                tools::graph_unified::execute(&self.storage, &self.cognitive, request.arguments)
+                    .await
+            }
+            // DEPRECATED (v2.2): folded into `graph`. Hidden aliases.
             "explore_connections" => {
+                warn!("Tool 'explore_connections' is deprecated in v2.2. Use 'graph' (action='chain'|'associations'|'bridges').");
                 tools::explore::execute(&self.storage, &self.cognitive, request.arguments).await
             }
             "predict" => {
+                warn!("Tool 'predict' is deprecated in v2.2. Use 'graph' (action='predict').");
                 tools::predict::execute(&self.storage, &self.cognitive, request.arguments).await
             }
-            "restore" => tools::restore::execute(&self.storage, request.arguments).await,
+            // DEPRECATED (v2.2): folded into `maintain` (action='restore').
+            "restore" => {
+                warn!("Tool 'restore' is deprecated in v2.2. Use 'maintain' (action='restore').");
+                tools::restore::execute(&self.storage, request.arguments).await
+            }
 
             // ================================================================
-            // CONTEXT PACKETS (v1.8+)
+            // CONTEXT PACKETS (v1.8+) — `session_start` (renamed v2.2)
             // ================================================================
+            "session_start" => {
+                tools::session_context::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+            // DEPRECATED (v2.2): renamed to `session_start`. Hidden alias.
             "session_context" => {
-                tools::session_context::execute(&self.storage, &self.cognitive, request.arguments)
-                    .await
+                warn!("Tool 'session_context' is deprecated in v2.2. Use 'session_start'.");
+                tools::session_context::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
             }
 
             // ================================================================
             // AUTONOMIC TOOLS (v1.9+)
             // ================================================================
-            "memory_health" => tools::health::execute(&self.storage, request.arguments).await,
-            "memory_graph" => tools::graph::execute(&self.storage, request.arguments).await,
+            // DEPRECATED (v2.2): folded into `memory_status` (view='retention').
+            "memory_health" => {
+                warn!("Tool 'memory_health' is deprecated in v2.2. Use 'memory_status' (view='retention').");
+                tools::health::execute(&self.storage, request.arguments).await
+            }
+            // DEPRECATED (v2.2): folded into `graph`. Hidden aliases.
+            "memory_graph" => {
+                warn!("Tool 'memory_graph' is deprecated in v2.2. Use 'graph' (action='memory_graph').");
+                tools::graph::execute(&self.storage, request.arguments).await
+            }
+            "composed_graph" => {
+                warn!("Tool 'composed_graph' is deprecated in v2.2. Use 'graph' (action='recent'|'get'|'memory'|'neighbors'|'never_composed'|'bounty_mode'|'label').");
+                tools::composed_graph::execute(&self.storage, request.arguments).await
+            }
+            // DEPRECATED (v2.2): folded into `recall`. Hidden aliases.
             "deep_reference" | "cross_reference" => {
+                warn!("Tool '{}' is deprecated in v2.2. Use 'recall' (mode='reason').", request.name);
                 tools::cross_reference::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
             }
             "contradictions" => {
+                warn!("Tool 'contradictions' is deprecated in v2.2. Use 'recall' (mode='contradictions').");
                 tools::contradictions::execute(&self.storage, request.arguments).await
             }
 
@@ -1160,6 +1340,31 @@ impl McpServer {
             return;
         }
         let now = Utc::now();
+
+        // v2.2: the unified `maintain` tool folds consolidate/dream/importance_score
+        // (the three maintenance actions that emit). Normalize its name to the
+        // effective action so the existing emit arms below fire unchanged. Old
+        // standalone names still arrive verbatim and match directly.
+        let tool_name = if tool_name == "maintain" {
+            args.as_ref()
+                .and_then(|a| a.get("action"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("maintain")
+        } else if tool_name == "recall" {
+            // The unified `recall` tool fires SearchPerformed only for the lookup
+            // path (the former `search`). reason/contradictions do not emit, so
+            // map them to a non-emitting name.
+            match args
+                .as_ref()
+                .and_then(|a| a.get("mode"))
+                .and_then(|v| v.as_str())
+            {
+                Some("reason") | Some("contradictions") => "recall_noemit",
+                _ => "search", // lookup (default) → SearchPerformed
+            }
+        } else {
+            tool_name
+        };
 
         match tool_name {
             // -- smart_ingest: memory created/updated --
@@ -1686,19 +1891,35 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        // v2.1.21: 25 tools (includes first-class contradictions surface)
-        assert_eq!(tools.len(), 25, "Expected exactly 25 tools in v2.1.21");
+        // v2.2 Tool Consolidation (Layer 1): 34 → 27 after `dedup` folds
+        // find_duplicates + the 7 Phase-3 merge tools (8 → 1). Old names remain
+        // dispatchable as hidden back-compat aliases but drop off the advertised list.
+        assert_eq!(
+            tools.len(),
+            13,
+            "Expected exactly 13 tools after v2.2 Layer-1 consolidation \
+             (12 consolidated: dedup + memory_status + graph + maintain + recall; \
+             session_context renamed) plus the flagship `backfill` (Retroactive \
+             Salience, Cai 2024 Nature), a distinct cognitive primitive"
+        );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
         // Unified tools
-        assert!(tool_names.contains(&"search"));
+        // (search folded into `recall` mode='lookup' in v2.2)
+        assert!(tool_names.contains(&"recall"));
         assert!(tool_names.contains(&"memory"));
         assert!(tool_names.contains(&"codebase"));
         assert!(tool_names.contains(&"intention"));
 
+        // Flagship retroactive-salience backfill stays advertised (not folded).
+        assert!(tool_names.contains(&"backfill"));
+
         // Core memory (smart_ingest absorbs ingest + checkpoint in v1.7)
         assert!(tool_names.contains(&"smart_ingest"));
+
+        // External-source connectors (#57)
+        assert!(tool_names.contains(&"source_sync"));
         assert!(
             !tool_names.contains(&"ingest"),
             "ingest should be removed in v1.7"
@@ -1718,12 +1939,21 @@ mod tests {
             "demote_memory should be removed in v1.7"
         );
 
-        // Temporal tools (v1.2)
-        assert!(tool_names.contains(&"memory_timeline"));
-        assert!(tool_names.contains(&"memory_changelog"));
-
-        // Maintenance tools (v1.7: system_status replaces health_check + stats)
-        assert!(tool_names.contains(&"system_status"));
+        // Status / temporal — unified `memory_status` tool (v2.2).
+        // system_status + memory_health + memory_timeline + memory_changelog
+        // folded in; old names dispatch as hidden aliases but are off the list.
+        assert!(tool_names.contains(&"memory_status"));
+        for old in [
+            "system_status",
+            "memory_health",
+            "memory_timeline",
+            "memory_changelog",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'memory_status' in v2.2"
+            );
+        }
         assert!(
             !tool_names.contains(&"health_check"),
             "health_check should be removed in v1.7"
@@ -1732,35 +1962,331 @@ mod tests {
             !tool_names.contains(&"stats"),
             "stats should be removed in v1.7"
         );
-        assert!(tool_names.contains(&"consolidate"));
-        assert!(tool_names.contains(&"backup"));
-        assert!(tool_names.contains(&"export"));
-        assert!(tool_names.contains(&"gc"));
+        // Maintenance / lifecycle — unified `maintain` tool (v2.2).
+        // consolidate + dream + gc + importance_score + backup + export + restore
+        // folded in; old names dispatch as hidden aliases but are off the list.
+        assert!(tool_names.contains(&"maintain"));
+        for old in [
+            "consolidate",
+            "dream",
+            "gc",
+            "importance_score",
+            "backup",
+            "export",
+            "restore",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'maintain' in v2.2"
+            );
+        }
 
-        // Auto-save & dedup tools (v1.3)
-        assert!(tool_names.contains(&"importance_score"));
-        assert!(tool_names.contains(&"find_duplicates"));
+        // Dedup / merge / supersede — unified `dedup` tool (v2.2).
+        // find_duplicates + the 7 Phase-3 merge tools folded in; still
+        // dispatchable as hidden back-compat aliases, but off the advertised list.
+        assert!(tool_names.contains(&"dedup"));
+        for old in [
+            "find_duplicates",
+            "merge_candidates",
+            "plan_merge",
+            "plan_supersede",
+            "apply_plan",
+            "merge_undo",
+            "protect",
+            "merge_policy",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'dedup' in v2.2"
+            );
+        }
 
-        // Cognitive tools (v1.5)
-        assert!(tool_names.contains(&"dream"));
-        assert!(tool_names.contains(&"explore_connections"));
-        assert!(tool_names.contains(&"predict"));
-        assert!(tool_names.contains(&"restore"));
+        // Cognitive tools (v1.5): explore_connections + predict → `graph`;
+        // dream + restore → `maintain` (all v2.2). Nothing left advertised here.
 
-        // Context packets (v1.8)
-        assert!(tool_names.contains(&"session_context"));
+        // Context packets (v1.8) — renamed session_context → session_start (v2.2)
+        assert!(tool_names.contains(&"session_start"));
+        assert!(
+            !tool_names.contains(&"session_context"),
+            "session_context renamed to 'session_start' in v2.2"
+        );
 
-        // Autonomic tools (v1.9)
-        assert!(tool_names.contains(&"memory_health"));
-        assert!(tool_names.contains(&"memory_graph"));
+        // Graph — unified `graph` tool (v2.2). explore_connections + predict +
+        // memory_graph + composed_graph folded in; old names dispatch as hidden
+        // aliases but are off the advertised list. (memory_health → memory_status.)
+        assert!(tool_names.contains(&"graph"));
+        for old in [
+            "explore_connections",
+            "predict",
+            "memory_graph",
+            "composed_graph",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'graph' in v2.2"
+            );
+        }
 
-        // Deep reference + cross_reference alias (v2.0.4)
-        assert!(tool_names.contains(&"deep_reference"));
-        assert!(tool_names.contains(&"cross_reference"));
-        assert!(tool_names.contains(&"contradictions"));
+        // Retrieval — unified `recall` tool (v2.2). search + deep_reference +
+        // cross_reference + contradictions folded in; old names dispatch as
+        // hidden aliases but are off the advertised list.
+        for old in [
+            "search",
+            "deep_reference",
+            "cross_reference",
+            "contradictions",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'recall' in v2.2"
+            );
+        }
 
         // Active forgetting (v2.0.5) — Anderson 2025 + Davis Rac1
         assert!(tool_names.contains(&"suppress"));
+    }
+
+    /// v2.2: the 8 tools folded into `dedup` must still dispatch (hidden
+    /// back-compat aliases), i.e. they must NOT return the "Unknown tool"
+    /// InvalidParams (-32602) error. Read-only/list-style actions are used so
+    /// the call resolves without mutating or requiring extra setup.
+    #[tokio::test]
+    async fn test_deprecated_dedup_aliases_redirect() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        // (tool name, args) — all read-only / list-style so they resolve cleanly.
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            ("find_duplicates", serde_json::json!({})),
+            ("merge_candidates", serde_json::json!({})),
+            ("merge_undo", serde_json::json!({})), // no operation_id => lists the reflog
+            ("merge_policy", serde_json::json!({})), // no args => returns current policy
+            ("dedup", serde_json::json!({"action": "policy"})),
+            ("dedup", serde_json::json!({})), // default action = scan
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            // The call may succeed (result) or fail for a domain reason, but it
+            // must NOT be the unknown-tool InvalidParams error.
+            if let Some(err) = response.error {
+                assert_ne!(
+                    err.code, -32602,
+                    "'{name}' should still dispatch (hidden alias), got unknown-tool error: {}",
+                    err.message
+                );
+            }
+        }
+    }
+
+    /// v2.2: the 4 tools folded into `memory_status` must still dispatch, and
+    /// each `view` of the new tool must resolve.
+    #[tokio::test]
+    async fn test_memory_status_views_and_aliases() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            // Deprecated aliases must still dispatch.
+            ("system_status", serde_json::json!({})),
+            ("memory_health", serde_json::json!({})),
+            ("memory_timeline", serde_json::json!({})),
+            ("memory_changelog", serde_json::json!({})),
+            // New unified views.
+            ("memory_status", serde_json::json!({})), // default view = health
+            ("memory_status", serde_json::json!({"view": "retention"})),
+            ("memory_status", serde_json::json!({"view": "timeline"})),
+            ("memory_status", serde_json::json!({"view": "changelog"})),
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            assert!(
+                response.error.is_none(),
+                "'{name}' {args} should resolve, got error: {:?}",
+                response.error
+            );
+        }
+    }
+
+    /// v2.2: the 4 tools folded into `graph` must still dispatch, and the
+    /// read-only `graph` actions must resolve. (memory_graph is sync — this also
+    /// guards the no-`.await` facade branch.)
+    #[tokio::test]
+    async fn test_graph_actions_and_aliases() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            // Deprecated aliases must still dispatch (not unknown-tool).
+            ("predict", serde_json::json!({})),
+            ("memory_graph", serde_json::json!({})),
+            ("composed_graph", serde_json::json!({"action": "recent"})),
+            // New unified actions (read-only).
+            ("graph", serde_json::json!({"action": "predict"})),
+            ("graph", serde_json::json!({"action": "memory_graph"})),
+            ("graph", serde_json::json!({"action": "recent"})),
+            ("graph", serde_json::json!({"action": "never_composed"})),
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            if let Some(err) = response.error {
+                assert_ne!(
+                    err.code, -32602,
+                    "'{name}' {args} should dispatch (not unknown-tool): {}",
+                    err.message
+                );
+            }
+        }
+    }
+
+    /// v2.2: the 7 tools folded into `maintain` must still dispatch, the new
+    /// actions must resolve, gc must default to dry_run, and restore must keep
+    /// path validation (a nonexistent path errors rather than silently no-op).
+    #[tokio::test]
+    async fn test_maintain_actions_and_safety() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        // Aliases + safe new actions must dispatch (not unknown-tool).
+        let dispatch_ok: Vec<(&str, serde_json::Value)> = vec![
+            ("consolidate", serde_json::json!({})),
+            ("backup", serde_json::json!({})),
+            ("dream", serde_json::json!({})),
+            ("maintain", serde_json::json!({"action": "consolidate"})),
+            ("maintain", serde_json::json!({"action": "gc"})),
+            ("maintain", serde_json::json!({"action": "backup"})),
+        ];
+        for (name, args) in dispatch_ok {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            if let Some(err) = response.error {
+                assert_ne!(err.code, -32602, "'{name}' {args} should dispatch: {}", err.message);
+            }
+        }
+
+        // gc via maintain defaults to dry_run=true (no deletion).
+        let gc_req = make_request(
+            "tools/call",
+            Some(serde_json::json!({ "name": "maintain", "arguments": {"action": "gc"} })),
+        );
+        let gc_resp = server.handle_request(gc_req).await.unwrap();
+        let text = gc_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("\"dryRun\": true") || text.contains("\"dryRun\":true"),
+            "maintain action=gc must default to dry_run=true; got: {text}"
+        );
+
+        // restore keeps path validation: a missing file must error, not no-op.
+        let restore_req = make_request(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "maintain",
+                "arguments": {"action": "restore", "path": "/nonexistent/vestige-backup-xyz.json"}
+            })),
+        );
+        let restore_resp = server.handle_request(restore_req).await.unwrap();
+        // Either a JSON-RPC error or an error envelope is acceptable; a silent
+        // success is NOT (that would mean confinement/validation was bypassed).
+        let validated = restore_resp.error.is_some()
+            || restore_resp
+                .result
+                .map(|r| {
+                    r["content"][0]["text"]
+                        .as_str()
+                        .map(|t| t.to_lowercase().contains("not found") || t.to_lowercase().contains("error"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+        assert!(validated, "maintain action=restore must validate a missing path");
+    }
+
+    /// v2.2 HOT PATH: `recall` defaults to mode='lookup' (search), the folded
+    /// names still dispatch, and the reason/contradictions modes resolve.
+    #[tokio::test]
+    async fn test_recall_modes_and_aliases() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            // Deprecated aliases must still dispatch.
+            ("search", serde_json::json!({"query": "x"})),
+            ("deep_reference", serde_json::json!({"query": "x"})),
+            ("cross_reference", serde_json::json!({"query": "x"})),
+            ("contradictions", serde_json::json!({})),
+            ("semantic_search", serde_json::json!({"query": "x"})),
+            // New unified modes.
+            ("recall", serde_json::json!({"query": "x"})), // default mode = lookup
+            ("recall", serde_json::json!({"mode": "lookup", "query": "x"})),
+            ("recall", serde_json::json!({"mode": "reason", "query": "x"})),
+            ("recall", serde_json::json!({"mode": "contradictions"})),
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            assert!(
+                response.error.is_none(),
+                "'{name}' {args} should resolve, got error: {:?}",
+                response.error
+            );
+        }
+    }
+
+    /// v2.2: `recall` mode='lookup' (the default) must produce the same result
+    /// shape as the former standalone `search` — i.e. the no-mode default is a
+    /// faithful pass-through, not a reasoning call.
+    #[tokio::test]
+    async fn test_recall_lookup_matches_search_shape() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let args = serde_json::json!({ "query": "anything" });
+        let via_recall = make_request(
+            "tools/call",
+            Some(serde_json::json!({ "name": "recall", "arguments": args })),
+        );
+        let via_search = make_request(
+            "tools/call",
+            Some(serde_json::json!({ "name": "search", "arguments": args })),
+        );
+        let r1 = server.handle_request(via_recall).await.unwrap();
+        let r2 = server.handle_request(via_search).await.unwrap();
+        assert!(r1.error.is_none() && r2.error.is_none());
+        // The unified-tool wrapper text (the search payload) must match.
+        assert_eq!(
+            r1.result.unwrap()["content"][0]["text"],
+            r2.result.unwrap()["content"][0]["text"],
+            "recall(mode=lookup) must equal search byte-for-byte"
+        );
     }
 
     #[tokio::test]
@@ -1977,10 +2503,17 @@ mod tests {
     /// (cargo-cult prevention).
     fn expected_max_result_size(name: &str) -> Option<u64> {
         match name {
-            "search" => Some(300_000),
-            "memory_timeline" => Some(200_000),
+            // v2.2: search folded into recall (mode='lookup'); annotation moved.
+            "recall" => Some(300_000),
+            // v2.2: memory_timeline folded into memory_status (view='timeline');
+            // the high-payload annotation moved with it.
+            "memory_status" => Some(200_000),
             "memory" => Some(100_000),
             "codebase" => Some(100_000),
+            // v2.2: dedup action='scan' returns clusters + candidates + policy.
+            "dedup" => Some(150_000),
+            // v2.2: graph memory_graph layout + bounty_mode pagination.
+            "graph" => Some(250_000),
             _ => None,
         }
     }
@@ -1996,7 +2529,7 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        for name in ["search", "memory_timeline", "memory", "codebase"] {
+        for name in ["recall", "memory_status", "memory", "codebase", "dedup", "graph"] {
             let tool = tools
                 .iter()
                 .find(|t| t["name"].as_str() == Some(name))
@@ -2084,19 +2617,20 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        let search_tool = tools
+        // v2.2: `recall` is the annotated retrieval tool (search folded in).
+        let recall_tool = tools
             .iter()
-            .find(|t| t["name"].as_str() == Some("search"))
-            .expect("'search' tool present");
+            .find(|t| t["name"].as_str() == Some("recall"))
+            .expect("'recall' tool present");
 
         // Wire-form: `_meta` must exist; `meta` (un-renamed) must NOT exist.
         assert!(
-            search_tool.get("_meta").is_some(),
-            "search tool missing `_meta` key (serde rename to _meta did not apply)"
+            recall_tool.get("_meta").is_some(),
+            "recall tool missing `_meta` key (serde rename to _meta did not apply)"
         );
         assert!(
-            search_tool.get("meta").is_none(),
-            "search tool has un-renamed `meta` key (regression — serde rename broke)"
+            recall_tool.get("meta").is_none(),
+            "recall tool has un-renamed `meta` key (regression — serde rename broke)"
         );
     }
 }

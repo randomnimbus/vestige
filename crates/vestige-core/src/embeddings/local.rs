@@ -343,14 +343,18 @@ impl EmbeddingService {
         Self { _unused: () }
     }
 
-    /// Check if the model is ready
+    /// Check if the model has already been initialized.
+    ///
+    /// This must stay side-effect free: health/status paths call it during
+    /// startup and must not download or load ONNX models just to report state.
     pub fn is_ready(&self) -> bool {
-        match get_backend() {
-            Ok(_) => true,
-            Err(e) => {
+        match EMBEDDING_BACKEND_RESULT.get() {
+            Some(Ok(backend)) => backend.lock().is_ok(),
+            Some(Err(e)) => {
                 tracing::warn!("Embedding model not ready: {}", e);
                 false
             }
+            None => false,
         }
     }
 

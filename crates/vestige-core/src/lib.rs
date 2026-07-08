@@ -80,11 +80,19 @@
 // MODULES
 // ============================================================================
 
+/// Optional `vestige.toml` configuration (Phase 2: Configurable Output).
+pub mod config;
+pub mod connectors;
 pub mod consolidation;
+pub mod embedder;
 pub mod fsrs;
 pub mod fts;
 pub mod memory;
 pub mod storage;
+
+/// Agent Black Box, Memory Receipts & Memory PRs — the cognitive flight
+/// recorder, immune system, and reviewable-diff model for agent memory.
+pub mod trace;
 
 #[cfg(feature = "embeddings")]
 #[cfg_attr(docsrs, doc(cfg(feature = "embeddings")))]
@@ -127,9 +135,12 @@ pub use memory::{
     MemorySystem,
     NodeType,
     RecallInput,
+    SchemaIntrospection,
     SearchMode,
     SearchResult,
     SimilarityResult,
+    SourceEnvelope,
+    TableIntrospection,
     TemporalRange,
 };
 
@@ -150,11 +161,64 @@ pub use fsrs::{
     retrievability_with_decay,
 };
 
+// Configuration (vestige.toml output profiles / defaults)
+pub use config::{CONFIG_FILE, OutputConfig, OutputDefaults, OutputProfile, VestigeConfig};
+
+// Agent Black Box / Receipts / Memory PRs (the cognitive flight recorder)
+pub use trace::{
+    classify_write, DecayRisk, MemoryPr, MemoryPrAction, MemoryPrKind, MemoryPrStatus,
+    MemoryTraceEvent, Receipt, ReceiptMutation, ReviewMode, RiskClass, RiskSignal, SuppressReason,
+    SuppressedReceiptEntry, WriteContext, WriteSource, HIGH_TRUST_FLOOR, LOW_CONFIDENCE_FLOOR,
+};
+
 // Storage layer
 pub use storage::{
-    ConnectionRecord, ConsolidationHistoryRecord, DreamHistoryRecord, InsightRecord,
-    IntentionRecord, PORTABLE_ARCHIVE_FORMAT, PortableArchive, PortableImportMode,
-    PortableImportReport, Result, SmartIngestResult, StateTransitionRecord, Storage, StorageError,
+    ClassificationResult,
+    CompositionEventRecord,
+    CompositionMemberRecord,
+    CompositionNeighborRecord,
+    CompositionOutcomeRecord,
+    ConnectionRecord,
+    ConnectorCursor,
+    ConsolidationHistoryRecord,
+    Domain,
+    DreamHistoryRecord,
+    HealthStatus,
+    InsightRecord,
+    IntentionRecord,
+    LocalMemoryStore,
+    MemoryEdge,
+    MemoryRecord,
+    MemoryStore,
+    MemoryStoreError,
+    MemoryStoreResult,
+    ModelSignature,
+    NeverComposedCandidate,
+    PORTABLE_ARCHIVE_FORMAT,
+    PortableArchive,
+    PortableImportMode,
+    PortableImportReport,
+    PortableSyncReport,
+    ReconcileReport,
+    Result,
+    SchedulingState,
+    SearchQuery,
+    AgentRunSummary,
+    SmartIngestResult,
+    SourceUpsertOutcome,
+    SourceUpsertResult,
+    SqliteMemoryStore,
+    StateTransitionRecord,
+    Storage,
+    StorageError,
+    StoreStats,
+    // Note: storage::SearchResult is intentionally not re-exported here to avoid
+    // collision with memory::SearchResult. Use vestige_core::storage::SearchResult directly.
+};
+
+// Embedder trait and implementations
+pub use embedder::{
+    Embedder, EmbedderError, EmbedderResult, EmbedderSend, FastembedEmbedder, LocalEmbedder,
 };
 
 // Consolidation (sleep-inspired memory processing)
@@ -213,6 +277,9 @@ pub use advanced::{
     LabileState,
     Language,
     MaintenanceType,
+    // Merge / Supersede controls (Phase 3)
+    MatchClass,
+    MatchSignals,
     // Memory chains
     MemoryChainBuilder,
     // Memory compression
@@ -223,10 +290,15 @@ pub use advanced::{
     MemoryPath,
     MemoryReplay,
     MemorySnapshot,
+    MergeCandidate,
+    MergeOperation,
+    MergePlan,
+    MergePolicy,
     MergeStrategy,
     Modification,
     Pattern,
     PatternType,
+    PlanKind,
     PredictedMemory,
     PredictionContext,
     PredictionErrorConfig,

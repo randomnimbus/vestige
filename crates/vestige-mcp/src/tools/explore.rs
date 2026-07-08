@@ -414,6 +414,7 @@ mod tests {
                 tags: vec!["test".to_string()],
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap()
             .id;
@@ -428,6 +429,7 @@ mod tests {
                 tags: vec!["test".to_string()],
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap()
             .id;
@@ -478,6 +480,7 @@ mod tests {
             tags: vec!["test".to_string()],
             valid_from: None,
             valid_until: None,
+            source_envelope: None,
         };
         let id_a = storage.ingest(make("Memory A about databases")).unwrap().id;
         let id_b = storage.ingest(make("Memory B about indexes")).unwrap().id;
@@ -529,6 +532,7 @@ mod tests {
             tags: vec!["test".to_string()],
             valid_from: None,
             valid_until: None,
+            source_envelope: None,
         };
         let id_a = storage.ingest(make("Bridge test memory A")).unwrap().id;
         let id_b = storage.ingest(make("Bridge test memory B")).unwrap().id;

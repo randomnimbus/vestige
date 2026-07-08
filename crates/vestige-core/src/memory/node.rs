@@ -80,6 +80,91 @@ impl std::fmt::Display for NodeType {
 }
 
 // ============================================================================
+// SOURCE ENVELOPE (#57)
+// ============================================================================
+
+/// Structured provenance for a memory that mirrors a record in an external
+/// system of record (a Redmine issue, a GitHub Issue, a Jira ticket, a support
+/// thread, …).
+///
+/// The product boundary (#57): the external system stays canonical. Vestige
+/// **indexes, connects, retrieves, and cites back**; it does not replace the
+/// ticket tracker. This envelope carries exactly the fields a connector needs
+/// to do that without leaking stale data:
+///
+/// - `(source_system, source_id)` is the **idempotency key**. Re-running a sync
+///   upserts the same logical record instead of duplicating it.
+/// - `content_hash` is the **change detector**. If a re-fetched record hashes
+///   to the stored value, the upsert is a no-op (only `synced_at` advances),
+///   so an incremental re-scan never churns the index or the embedding model.
+/// - `source_url` is the **citation**. Search results link back to the
+///   canonical record so the agent can follow it for authoritative detail.
+/// - `source_updated_at` is the **cursor field** the connector checkpoints on.
+///
+/// Every field is optional at the type level so partial connectors and manual
+/// imports can populate only what they have, but a real connector should always
+/// set `source_system`, `source_id`, and `content_hash`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceEnvelope {
+    /// External system this record came from, e.g. `redmine`, `github`, `jira`.
+    /// Namespaces `source_id` so two systems can share numeric ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_system: Option<String>,
+    /// Stable native id in the source system (Redmine issue id, GitHub issue
+    /// number/node id, …). Combined with `source_system` it is the upsert key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// Canonical URL back to the record so retrieval can cite the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    /// When the source record was last updated upstream (the connector cursor
+    /// field — Redmine `updated_on`, GitHub `updated_at`). RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_updated_at: Option<DateTime<Utc>>,
+    /// Stable hash of the normalized record content. Idempotency / change key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// When the connector last observed this record live. Drives tombstone
+    /// reconciliation (a record not seen in a full reconcile pass is gone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_at: Option<DateTime<Utc>>,
+    /// Project / repo / space the record belongs to (Redmine project, GitHub
+    /// `owner/repo`). Used for scoped sync and search filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_project: Option<String>,
+    /// Record type within the source (`issue`, `comment`, `journal`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    /// Author / reporter of the record in the source system.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_author: Option<String>,
+}
+
+impl SourceEnvelope {
+    /// True once the two fields a connector needs for idempotent upsert are
+    /// present. Manual imports that only set `source_url` are not "keyed".
+    pub fn has_key(&self) -> bool {
+        self.source_system.is_some() && self.source_id.is_some()
+    }
+
+    /// True if every field is unset — used to collapse an all-`None` envelope
+    /// back to `None` on the node so legacy rows stay clean.
+    pub fn is_empty(&self) -> bool {
+        self.source_system.is_none()
+            && self.source_id.is_none()
+            && self.source_url.is_none()
+            && self.source_updated_at.is_none()
+            && self.content_hash.is_none()
+            && self.synced_at.is_none()
+            && self.source_project.is_none()
+            && self.source_type.is_none()
+            && self.source_author.is_none()
+    }
+}
+
+// ============================================================================
 // KNOWLEDGE NODE
 // ============================================================================
 
@@ -188,6 +273,15 @@ pub struct KnowledgeNode {
     /// Timestamp of the most recent suppression (for 24h labile window).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppressed_at: Option<DateTime<Utc>>,
+
+    // ========== Source Envelope (#57, external-source connectors) ==========
+    /// Structured provenance for memories ingested from an external system
+    /// (Redmine, GitHub Issues, Jira, …). `None` for memories created directly
+    /// by an agent or the user — the legacy free-form `source` string above
+    /// remains the human-readable label; this envelope is the machine-readable,
+    /// idempotency- and citation-bearing record. See [`SourceEnvelope`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_envelope: Option<SourceEnvelope>,
 }
 
 impl Default for KnowledgeNode {
@@ -224,6 +318,7 @@ impl Default for KnowledgeNode {
             embedding_model: None,
             suppression_count: 0,
             suppressed_at: None,
+            source_envelope: None,
         }
     }
 }
@@ -291,6 +386,11 @@ pub struct IngestInput {
     /// When this knowledge stops being valid
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<DateTime<Utc>>,
+    /// Structured provenance for connector-ingested records (#57). When set
+    /// with a `(source_system, source_id)` key, callers should route through
+    /// `upsert_by_source` for idempotent sync rather than plain `ingest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_envelope: Option<SourceEnvelope>,
 }
 
 impl Default for IngestInput {
@@ -304,6 +404,7 @@ impl Default for IngestInput {
             tags: vec![],
             valid_from: None,
             valid_until: None,
+            source_envelope: None,
         }
     }
 }

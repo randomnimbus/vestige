@@ -7,6 +7,257 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-07-02 — "Windows embeddings + backfill safety"
+
+A focused patch release. Two fixes plus a first-run guide.
+
+### Fixed — Windows embeddings never initialized (#101)
+
+The `x86_64-pc-windows-msvc` v2.2.0 binary was built without the `vector-search`
+feature, so the storage layer's `#[cfg(feature = "vector-search")]` paths compiled
+out. On Windows this meant new memories got no embedding, semantic search returned
+nothing, `vestige health` reported "Embedding Service: Not Ready" (0% coverage),
+and no model download was ever attempted — while v2.1.23 worked on the same machine.
+The release build now includes `vector-search` on Windows (it compiles cleanly on
+MSVC because `usearch` is pinned with `features = ["fp16lib"]`). npm and direct
+downloads are fixed by the same rebuilt release asset. Thanks @Vrakoss for the
+precise report.
+
+### Fixed — Retroactive Salience Backfill: bounded promote + opt-out lever (#103)
+
+The consolidation-pass backfill promoted root-cause memories with an **uncapped**
+`stability * 1.5` FSRS multiply, and a code comment wrongly claimed it was capped.
+On a chronically-recurring failure this could inflate a cause's stability without
+bound, distorting its review schedule. Backfill promotion is now bounded to
+`MIN(stability * 1.5, stability + 365.0)` (the additive +365-day ceiling the
+backfill module already computed but never applied), on both the auto-fire and the
+manual `backfill` tool paths. Auto-fire remains **on by default** (it shipped and
+was documented in v2.2.0) but is now disableable: set `VESTIGE_BACKFILL_AUTOFIRE=0`
+(or `false`/`off`/`no`) to turn it off; the manual `backfill` tool + CLI remain
+available regardless. Thanks @randomnimbus for the report and the initial patch.
+
+### Added — First-run guide (#83)
+
+A single `docs/GETTING-STARTED.md` that consolidates install, "what gets saved",
+how to inspect your memory, and project scoping into one 30-minute first-run path,
+linked from the README.
+
+## [2.2.0] - 2026-06-29 — "Retroactive Salience + Tool Consolidation"
+
+Three independent value streams land together as a coherent release.
+
+### Added — Retroactive Salience Backfill ("Memory with hindsight")
+
+A faithful port of Cai 2024 (*Nature*). When a **failure** (bug/crash/regression)
+is recorded, Vestige reaches **backward in time** and promotes the quiet earlier
+memory that *caused* it — the root cause a vector search structurally cannot
+surface, because it is not *similar* to the failure, only *causally upstream*
+(it shares an entity: the same file, env var, or service). Backward-only by
+construction. Auto-fires inside the consolidation pass; also exposed as the
+`backfill` MCP tool and the `vestige backfill` CLI command (`--manual`,
+`--contrast`, `--no-promote` dry-run).
+
+### Changed — MCP Tool Consolidation (34 → 13 advertised tools)
+
+The MCP surface is consolidated from 34 tools to **13**: `recall` (folds
+search + deep_reference + contradictions), `maintain` (consolidate/dream/gc/
+importance_score/backup/export/restore), `dedup` (8 merge tools → 1), `graph`
+(explore/predict/memory_graph/composed_graph), `memory_status` (system_status/
+memory_health/timeline/changelog), plus `memory`, `codebase`, `intention`,
+`smart_ingest`, `source_sync`, `session_start`, `suppress`, and the flagship
+`backfill`. Old tool names remain dispatchable as hidden back-compat aliases.
+
+### Improved — `deep_reference` retrieval engine
+
+- **F32 embeddings** (was I8 quantization) — lifts the 0.4–0.6 paraphrase cosine
+  band so close-but-reworded queries actually retrieve.
+- **Reciprocal Rank Fusion** replaces linear score combination in hybrid search.
+- **Claim-vs-memory contradiction** — `recall`/`cross_reference` now test *your
+  claim* against stored memory, surfacing `claim_contradicts_memory` instead of
+  the old "confident silence."
+- **Never-composed semantic-band gate** — admits no-shared-word memory pairs in
+  the 0.45–0.85 cosine band for `vestige compose`.
+- New `vestige recall <query>` and `vestige compose` CLI commands expose the
+  engine outside the MCP path.
+
+### Fixed — security & correctness (multi-model audit swarm)
+
+SSRF/token-exfil hardening, panic/DoS/overflow fixes, deadlock and
+lock-contention fixes, dedup and decay correctness. `usearch` keeps
+`features = ["fp16lib"]` to avoid the Windows MSVC C1021 build break (#71/#94).
+
+## [2.1.27] - 2026-06-19 — "External-Source Connectors"
+
+Roadmap [#57](https://github.com/samvallad33/vestige/issues/57), **Phases 1–4
+(complete)**: Vestige can now act as a durable, local, semantically-searchable
+retrieval layer over an external system of record — GitHub Issues and Redmine —
+without replacing it. The external system stays canonical; Vestige **indexes,
+connects, retrieves, and cites back** to the source record.
+
+Unlike a live ticket-system MCP proxy (which holds no state and is rate-limited
+per query), Vestige keeps a durable embedded index: searchable **offline**,
+**semantically**, joinable with the rest of your memory, temporally versioned,
+and re-syncable **idempotently** with no duplication. To our knowledge no other
+local-first memory layer combines native connectors, external-URL provenance,
+content-hash idempotent sync, and tombstoning of vanished records.
+
+### Added
+
+- **`source_sync` MCP tool** — index an external system into Vestige.
+  - GitHub: `{"source": "github", "repo": "owner/name"}` indexes every issue +
+    its comments. Auth via `GITHUB_TOKEN` (public repos work tokenless at a
+    lower rate limit).
+  - Redmine: `{"source": "redmine", "project": "<id>"}` indexes a project's
+    issues + journals (comments and status/assignment history). Host from
+    `REDMINE_URL`, auth from `REDMINE_API_KEY`.
+  - Re-running updates changed issues in place (no duplicates); `reconcile:
+    true` tombstones issues no longer visible upstream.
+- **Source-aware investigation filters on `search`** (Phase 4) — filter results
+  by `source_system`, `source_project`, `source_id`, `source_type`,
+  `source_author`, a `source_updated_after`/`source_updated_before` date range,
+  and `source_status` (`valid` / `tombstoned` / `any`). Status, tracker, and
+  priority remain filterable via the existing `tag_prefix` (the connectors emit
+  `status:`/`tracker:`/`priority:`/`label:` tags). Applied as post-filters;
+  non-connector memories are excluded from a source-scoped query.
+- **Source envelope** on every memory — structured, machine-readable provenance
+  (`source_system`, `source_id`, `source_url`, `source_updated_at`,
+  `content_hash`, `synced_at`, `source_project`, `source_type`, `source_author`)
+  distinct from the legacy free-form `source` label. Search results gain a
+  `sourceRecord` object (with the canonical `url`) **only** for
+  connector-ingested memories, so an agent can cite and follow the source.
+- **Idempotent sync primitives** (`vestige-core`): `upsert_by_source` (keyed on
+  `(source_system, source_id)`, content-hash change detection), per-connector
+  cursor checkpoints (`connector_cursors`), and `reconcile_source_tombstones`
+  (invalidate-don't-delete via the bitemporal `valid_until`, so a vanished
+  record is retained for audit but drops out of current retrieval).
+- **Connector contract** (`vestige_core::connectors`) — a small source-agnostic
+  `Connector` trait + `run_sync` driver (cursor overlap window, incremental
+  paging, optional deletion reconcile) with two reference connectors behind the
+  optional `connectors` cargo feature (on by default in the MCP server, off in
+  the core library's default features so non-connector consumers link no HTTP
+  client):
+  - **GitHub Issues** — `state=all`, `since` cursor, Link-header pagination,
+    drops PRs, host-pinned next-url.
+  - **Redmine** — `status_id=*` (open + closed), hex-encoded `updated_on>=`
+    cursor, `offset` pagination, per-issue detail fetch for journals (the list
+    endpoint omits them), `X-Redmine-API-Key` header auth.
+
+### Database
+
+- **Migration V17** — nine nullable source-envelope columns on `knowledge_nodes`
+  (additive; every existing memory is untouched), a partial UNIQUE index on
+  `(source_system, source_id)` enforcing one memory per external record while
+  costing nothing for envelope-less legacy rows, and the `connector_cursors`
+  checkpoint table. Idempotent on replay, following the established
+  `add_column_if_missing` pattern.
+
+### Notes
+
+- Local-first and optional: with no `source_sync` call, behavior is unchanged.
+  The default core-library build does not link an HTTP client.
+
+## [2.1.26] - 2026-06-15 — "Configurable Output"
+
+Roadmap **Phase 2: Configurable Output**. Users can now control the default
+shape and size of high-traffic MCP responses with an optional, local-first
+config file — without recompiling and without a cloud service. The default
+behavior is unchanged: a fresh install with no `vestige.toml` behaves exactly
+as before.
+
+### Added
+
+- **`vestige.toml` config file**, loaded from the active Vestige data directory
+  (`<data_dir>/vestige.toml`, alongside `vestige.db`). A missing or malformed
+  file falls back to built-in defaults, so existing installs are unaffected.
+- **`[defaults]` table** with three keys: `detail_level`
+  (`brief` | `summary` | `full`), `limit` (default result count for
+  high-traffic tools), and `profile`.
+- **Output profiles** — `lean`, `default`, `audit`, `research` — each presetting
+  a coherent bundle of detail level, result limit, and whether scores and
+  timestamps are included:
+  - `lean`: `brief` detail, limit 5, scores and timestamps dropped (smallest
+    context cost).
+  - `default`: historical behavior — `summary` detail, tool's own default
+    limit, scores and timestamps present. **Unchanged.**
+  - `audit`: `full` detail with every field, score, and timestamp.
+  - `research`: `full` detail with a larger default limit (25).
+- **Three-layer precedence**, applied per call: an explicit MCP parameter wins
+  over the config file, which wins over the built-in default.
+- **`profile` field** echoed in `search`, `memory_timeline`, `codebase`
+  (`get_context`), and `session_context` responses so the active profile is
+  observable.
+
+### Changed
+
+- `search`, `memory_timeline`, `codebase` (`get_context`), and
+  `session_context` now resolve their default detail level and result limit
+  through the config file when no explicit parameter is supplied. With no
+  `vestige.toml` present, their output is byte-for-byte identical to v2.1.25.
+
+### Documentation
+
+- `docs/CONFIGURATION.md` gains a **Output Configuration (`vestige.toml`)**
+  section documenting the file location, `[defaults]` keys, profile presets,
+  and precedence rules.
+
+## [2.1.25] - 2026-06-12 — "Merge / Supersede Controls"
+
+v2.1.25 ships Phase 3: diff-previewed, confidence-gated, reversible,
+self-explaining combine/dedupe/supersede on a never-delete (bitemporal) store.
+The default is always preview/review — these tools never silently mutate memory.
+The differentiator is the reversible operation log: every merge/supersede/undo is
+an auditable, reversible event with provenance ("why did these combine?") — a git
+reflog for your agent's memory.
+
+### Added
+
+- **Seven new MCP tools** for merge/supersede control:
+  - `merge_candidates` — surface likely duplicate/overlapping clusters with
+    confidence scores and the signals behind each (Fellegi-Sunter
+    match/possible/non-match). Read-only.
+  - `plan_merge` — produce a previewable merge PLAN (a diff of combined
+    content/tags/provenance) without applying it.
+  - `plan_supersede` — preview superseding A with B (bitemporal invalidation,
+    audit-preserving) without applying.
+  - `apply_plan` — execute a previously-generated plan id; recorded as a
+    reversible operation.
+  - `merge_undo` — reverse a prior merge/supersede operation, or list the
+    reversible operation log (the "memory reflog").
+  - `protect` — pin a memory so it can never be auto-merged, superseded, or
+    garbage-collected.
+  - `merge_policy` — get/set the per-project Fellegi-Sunter two thresholds
+    (`match_threshold`, `possible_threshold`) and `auto_apply`.
+- **Bitemporal "invalidate, don't delete" supersede** (Graphiti-style): a
+  superseded memory is kept and stays queryable for audit. It is stamped with
+  `valid_until = now` and a new `superseded_by` lineage pointer, instead of being
+  deleted or merely demoted.
+- **Reversible operation log** (`merge_operations` table) — every applied
+  merge/supersede records an undo payload and provenance signals so any operation
+  can be reversed, including restoring survivor content/tags and clearing the
+  bitemporal invalidation.
+- **Fellegi-Sunter two-threshold scoring** for dedup/merge candidates, combining
+  embedding cosine similarity with tag and content-token overlap. Borderline
+  "possible" matches are surfaced for review instead of force-merged.
+- **Memory protection / pinning** — `protected` column on `knowledge_nodes`;
+  protected memories are excluded from auto-merge/supersede/GC paths.
+- **Migration V14** adding the `merge_plans` and `merge_operations` tables, the
+  `protected` and `superseded_by` columns on `knowledge_nodes`, and their
+  indexes. Idempotent on replay.
+- **Docs**: `docs/MERGE_SUPERSEDE.md` describing the design, the bitemporal
+  model, the two-threshold policy, the reversible operation log, and the tool
+  surface.
+
+### Notes
+
+- All merge/supersede operations are **opt-in and preview-first**. `apply_plan`
+  requires `confirm=true` for `possible`/`non_match` plans, and only applies
+  `match` plans without confirmation when `merge_policy.auto_apply` is enabled
+  (default off). This deliberately avoids the silent-merge / auto-delete /
+  audit-trail-loss anti-patterns reported against other memory systems.
+- The merge policy persists per-project and is also overridable via
+  `VESTIGE_MERGE_MATCH_THRESHOLD`, `VESTIGE_MERGE_POSSIBLE_THRESHOLD`, and
+  `VESTIGE_MERGE_AUTO_APPLY` environment variables.
+
 ## [2.1.23] - 2026-05-27 — "Receipt Lock Hardening"
 
 v2.1.23 hardens the Sanhedrin launch path so Receipt Lock is portable,

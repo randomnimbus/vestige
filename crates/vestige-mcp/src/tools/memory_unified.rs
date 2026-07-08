@@ -552,6 +552,7 @@ mod tests {
                 tags: vec!["test-tag".to_string()],
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap();
         node.id

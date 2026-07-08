@@ -268,13 +268,23 @@ impl SpeculativeRetriever {
             }
         }
 
-        // Update file-memory associations
+        // Update file-memory associations. Dedupe and cap per file so the map
+        // cannot grow without bound in a long-running server (mirrors the
+        // MAX_PATTERN_HISTORY trim on access_sequence above).
         if let Some(file) = file_context
             && let Ok(mut map) = self.file_memory_map.write()
         {
-            map.entry(file.to_string())
-                .or_insert_with(Vec::new)
-                .push(memory_id.to_string());
+            let ids = map.entry(file.to_string()).or_insert_with(Vec::new);
+            let id = memory_id.to_string();
+            if !ids.contains(&id) {
+                ids.push(id);
+                // keep only the most recent N associations per file
+                const MAX_FILE_MEMORIES: usize = 256;
+                if ids.len() > MAX_FILE_MEMORIES {
+                    let excess = ids.len() - MAX_FILE_MEMORIES;
+                    ids.drain(0..excess);
+                }
+            }
         }
     }
 
@@ -466,7 +476,11 @@ impl SpeculativeRetriever {
 
     fn store_pending_predictions(&self, predictions: &[PredictedMemory]) {
         if let Ok(mut pending) = self.pending_predictions.write() {
-            pending.clear();
+            // Merge (do NOT clear): two predict() calls without an intervening
+            // record_usage() would otherwise wipe the first batch's pending
+            // entries, destroying the right/wrong accounting record_usage relies
+            // on. Newer predictions overwrite same-id entries; older survive
+            // until consumed.
             for pred in predictions {
                 pending.insert(pred.memory_id.clone(), pred.clone());
             }

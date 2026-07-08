@@ -55,6 +55,43 @@ pub fn sanitize_fts5_terms(query: &str) -> Option<String> {
     Some(terms.join(" "))
 }
 
+/// Build a RECALL-friendly FTS5 query that matches rows containing ANY of the
+/// query's tokens, each quoted as a phrase literal so punctuation/operators are
+/// neutralized. Produces e.g. `"500" OR "internal" OR "server" OR "error"`.
+///
+/// This is the correct default for natural-language similarity search: implicit
+/// AND (the old behavior) requires every word — including "on"/"the" — to appear,
+/// which silently drops near-matches; wrapping the whole string in one phrase
+/// (the prior `sanitize_fts5_query`) requires the tokens to be adjacent and in
+/// order, which drops nearly everything. OR + `ORDER BY rank` (BM25) ranks the
+/// row sharing the most distinctive tokens first — true lexical resemblance.
+///
+/// Per https://sqlite.org/fts5.html an embedded `"` is escaped by doubling it.
+///
+/// Tokenization MUST mirror the index's `tokenize='porter ascii'` (migration V7):
+/// the `ascii` tokenizer treats every non-ASCII-alphanumeric byte as a separator,
+/// including `_` and any non-ASCII letter. So we split on `!is_ascii_alphanumeric`
+/// — otherwise a query token like `API_TIMEOUT` or `café` becomes a single phrase
+/// (`"api_timeout"` / `"café"`) that can NEVER match the index (which stored them
+/// as `api`+`timeout` / `caf`). Per-token length is capped at 64 (the ascii
+/// tokenizer's effective max token length) and token count at 64 to bound the
+/// OR-chain. ASCII lowercasing mirrors the tokenizer's case-folding.
+pub fn sanitize_fts5_or_query(query: &str) -> Option<String> {
+    let limited: String = query.chars().take(1000).collect();
+    let q: String = limited
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .take(64) // bound the OR-chain length (DoS hardening)
+        .map(|t| {
+            // mirror the ascii tokenizer: lowercase, cap at its max token length
+            let tok: String = t.chars().take(64).collect::<String>().to_ascii_lowercase();
+            format!("\"{}\"", tok.replace('"', "\"\""))
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    if q.is_empty() { None } else { Some(q) }
+}
+
 /// Sanitize input for FTS5 MATCH queries
 ///
 /// Prevents:
@@ -150,5 +187,54 @@ mod tests {
         let long_query = "a".repeat(2000);
         let sanitized = sanitize_fts5_query(&long_query);
         assert!(sanitized.len() <= 1004);
+    }
+
+    // --- sanitize_fts5_or_query (rotation-audit-hardened) -------------------
+
+    #[test]
+    fn or_query_splits_like_ascii_tokenizer() {
+        // The index uses tokenize='porter ascii': '_' and non-ASCII are separators.
+        // API_TIMEOUT must become two tokens, lowercased — NOT one phrase that
+        // could never match the index. (Consensus finding, DeepSeek + MiniMax.)
+        let q = sanitize_fts5_or_query("API_TIMEOUT failed").unwrap();
+        assert_eq!(q, "\"api\" OR \"timeout\" OR \"failed\"");
+    }
+
+    #[test]
+    fn or_query_non_ascii_is_separated() {
+        // café -> the ascii tokenizer indexes "caf"; our query must not emit "café".
+        let q = sanitize_fts5_or_query("café").unwrap();
+        assert_eq!(q, "\"caf\"");
+    }
+
+    #[test]
+    fn or_query_neutralizes_fts5_operators_and_injection() {
+        // Operators/columns/wildcards are all separators -> stripped, then quoted.
+        let q = sanitize_fts5_or_query("title:secret OR a* -b \"x\"").unwrap();
+        // every token is a quoted phrase literal; no bare operator survives except
+        // our own joining OR. An embedded quote is doubled.
+        assert!(q.contains("\"title\""));
+        assert!(q.contains("\"secret\""));
+        assert!(!q.contains("title:"));
+        assert!(!q.contains("a*"));
+        assert!(!q.contains("-b"));
+    }
+
+    #[test]
+    fn or_query_empty_and_punctuation_only() {
+        assert_eq!(sanitize_fts5_or_query(""), None);
+        assert_eq!(sanitize_fts5_or_query("   "), None);
+        assert_eq!(sanitize_fts5_or_query(":-*^()"), None);
+    }
+
+    #[test]
+    fn or_query_bounds_token_count_and_length() {
+        // DoS hardening: <=64 arms, each token <=64 chars.
+        let many = (0..500).map(|i| format!("t{i}")).collect::<Vec<_>>().join(" ");
+        let q = sanitize_fts5_or_query(&many).unwrap();
+        assert!(q.matches(" OR ").count() <= 63, "OR-chain must be bounded");
+        let longtok = "a".repeat(200);
+        let q2 = sanitize_fts5_or_query(&longtok).unwrap();
+        assert!(q2.len() <= 66, "single token capped at 64 + quotes, got {}", q2.len());
     }
 }

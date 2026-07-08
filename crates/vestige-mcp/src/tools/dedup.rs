@@ -276,6 +276,99 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
     }
 }
 
+// ============================================================================
+// UNIFIED `dedup` TOOL (v2.2 — Tool Consolidation)
+//
+// Folds the 8 former dedup/merge tools into a single action-dispatched surface:
+//   action = scan (default) | plan_merge | plan_supersede | apply | undo
+//          | protect | policy
+//
+// `scan` combines cosine-similarity duplicate clusters (this module's
+// `execute`) with Fellegi-Sunter merge candidates (`merge::merge_candidates`),
+// returning both in separate fields. The mutate/preview/reverse actions delegate
+// to `super::merge::execute` verbatim, preserving plan_id → apply → undo,
+// confirm-gating, and bitemporal-never-delete byte-for-byte.
+// ============================================================================
+
+/// Discriminated-union schema for the unified `dedup` tool.
+pub fn unified_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["scan", "plan_merge", "plan_supersede", "apply", "undo", "protect", "policy"],
+                "default": "scan",
+                "description": "What to do. 'scan' (default): surface duplicate clusters (cosine) AND merge candidates (Fellegi-Sunter), read-only. 'plan_merge'/'plan_supersede': preview a reversible plan without applying (returns plan_id). 'apply': execute a plan_id. 'undo': reverse a prior operation (omit operation_id to list the reflog). 'protect': pin a memory against auto-merge/supersede/forget. 'policy': get/set Fellegi-Sunter thresholds."
+            },
+            "similarity_threshold": {
+                "type": "number",
+                "description": "[scan] Minimum cosine similarity for duplicate clusters (0.5-1.0, default 0.80).",
+                "minimum": 0.5, "maximum": 1.0
+            },
+            "limit": {
+                "type": "integer",
+                "description": "[scan] Max clusters/candidates to return (default 20).",
+                "minimum": 1, "maximum": 100
+            },
+            "tags": {
+                "type": "array", "items": { "type": "string" },
+                "description": "[scan] Optional: only consider memories with these tags (ANY match)."
+            },
+            "member_ids": {
+                "type": "array", "items": { "type": "string" },
+                "description": "[plan_merge] IDs of memories to merge (>= 2). Survivor kept; rest bitemporally invalidated."
+            },
+            "survivor_id": { "type": "string", "description": "[plan_merge] Optional: which member to keep (defaults to highest-retention)." },
+            "old_id": { "type": "string", "description": "[plan_supersede] Memory being superseded (kept, marked invalid)." },
+            "new_id": { "type": "string", "description": "[plan_supersede] Memory that supersedes the old one." },
+            "plan_id": { "type": "string", "description": "[apply] ID of a plan produced by plan_merge/plan_supersede." },
+            "confirm": { "type": "boolean", "default": false, "description": "[apply] Required true for 'possible'/'non_match' plans." },
+            "operation_id": { "type": "string", "description": "[undo] Operation to reverse. Omit to list the reflog." },
+            "id": { "type": "string", "description": "[protect] Memory id to protect/unprotect." },
+            "protected": { "type": "boolean", "default": true, "description": "[protect] true to pin, false to unpin." },
+            "match_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "[policy] Score >= this => 'match'." },
+            "possible_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "[policy] Score in [possible, match) => review." },
+            "auto_apply": { "type": "boolean", "description": "[policy] Allow 'match' plans to apply without confirm. Default false." }
+        }
+    })
+}
+
+/// Unified dispatcher for the `dedup` tool. Routes on `action` (default `scan`).
+pub async fn execute_unified(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
+    let action = args
+        .as_ref()
+        .and_then(|a| a.get("action"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("scan")
+        .to_string();
+
+    match action.as_str() {
+        "scan" => {
+            // Cosine-similarity duplicate clusters (this module).
+            let clusters = execute(storage, args.clone()).await?;
+            // Fellegi-Sunter merge candidates (merge module, name-dispatched).
+            let candidates =
+                super::merge::execute(storage, "merge_candidates", args.clone()).await?;
+            Ok(serde_json::json!({
+                "action": "scan",
+                "duplicateClusters": clusters,
+                "mergeCandidates": candidates,
+                "nextStep": "Use action='plan_merge' (member_ids) or action='plan_supersede' (old_id,new_id) to preview a reversible plan, then action='apply' (plan_id)."
+            }))
+        }
+        "plan_merge" => super::merge::execute(storage, "plan_merge", args).await,
+        "plan_supersede" => super::merge::execute(storage, "plan_supersede", args).await,
+        "apply" => super::merge::execute(storage, "apply_plan", args).await,
+        "undo" => super::merge::execute(storage, "merge_undo", args).await,
+        "protect" => super::merge::execute(storage, "protect", args).await,
+        "policy" => super::merge::execute(storage, "merge_policy", args).await,
+        other => Err(format!(
+            "Unknown dedup action '{other}'. Use scan|plan_merge|plan_supersede|apply|undo|protect|policy."
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +378,25 @@ mod tests {
         let schema = schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["similarity_threshold"].is_object());
+    }
+
+    #[test]
+    fn test_unified_schema() {
+        let schema = unified_schema();
+        assert_eq!(schema["type"], "object");
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert_eq!(actions.len(), 7);
+        assert_eq!(schema["properties"]["action"]["default"], "scan");
+    }
+
+    #[tokio::test]
+    async fn test_unified_scan_empty_storage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(Some(dir.path().join("test.db"))).unwrap();
+        let storage = Arc::new(storage);
+        // Default action (scan) on empty storage must not error.
+        let result = execute_unified(&storage, None).await;
+        assert!(result.is_ok());
     }
 
     #[test]

@@ -139,3 +139,6 @@ apps/dashboard/node_modules/
 # =============================================================================
 fastembed-rs/
 .mcp.json
+
+.claude/
+.codebase-memory/

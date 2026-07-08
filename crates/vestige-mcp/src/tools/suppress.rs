@@ -177,6 +177,7 @@ mod tests {
                 tags: vec!["test".to_string()],
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap()
             .id

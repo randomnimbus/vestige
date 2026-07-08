@@ -23,8 +23,10 @@ pub mod cross_project;
 pub mod dreams;
 pub mod importance;
 pub mod intent;
+pub mod merge_supersede;
 pub mod prediction_error;
 pub mod reconsolidation;
+pub mod retroactive_backfill;
 pub mod speculative;
 
 // Re-exports for convenient access
@@ -61,6 +63,11 @@ pub use dreams::{
 };
 pub use importance::{ImportanceDecayConfig, ImportanceScore, ImportanceTracker, UsageEvent};
 pub use intent::{ActionType, DetectedIntent, IntentDetector, MaintenanceType, UserAction};
+pub use merge_supersede::{
+    DEFAULT_MATCH_THRESHOLD, DEFAULT_POSSIBLE_THRESHOLD, MatchClass, MatchSignals, MergeCandidate,
+    MergeOperation, MergePlan, MergePolicy, PlanKind, compose_merged_content, compose_merged_tags,
+    score_pair,
+};
 pub use prediction_error::{
     CandidateMemory, CreateReason, EvaluationIntent, GateDecision, GateStats, MergeStrategy,
     PredictionErrorConfig, PredictionErrorGate, SimilarityResult, SupersedeReason, UpdateType,
@@ -70,5 +77,8 @@ pub use reconsolidation::{
     AccessContext, AccessTrigger, AppliedModification, ChangeSummary, LabileState, MemorySnapshot,
     Modification, ReconsolidatedMemory, ReconsolidationManager, ReconsolidationStats,
     RelationshipType, RetrievalRecord,
+};
+pub use retroactive_backfill::{
+    BackfillCandidate, BackfillResult, BackfilledCause, FailureEvent, RetroactiveBackfill,
 };
 pub use speculative::{PredictedMemory, PredictionContext, SpeculativeRetriever, UsagePattern};

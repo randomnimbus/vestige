@@ -1,480 +1,307 @@
 <div align="center">
 
-# Vestige
+<h1>Vestige</h1>
 
-### Local cognitive memory for MCP-compatible AI agents.
+### Your bug was born days before it crashed. You just can't remember where.
 
-[![GitHub stars](https://img.shields.io/github/stars/samvallad33/vestige?style=social)](https://github.com/samvallad33/vestige)
-[![Release](https://img.shields.io/github/v/release/samvallad33/vestige)](https://github.com/samvallad33/vestige/releases/latest)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](https://github.com/samvallad33/vestige/actions)
-[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
-[![MCP Compatible](https://img.shields.io/badge/MCP-compatible-green)](https://modelcontextprotocol.io)
+<em>Vestige is a local-first memory for AI agents that reaches <b>backward through time</b> to find the quiet change that caused today's failure: the cause that looks nothing like the bug. One 23MB Rust binary. No cloud. Your data never leaves your machine.</em>
 
-**Your agent forgets project decisions between sessions. Vestige gives it local, inspectable memory.**
+[![GitHub stars](https://img.shields.io/github/stars/samvallad33/vestige?style=for-the-badge&logo=github&color=8b5cf6)](https://github.com/samvallad33/vestige/stargazers)
+[![Release](https://img.shields.io/github/v/release/samvallad33/vestige?style=for-the-badge&color=06b6d4)](https://github.com/samvallad33/vestige/releases/latest)
+[![Tests](https://img.shields.io/badge/tests-1550_passing-22c55e?style=for-the-badge)](https://github.com/samvallad33/vestige/actions)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-3b82f6?style=for-the-badge)](LICENSE)
 
-Built on proven memory and retrieval ideas — FSRS-6 spaced repetition, prediction error gating, synaptic tagging, spreading activation, and memory consolidation — all running in a single Rust binary with a local dashboard. 100% local. Zero cloud.
-
-[Quick Start](#quick-start) | [Dashboard](#-3d-memory-dashboard) | [How It Works](#-the-cognitive-science-stack) | [Tools](#-25-mcp-tools) | [Docs](docs/)
+[**⚡ Quick Start**](#-get-it-running-in-60-seconds) · [**🧠 The Idea**](#-why-i-built-this) · [**🔬 The Science**](#-this-is-real-neuroscience-not-a-metaphor) · [**🛠 13 Tools**](#-13-tools-one-brain) · [**📊 Dashboard**](#-watch-your-ai-think-in-3d)
 
 </div>
 
 ---
 
-## What's New in v2.1.23 "Receipt Lock Hardening"
+## 👋 Why I built this
 
-v2.1.23 turns the Sanhedrin Receipt Lock launch into something more portable,
-observable, and harder to spoof.
+Hi, I'm [Sam](https://github.com/samvallad33). I built Vestige from a tiny apartment in Chicago because I kept losing days to the same thing, and I bet you have too.
 
-- **Model-agnostic Sanhedrin presets.** Sanhedrin no longer guesses a large default verifier. Users choose any OpenAI-compatible endpoint/model, or start from custom, small laptop, Ollama, MLX, vLLM, llama.cpp, hosted API, or LiteLLM presets.
-- **Sharper Receipt Lock.** Verification claims inside code fences, quotes, blockquotes, or explicitly hedged "let me verify" language no longer trigger false vetoes, while actual "tests passed" claims still require command receipts.
-- **Safer command receipts.** Transcript command evidence now prefers structured tool-use receipts; loose JSON scanning is opt-in only.
-- **Visible fail-open telemetry.** Timeouts, unavailable model endpoints, and malformed verdicts are logged locally and surfaced in the dashboard's 7-day Sanhedrin stats.
-- **Durable evidence boundary.** Staged evidence remains useful context, but it cannot satisfy durable support or contradiction requirements by itself.
-- **Safer batch writes.** `smart_ingest` batch mode now keeps caller-separated items separate by default and returns merge previews when an existing memory is mutated.
-- **Opt-in NVIDIA acceleration path.** Qwen3 embedding builds expose CUDA/cuDNN feature flags for contributors and users with CUDA-capable hosts.
+Production breaks. You start hunting. And the cause is almost never *near* the error. It's some quiet change you made days ago that looks **nothing** like the crash it eventually caused. A flipped env var. A swapped service. A config tweak you'd already forgotten.
+
+Here's the part that took me a while to see: **every AI memory tool is built on vector search, and vector search hunts for what *looks like* your problem.** But a root cause never looks like the bug it creates. So they all search the goal line, while the real failure was a quiet midfield turnover fifteen minutes earlier.
+
+I wanted a memory that traces the match *backward.*
+
+So that's what Vestige is. Everyone else built a memory that **remembers**. I tried to build the first one that **realizes**: it gates what's worth keeping, lets the noise fade like your own memory does, and when a failure hits, it reaches back through time to the change that actually caused it.
+
+It's one Rust binary. It runs entirely on your machine. It never phones home. And there's a 60-second start right below.
+
+> 🎙️ **The 60-second version** of this whole story, the one I give in person, lives in [`demo/PITCH-v2-causebench.md`](demo/PITCH-v2-causebench.md). If you've got a minute, read that first. It's the clearest way to *get* why this matters.
 
 ---
 
-## Quick Start
+## ⚡ Get it running in 60 seconds
+
+**Step 1 — install (one binary, no Docker, no API key, no signup):**
 
 ```bash
-# 1. Install
 npm install -g vestige-mcp-server@latest
-
-# 2. Connect to any MCP-compatible agent
-# Claude Code
-claude mcp add vestige vestige-mcp -s user
-
-# Codex
-codex mcp add vestige -- vestige-mcp
-
-# 3. Test it
-# "Remember that I prefer TypeScript over JavaScript"
-# ...new session...
-# "What are my coding preferences?"
-# → "You prefer TypeScript over JavaScript."
 ```
+
+**Step 2 — connect it to your agent.** Vestige speaks [MCP](https://modelcontextprotocol.io), so it works with *any* AI agent. The universal config (works everywhere):
+
+```json
+{ "mcpServers": { "vestige": { "command": "vestige-mcp" } } }
+```
+
+Drop that into your agent's MCP config file. Or use the one-line shortcut for your agent:
+
+```bash
+# Cursor / Windsurf / VS Code      → add the JSON above to ~/.cursor/mcp.json (or the editor's MCP settings)
+# Claude Code                      → claude mcp add vestige vestige-mcp -s user
+# Codex                            → codex mcp add vestige -- vestige-mcp
+# Cline / Continue / Zed / Goose   → add the JSON above to that client's MCP config
+```
+
+**Step 3 — confirm it's working:**
+
+```bash
+vestige-mcp --version     # prints the installed version
+vestige stats             # prints your memory count (0 on a fresh install)
+```
+
+That's the whole install. New here? The [**30-minute first-run guide**](docs/GETTING-STARTED.md) walks you from install to your first backward-reach: what gets saved (and what doesn't), how to inspect your own memory, and how to scope it per project. Per-agent guides (Cursor, VS Code, Windsurf, JetBrains, Xcode, OpenCode, Codex, Claude Desktop) are [here ↓](#-works-with-every-ai-agent).
+
+Now talk to your agent like it has a memory, because now it does:
+
+```
+You:  "Remember: we always disable SimSIMD on release builds, it breaks old x86 CPUs."
+        ...days later, fresh session, zero context...
+You:  "Should I enable SimSIMD for the release?"
+AI:   ⚠️ Hold on, this contradicts a decision you stored: you chose to DISABLE it
+        because it breaks old x86 CPUs.
+```
+
+That last line isn't me being cute. It's a real status the engine returns, called `claim_contradicts_memory`. Most memory tools would have happily handed you the wrong answer. Vestige tells you when you're about to walk back into a mistake you already learned from.
+
+And the headline feature, the one nothing else does, is one command:
+
+```bash
+vestige backfill --contrast
+```
+
+When a failure is in your memory, this reaches *backward through time* and finds the quiet earlier change that caused it (the one a vector search ranks poorly because it shares no words with the error). It shows you, side by side, what similarity search returns versus the real cause. [More on the backward reach ↓](#-the-thing-nothing-else-does-memory-with-hindsight)
+
+*(Works with Codex, Cursor, VS Code, Claude Desktop, Windsurf, JetBrains, Zed: anything that speaks MCP. [Full setup is here ↓](#-works-in-every-editor-you-use).)*
+
+---
+
+## 🧠 It's not RAG with a nicer haircut
+
+RAG is a bucket: throw everything in, hope nearest-neighbor finds it later. Vestige behaves more like an actual memory: it decides what's worth keeping, forgets what isn't, and reasons across what's left.
+
+|  | 🪣 RAG / Vector Store | 🧠 Vestige |
+|---|---|---|
+| **What it stores** | Everything you hand it | Only what's **surprising or new** (the rest gets merged or skipped) |
+| **What it forgets** | Nothing; it just bloats | Unused memories **fade** on a real forgetting curve, so your context stays lean |
+| **Finding a root cause** | Can't, because the cause isn't *similar* to the bug | **Reaches backward in time** to the change that caused it (the whole point ↓) |
+| **Catching contradictions** | Silent; serves the stale answer with a straight face | Tells you: *"this contradicts what you decided"* |
+| **Duplicates** | You clean them up by hand | Self-heals: *"likes dark mode"* + *"prefers dark themes"* quietly become one |
+| **Forgetting on demand** | DELETE and it's gone | **`suppress`** gently inhibits a memory (and its neighbors), reversible for 24h |
+| **Where it lives** | Usually someone else's cloud | **Your machine. One binary. No telemetry.** |
+
+---
+
+## 🔥 The thing nothing else does: memory with hindsight
+
+This is the part I'm proudest of, and it's worth one honest paragraph.
+
+A bug shows up today. The cause was a quiet decision from three weeks ago, like a changed env var or a swapped service. That cause **shares no words with the error it created.** A vector search will never connect them, because it only knows how to find things that *look alike*, and this is a case where the cause and the symptom look nothing alike. This isn't a tuning problem; in 2026 Google DeepMind published a proof ([arXiv:2508.21038](https://arxiv.org/abs/2508.21038), ICLR 2026) that single-vector retrieval is *mathematically* incapable of bridging gaps like this.
+
+So Vestige doesn't do it with similarity. Its **Retroactive Salience Backfill** (ported from **Zaki/Cai et al., 2024, *Nature* 637:145–155** ([DOI](https://doi.org/10.1038/s41586-024-08168-4)), on how the brain links a shock to the quiet memory that caused it) reaches *backward through time* and promotes the dormant memory that's **causally upstream**: it shares an *entity* (the same file, env var, or service), not the same words.
+
+I also built a benchmark to keep myself honest about it. Every pure vector retriever scored **0% recall@1** on the causal-gap task; Vestige scored **60%**. (To be precise: the impossibility is DeepMind's *theorem*; the 0%-vs-60% is *my measurement*. Two different claims, and I keep them separate.)
+
+```bash
+vestige backfill --contrast      # show the root cause a vector search would have missed
+```
+
+The nice part: it compounds. Every failure your agent records makes the *next* session diagnose faster (run two is smarter than run one), and it happens automatically during consolidation, so you don't have to babysit it.
+
+All of this shipped in **v2.2.0**, along with a 34→13 tool consolidation and a rebuilt retrieval engine. [Full release notes →](https://github.com/samvallad33/vestige/releases/tag/v2.2.0)
+
+---
+
+## 🔬 This is real neuroscience, not a metaphor
+
+I get skeptical when projects wave the word "neuroscience" around, so here's my receipt: every mechanism below is a real, cited paper, implemented in Rust, running locally on your machine. None of it phones a model in the cloud to sound smart.
+
+| Mechanism | What it does for you | Grounded in |
+|---|---|---|
+| **Prediction-Error Gating** | Redundant info gets merged, contradictory gets superseded, only the novel gets stored | The hippocampal novelty signal |
+| **FSRS-6 Spaced Repetition** | 21 parameters of the mathematics of forgetting, so used memories stay and unused ones fade | Modern spaced-repetition research |
+| **Retroactive Salience Backfill** | Backward causal reach to the root cause of a failure | Zaki/Cai et al. 2024, *Nature* 637:145–155 |
+| **Synaptic Tagging** | A memory that looked trivial this morning can be tagged critical tonight | [Frey & Morris 1997](https://doi.org/10.1038/385533a0) |
+| **Spreading Activation** | Search "auth bug," surface last week's JWT update, because memory is a graph, not a list | [Collins & Loftus 1975](https://doi.org/10.1037/0033-295X.82.6.407) |
+| **Dual-Strength Model** | Storage strength vs. retrieval strength, so deeply stored ≠ instantly recalled, just like you | [Bjork & Bjork 1992](https://doi.org/10.1016/S0079-7421(08)60016-9) |
+| **Memory Dreaming** | Sleep-like consolidation: replays, connects, synthesizes insights to a graph | Active-dreaming consolidation |
+| **Active Forgetting (`suppress`)** | Top-down inhibition that *compounds* and cascades to neighbors, reversible for 24h | [Anderson 2025](https://www.nature.com/articles/s41583-025-00929-y) · [Davis 2020](https://pmc.ncbi.nlm.nih.gov/articles/PMC7477079/) |
+
+[**Read the full science doc →**](docs/SCIENCE.md). Every feature, every paper.
+
+---
+
+## 🛠 13 tools, one brain
+
+v2.2.0 consolidated a sprawling 34-tool surface into **13 sharp ones** your agent actually reaches for. Old names still work as hidden aliases, so nothing breaks.
+
+| Tool | What it does |
+|---|---|
+| 🔍 `recall` | The retrieval engine. Folds search + deep reasoning + contradiction detection into one call. F32 embeddings, Reciprocal Rank Fusion, claim-vs-memory checks. |
+| 🧠 `backfill` | **Memory with hindsight.** Backward causal reach to a failure's root cause (Cai 2024). |
+| 💾 `smart_ingest` | Stores with CREATE / UPDATE / SUPERSEDE via Prediction-Error Gating. Batch session-end saves. |
+| 🗂 `memory` | Get, edit, promote 👍, demote 👎, check state, purge content + embeddings. |
+| 🧩 `graph` | Reasoning chains, associations, bridges, predictions, force-directed export. |
+| 🌙 `maintain` | Consolidate, dream, GC, importance-score, backup, export, restore. One maintenance verb. |
+| 🧹 `dedup` | Self-healing duplicate detection + merge (8 old tools → 1). |
+| 🚫 `suppress` | Top-down active forgetting that compounds, cascades, and is reversible for 24h. The memory is *inhibited, not erased.* |
+| 📟 `memory_status` | Health + stats + trends + recommendations in one packet. |
+| 🧬 `codebase` · `intention` · `source_sync` · `session_start` | Per-project code memory · "remind me when X" · external-source connectors · one-call session init. |
+
+---
+
+## 📊 Watch your AI think in 3D
+
+```bash
+vestige dashboard      # → http://localhost:3927/dashboard
+```
+
+Every memory is a glowing node in a real-time, force-directed 3D graph. Connections form as you work. Nodes **pulse** when accessed, **burst** on creation, **fade** on decay. Kick off a consolidation and the whole graph slides into **purple dream mode**, replaying memories that light up in sequence.
+
+Built with SvelteKit 2 · Svelte 5 · Three.js · WebGL bloom · live WebSocket events. 1000+ nodes at 60fps. Installable as a PWA.
+
+---
+
+## 🧩 Works with every AI agent
+
+Vestige speaks MCP, so **any agent that can register an MCP server can use it.** Not a plugin for one tool, the memory layer underneath all of them. The universal config works everywhere:
+
+```json
+{ "mcpServers": { "vestige": { "command": "vestige-mcp" } } }
+```
+
+| Agent | Setup |
+|---|---|
+| **Cursor** | add the JSON above to `~/.cursor/mcp.json` · [guide →](docs/integrations/cursor.md) |
+| **Windsurf** | [guide →](docs/integrations/windsurf.md) |
+| **VS Code (Copilot)** | [guide →](docs/integrations/vscode.md) |
+| **Cline / Continue / Zed / Goose** | add the universal JSON to that client's MCP config |
+| **Claude Code** | `claude mcp add vestige vestige-mcp -s user` |
+| **Codex** | `codex mcp add vestige -- vestige-mcp` |
+| **JetBrains · Xcode · OpenCode** | [integration guides →](docs/integrations/) |
+| **Claude Desktop** | [2-minute setup →](docs/CONFIGURATION.md#claude-desktop-macos) |
 
 <details>
-<summary>Other platforms & install methods</summary>
+<summary><b>Other install methods (Intel Mac, Windows, build-from-source)</b></summary>
 
-**Updating an existing install:**
+**Update an existing install:**
 ```bash
-vestige update
+vestige update                          # binaries only
+vestige update --sandwich-companion     # also refresh optional Claude Code companion files
 ```
 
-`vestige update` updates only the Vestige binaries by default. Use
-`vestige update --sandwich-companion` if you also want to refresh optional Claude
-Code Cognitive Sandwich companion files.
-
-**macOS/Linux manual binary install:**
-```bash
-vestige update --install-dir /usr/local/bin
-```
-
-**macOS (Intel):** Microsoft is discontinuing x86_64 macOS prebuilts after ONNX Runtime v1.23.0, so Vestige's Intel Mac build links dynamically against a Homebrew-installed ONNX Runtime via the `ort-dynamic` feature. Install with:
-
+**macOS (Intel):** Microsoft is dropping x86_64 macOS ONNX Runtime prebuilts after v1.23.0, so the Intel Mac build links dynamically against a Homebrew ONNX Runtime:
 ```bash
 brew install onnxruntime
 npm install -g vestige-mcp-server@latest
-echo 'export ORT_DYLIB_PATH="'"$(brew --prefix onnxruntime)"'/lib/libonnxruntime.dylib"' >> ~/.zshrc
-source ~/.zshrc
+echo 'export ORT_DYLIB_PATH="'"$(brew --prefix onnxruntime)"'/lib/libonnxruntime.dylib"' >> ~/.zshrc && source ~/.zshrc
 claude mcp add vestige vestige-mcp -s user
 ```
+Full guide: [`docs/INSTALL-INTEL-MAC.md`](docs/INSTALL-INTEL-MAC.md).
 
-Full Intel Mac guide (build-from-source + troubleshooting): [`docs/INSTALL-INTEL-MAC.md`](docs/INSTALL-INTEL-MAC.md).
-
-**Windows + Claude Desktop (recommended):**
-
-Fully quit Claude Desktop from the system tray, then install or update Vestige from PowerShell:
-
+**Windows + Claude Desktop:** quit Claude Desktop from the tray, then in PowerShell:
 ```powershell
 npm install -g vestige-mcp-server@latest
 vestige-mcp --version
 ```
-
-Open `%APPDATA%\Claude\claude_desktop_config.json` and point Claude Desktop at the installed MCP command:
-
+Point `%APPDATA%\Claude\claude_desktop_config.json` at it:
 ```json
-{
-  "mcpServers": {
-    "vestige": {
-      "command": "vestige-mcp"
-    }
-  }
-}
+{ "mcpServers": { "vestige": { "command": "vestige-mcp" } } }
 ```
+If it can't find the command, run `where vestige-mcp` and use the exact `.cmd` path.
 
-If Claude Desktop cannot find `vestige-mcp`, run `where vestige-mcp` in PowerShell and use the exact `.cmd` path it prints as `command`. Example: `"C:\\Users\\you\\AppData\\Roaming\\npm\\vestige-mcp.cmd"`. Reopen Claude Desktop after saving. Future binary updates use `vestige update`; optional Claude Code companion files require `vestige update --sandwich-companion`.
-
-**Windows source build:** Prebuilt binaries ship but `usearch 2.24.0` hit an MSVC compile break ([usearch#746](https://github.com/unum-cloud/usearch/issues/746)); we've pinned `=2.23.0` until upstream fixes it. Source builds work with:
-
+**Build from source (Rust 1.91+):**
 ```bash
 git clone https://github.com/samvallad33/vestige && cd vestige
 cargo build --release -p vestige-mcp
-```
-
-**npm:**
-```bash
-npm install -g vestige-mcp-server
-```
-
-**Build from source (requires Rust 1.91+):**
-```bash
-git clone https://github.com/samvallad33/vestige && cd vestige
-cargo build --release -p vestige-mcp
-# Optional: enable Metal GPU acceleration on Apple Silicon
-cargo build --release -p vestige-mcp --features metal
+# Apple Silicon GPU: --features metal   ·   NVIDIA: --features qwen3-embeddings,cuda
 ```
 </details>
 
 ---
 
-## Works Everywhere
+## 🚀 Make your AI use memory automatically
 
-Vestige speaks MCP, so any client that can register a stdio MCP server can use it.
+Registering the server exposes the tools; a short instruction tells the agent *when* to call them. Drop in the protocol and your agent saves and recalls on its own:
 
-| IDE | Setup |
-|-----|-------|
-| **Claude Code** | `claude mcp add vestige vestige-mcp -s user` |
-| **Codex** | [Integration guide](docs/integrations/codex.md) |
-| **Claude Desktop** | [2-min setup](docs/CONFIGURATION.md#claude-desktop-macos) |
-| **Xcode 26.3** | [Integration guide](docs/integrations/xcode.md) |
-| **Cursor** | [Integration guide](docs/integrations/cursor.md) |
-| **VS Code (Copilot)** | [Integration guide](docs/integrations/vscode.md) |
-| **JetBrains** | [Integration guide](docs/integrations/jetbrains.md) |
-| **Windsurf** | [Integration guide](docs/integrations/windsurf.md) |
+| You say | Vestige does |
+|---|---|
+| *"Remember this"* | Saves immediately |
+| *"I always..."* / *"I prefer..."* | Saves as a durable preference |
+| *"Remind me when..."* | Creates a future trigger (`intention`) |
+| *"This is important"* | Saves **and** promotes it |
+
+[Agent memory protocol →](docs/AGENT-MEMORY-PROTOCOL.md) · [Claude Code template →](docs/CLAUDE-SETUP.md)
 
 ---
 
-## 🧠 3D Memory Dashboard
-
-Vestige v2.0 ships with a real-time 3D visualization of your AI's memory. Every memory is a glowing node in 3D space. Watch connections form, memories pulse when accessed, and the entire graph come alive during dream consolidation.
-
-**Features:**
-- Force-directed 3D graph with 1000+ nodes at 60fps
-- Bloom post-processing for cinematic neural network aesthetic
-- Real-time WebSocket events: memories pulse on access, burst on creation, fade on decay
-- Dream visualization: graph enters purple dream mode, replayed memories light up sequentially
-- FSRS retention curves: see predicted memory decay at 1d, 7d, 30d
-- Command palette (`Cmd+K`), keyboard shortcuts, responsive mobile layout
-- Installable as PWA for quick access
-
-**Tech:** SvelteKit 2 + Svelte 5 + Three.js + Tailwind CSS 4 + WebSocket
-
-Run `vestige dashboard` to open `http://localhost:3927/dashboard`, or set `VESTIGE_DASHBOARD_ENABLED=true` to start it with the MCP server.
-
----
-
-## Architecture
+## 🏗 Under the hood
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  SvelteKit Dashboard (apps/dashboard)                │
-│  Three.js 3D Graph · WebGL + Bloom · Real-time WS   │
-├─────────────────────────────────────────────────────┤
-│  Axum HTTP + WebSocket Server (port 3927)            │
-│  15 REST endpoints · WS event broadcast              │
-├─────────────────────────────────────────────────────┤
-│  MCP Server (stdio JSON-RPC)                         │
-│  25 tools · 30 cognitive modules                     │
-├─────────────────────────────────────────────────────┤
-│  Cognitive Engine                                    │
-│  ┌──────────┐ ┌──────────┐ ┌───────────────┐       │
-│  │ FSRS-6   │ │ Spreading│ │ Prediction    │       │
-│  │ Scheduler│ │ Activation│ │ Error Gating  │       │
-│  └──────────┘ └──────────┘ └───────────────┘       │
-│  ┌──────────┐ ┌──────────┐ ┌───────────────┐       │
-│  │ Memory   │ │ Synaptic │ │ Hippocampal   │       │
-│  │ Dreamer  │ │ Tagging  │ │ Index         │       │
-│  └──────────┘ └──────────┘ └───────────────┘       │
-├─────────────────────────────────────────────────────┤
-│  Storage Layer                                       │
-│  SQLite + FTS5 · USearch HNSW · Nomic Embed v1.5    │
-│  Optional: Nomic v2 MoE · Qwen3 Reranker · Metal   │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  SvelteKit Dashboard / Three.js 3D graph / WebGL bloom    │
+├──────────────────────────────────────────────────────────┤
+│  Axum HTTP + WebSocket (:3927) / REST + live event stream │
+├──────────────────────────────────────────────────────────┤
+│  MCP Server (stdio JSON-RPC) / 13 tools · 30 modules      │
+├──────────────────────────────────────────────────────────┤
+│  Cognitive Engine                                          │
+│   FSRS-6 · Spreading Activation · Prediction-Error Gating │
+│   Retroactive Salience Backfill · Synaptic Tagging        │
+│   Memory Dreamer · Hippocampal Index · Active Forgetting  │
+├──────────────────────────────────────────────────────────┤
+│  Storage: SQLite + FTS5 · USearch HNSW · Nomic Embed v1.5 │
+│   Optional: Qwen3 reranker · SQLCipher · Metal/CUDA       │
+└──────────────────────────────────────────────────────────┘
 ```
 
----
-
-## Why Not Just Use RAG?
-
-RAG is a dumb bucket. Vestige is an active organ.
-
-| | RAG / Vector Store | Vestige |
-|---|---|---|
-| **Storage** | Store everything | **Prediction Error Gating** — only stores what's surprising or new |
-| **Retrieval** | Nearest-neighbor | **7-stage pipeline** — HyDE expansion + reranking + spreading activation |
-| **Decay** | Nothing expires | **FSRS-6** — memories fade naturally, context stays lean |
-| **Forgetting** *(v2.0.5)* | Delete only | **`suppress` tool** — compounding top-down inhibition, neighbor cascade, reversible 24h |
-| **Duplicates** | Manual dedup | **Self-healing** — auto-merges "likes dark mode" + "prefers dark themes" |
-| **Importance** | All equal | **4-channel scoring** — novelty, arousal, reward, attention |
-| **Sleep** | No consolidation | **Memory dreaming** — replays, connects, synthesizes insights |
-| **Health** | No visibility | **Retention dashboard** — distributions, trends, recommendations |
-| **Visualization** | None | **3D neural graph** — real-time WebSocket-powered Three.js |
-| **Privacy** | Usually cloud | **100% local** — your data never leaves your machine |
+| | |
+|---|---|
+| **Language** | Rust 2024 (MSRV 1.91), **86,000+ lines** |
+| **Binary** | ~23MB, single file |
+| **Embeddings** | Nomic Embed Text v1.5 (768d→256d Matryoshka, 8192 ctx); Qwen3 optional |
+| **Vector search** | USearch HNSW (≈20× faster than FAISS) |
+| **Storage** | SQLite + FTS5, optional SQLCipher encryption |
+| **Tests** | **1,550 passing** · clippy `-D warnings` clean |
+| **First run** | Downloads ~130MB embedding model once, then **fully offline forever** |
+| **Platforms** | macOS (ARM + Intel) · Linux x86_64 · Windows x86_64. All prebuilt |
 
 ---
 
-## 🔬 The Cognitive Science Stack
+## 📚 Go deeper
 
-This isn't a key-value store with an embedding model bolted on. Vestige implements real neuroscience:
-
-**Prediction Error Gating** — The hippocampal bouncer. When new information arrives, Vestige compares it against existing memories. Redundant? Merged. Contradictory? Superseded. Novel? Stored with high synaptic tag priority.
-
-**FSRS-6 Spaced Repetition** — 21 parameters governing the mathematics of forgetting. Frequently-used memories stay strong. Unused memories naturally decay. Your context window stays clean.
-
-**HyDE Query Expansion** *(v2.0)* — Template-based Hypothetical Document Embeddings. Expands queries into 3-5 semantic variants, embeds all variants, and searches with the centroid embedding for dramatically better recall on conceptual queries.
-
-**Synaptic Tagging** — A memory that seemed trivial this morning can be retroactively tagged as critical tonight. Based on [Frey & Morris, 1997](https://doi.org/10.1038/385533a0).
-
-**Spreading Activation** — Search for "auth bug" and find the related JWT library update from last week. Memories form a graph, not a flat list. Based on [Collins & Loftus, 1975](https://doi.org/10.1037/0033-295X.82.6.407).
-
-**Dual-Strength Model** — Every memory has storage strength (encoding quality) and retrieval strength (accessibility). A deeply stored memory can be temporarily hard to retrieve — just like real forgetting. Based on [Bjork & Bjork, 1992](https://doi.org/10.1016/S0079-7421(08)60016-9).
-
-**Memory Dreaming** — Like sleep consolidation. Replays recent memories to discover hidden connections, strengthen important patterns, and synthesize insights. Dream-discovered connections persist to a graph database. Based on the [Active Dreaming Memory](https://engrxiv.org/preprint/download/5919/9826/8234) framework.
-
-**Waking SWR Tagging** — Promoted memories get sharp-wave ripple tags for preferential replay during dream consolidation. 70/30 tagged-to-random ratio. Based on [Buzsaki, 2015](https://doi.org/10.1038/nn.3963).
-
-**Autonomic Regulation** — Self-regulating memory health. Auto-promotes frequently accessed memories. Auto-GCs low-retention memories. Consolidation triggers on 6h staleness or 2h active use.
-
-**Active Forgetting** *(v2.0.5)* — Top-down inhibitory control via the `suppress` tool. Other memory systems implement passive decay — the Ebbinghaus 1885 "use it or lose it" curve, sometimes with trust-weighted strength factors. Vestige v2.0.5 also implements *active* top-down suppression: each `suppress` call compounds (Suppression-Induced Forgetting, Anderson 2025), a background Rac1 cascade worker fades co-activated neighbors across the connection graph (Cervantes-Sandoval & Davis 2020), and a 24-hour labile window allows reversal (Nader reconsolidation semantics on a pragmatic axis). The memory persists — it's **inhibited, not erased**. Explicitly distinct from Anderson 1994 retrieval-induced forgetting (bottom-up, passive competition during retrieval), which is a separate, older primitive that several other memory systems implement. Based on [Anderson et al., 2025](https://www.nature.com/articles/s41583-025-00929-y) and [Cervantes-Sandoval et al., 2020](https://pmc.ncbi.nlm.nih.gov/articles/PMC7477079/). First shipped AI memory system with this primitive.
-
-[Full science documentation ->](docs/SCIENCE.md)
+| | |
+|---|---|
+| [**Getting Started**](docs/GETTING-STARTED.md) | Your first 30 minutes, start to finish |
+| [**FAQ**](docs/FAQ.md) | 30+ real questions answered |
+| [**The Science**](docs/SCIENCE.md) | Every feature, every paper |
+| [**Storage Modes**](docs/STORAGE.md) | Global · per-project · multi-instance |
+| [**Configuration**](docs/CONFIGURATION.md) | CLI, env vars, every knob |
+| [**Changelog**](CHANGELOG.md) | The full story, version by version |
 
 ---
 
-## 🛠 25 MCP Tools
+<div align="center">
 
-### Context Packets
-| Tool | What It Does |
-|------|-------------|
-| `session_context` | **One-call session init** — replaces 5 calls with token-budgeted context, automation triggers, expandable IDs |
+### If your agent should remember what you taught it yesterday, star it. ⭐
 
-### Core Memory
-| Tool | What It Does |
-|------|-------------|
-| `search` | Concrete literal search for exact identifiers, or 7-stage cognitive search — HyDE expansion + keyword + semantic + reranking + temporal + competition + spreading activation |
-| `smart_ingest` | Intelligent storage with CREATE/UPDATE/SUPERSEDE via Prediction Error Gating. Batch mode for session-end saves |
-| `memory` | Get, purge content/embeddings, check state, promote (thumbs up), demote (thumbs down), edit |
-| `codebase` | Remember code patterns and architectural decisions per-project |
-| `intention` | Prospective memory — "remind me to X when Y happens" |
+<sub><b>86,000+ lines of Rust · 13 tools · 30 cognitive modules · 130 years of memory research · one 23MB binary that never phones home.</b></sub>
 
-### Cognitive Engine
-| Tool | What It Does |
-|------|-------------|
-| `dream` | Memory consolidation — replays memories, discovers connections, synthesizes insights, persists graph |
-| `explore_connections` | Graph traversal — reasoning chains, associations, bridges between memories |
-| `predict` | Proactive retrieval — predicts what you'll need next based on context and activity |
+<sub>Built by <a href="https://github.com/samvallad33">@samvallad33</a> · AGPL-3.0 · 100% local, 100% yours</sub>
 
-### Autonomic
-| Tool | What It Does |
-|------|-------------|
-| `memory_health` | Retention dashboard — distribution, trends, recommendations |
-| `memory_graph` | Knowledge graph export — force-directed layout, up to 200 nodes |
-
-### Scoring & Dedup
-| Tool | What It Does |
-|------|-------------|
-| `importance_score` | 4-channel neuroscience scoring (novelty, arousal, reward, attention) |
-| `find_duplicates` | Detect and merge redundant memories via cosine similarity |
-
-### Maintenance
-| Tool | What It Does |
-|------|-------------|
-| `system_status` | Combined health + stats + cognitive state + recommendations |
-| `consolidate` | Run FSRS-6 decay cycle (also auto-runs every 6 hours) |
-| `memory_timeline` | Browse chronologically, grouped by day |
-| `memory_changelog` | Audit trail of state transitions |
-| `backup` / `export` / `gc` | Database backup, JSON/JSONL/portable export, garbage collection |
-| `restore` | Restore from JSON backup or portable archive |
-
-### Deep Reference (v2.0.4)
-| Tool | What It Does |
-|------|-------------|
-| `deep_reference` | **Cognitive reasoning across memories.** 8-stage pipeline: FSRS-6 trust scoring, intent classification, spreading activation, temporal supersession, contradiction analysis, relation assessment, dream insight integration, and algorithmic reasoning chain generation. Returns trust-scored evidence with a pre-built reasoning scaffold. |
-| `cross_reference` | Backward-compatible alias for `deep_reference`. |
-| `contradictions` | **Honest memory inspection.** Scans a topic or recent memories for trust-weighted disagreements using the same local contradiction logic as `deep_reference`. |
-
-### Active Forgetting (v2.0.5)
-| Tool | What It Does |
-|------|-------------|
-| `suppress` | **Top-down active forgetting** — neuroscience-grounded inhibitory control over retrieval. Distinct from `memory(action="purge")`, which permanently removes content/embeddings. Each suppression compounds a retrieval-score penalty (Anderson 2025 SIF), and a background Rac1 cascade worker fades co-activated neighbors over 72h (Davis 2020). Reversible within a 24-hour labile window via `reverse: true`. **The memory persists** — it is inhibited, not erased. |
-
----
-
-## Make Your AI Use Vestige Automatically
-
-Registering the MCP server exposes tools; the agent still needs an instruction
-that tells it when to call memory. Use the agent-neutral protocol, then adapt it
-to your client-specific instruction file.
-
-| You Say | AI Does |
-|---------|---------|
-| "Remember this" | Saves immediately |
-| "I prefer..." / "I always..." | Saves as preference |
-| "Remind me..." | Creates a future trigger |
-| "This is important" | Saves + promotes |
-
-[Agent memory protocol ->](docs/AGENT-MEMORY-PROTOCOL.md) · [Claude Code template ->](docs/CLAUDE-SETUP.md)
-
----
-
-## Technical Details
-
-| Metric | Value |
-|--------|-------|
-| **Language** | Rust 2024 edition (MSRV 1.91) |
-| **Codebase** | 80,000+ lines with Rust core/MCP/e2e, dashboard, and hook coverage |
-| **Binary size** | ~20MB |
-| **Embeddings** | Nomic Embed Text v1.5 by default (768d -> 256d Matryoshka, 8192 context); Qwen3 0.6B optional |
-| **Vector search** | USearch HNSW (20x faster than FAISS) |
-| **Reranker** | Jina Reranker v1 Turbo (38M params, +15-20% precision) |
-| **Storage** | SQLite + FTS5 (optional SQLCipher encryption) |
-| **Dashboard** | SvelteKit 2 + Svelte 5 + Three.js + Tailwind CSS 4 |
-| **Transport** | MCP stdio (JSON-RPC 2.0) + WebSocket |
-| **Cognitive modules** | 30 stateful (17 neuroscience, 11 advanced, 2 search) |
-| **First run** | Downloads embedding model (~130MB), then fully offline |
-| **Platforms** | macOS ARM + Intel + Linux x86_64 + Windows x86_64 (all prebuilt). Intel Mac needs `brew install onnxruntime` — see [install guide](docs/INSTALL-INTEL-MAC.md). |
-
-### Optional Features
-
-```bash
-# Qwen3 embeddings (Candle backend; add metal on Apple Silicon)
-cargo build --release -p vestige-mcp --features qwen3-embeddings,metal
-VESTIGE_EMBEDDING_MODEL=qwen3-0.6b vestige consolidate
-```
-
-### Building with CUDA support (NVIDIA hosts - Windows / Linux)
-
-The `cuda` feature routes Qwen3 embedding through NVIDIA GPUs via
-`candle-core/cuda`. On a host with the CUDA toolkit installed and a supported
-NVIDIA runtime, this drops Qwen3-Embedding inference from CPU-bound to GPU-bound
-for batched workloads.
-
-```bash
-# Linux / Windows + CUDA toolkit (12.x or 13.x)
-cargo build --release -p vestige-mcp --features qwen3-embeddings,cuda
-
-# Optional cuDNN acceleration on top of CUDA
-cargo build --release -p vestige-mcp --features qwen3-embeddings,cudnn
-
-VESTIGE_EMBEDDING_MODEL=qwen3-0.6b vestige consolidate
-```
-
-**Prerequisites:**
-
-- NVIDIA driver + CUDA toolkit (12.x or 13.x). Verify with `nvcc --version`.
-- A C++ host compiler that `nvcc` can drive (Linux: `gcc`; Windows: MSVC /
-  `cl.exe` from a recent Visual Studio Build Tools install).
-
-**Windows + MSVC + CUDA 13.x build note.** Recent CCCL headers shipped with
-CUDA 13.x require the modern preprocessor. Without it, the `candle-kernels`
-`.cu` compile pass can fail at `cuda/include/cuda/std/__cccl/compiler.h`. Set
-this env var before `cargo build` to pass `/Zc:preprocessor` through `nvcc`:
-
-```powershell
-# PowerShell
-$env:NVCC_PREPEND_FLAGS = '-Xcompiler="/Zc:preprocessor"'
-cargo build --release -p vestige-mcp --features qwen3-embeddings,cuda
-```
-
-```cmd
-:: cmd.exe
-set NVCC_PREPEND_FLAGS=-Xcompiler="/Zc:preprocessor"
-cargo build --release -p vestige-mcp --features qwen3-embeddings,cuda
-```
-
-Linux + CUDA 13.x builds with `gcc` do not need the equivalent flag.
-
-**Verifying GPU is actually used.** With CUDA-enabled builds, run
-`VESTIGE_EMBEDDING_MODEL=qwen3-0.6b vestige consolidate` on a corpus of 1000+
-memories and watch `nvidia-smi`; embedding passes should pin a single GPU while
-the run is active.
-
----
-
-## CLI
-
-```bash
-vestige stats                    # Memory statistics
-vestige stats --tagging          # Retention distribution
-vestige stats --states           # Cognitive state breakdown
-vestige health                   # System health check
-vestige consolidate              # Run memory maintenance
-vestige restore <file>           # Restore from backup
-vestige portable-export <file>         # Exact cross-device archive
-vestige portable-import <file>         # Import archive into an empty database
-vestige portable-import <file> --merge # Merge archive into this database
-vestige sync <file>                    # Pull/merge/push via file backend
-vestige dashboard                # Open 3D dashboard in browser
-```
-
----
-
-## Documentation
-
-| Document | Contents |
-|----------|----------|
-| [FAQ](docs/FAQ.md) | 30+ common questions answered |
-| [Science](docs/SCIENCE.md) | The neuroscience behind every feature |
-| [Storage Modes](docs/STORAGE.md) | Global, per-project, multi-instance |
-| [CLAUDE.md Setup](docs/CLAUDE-SETUP.md) | Templates for proactive memory |
-| [Configuration](docs/CONFIGURATION.md) | CLI commands, environment variables |
-| [Integrations](docs/integrations/) | Codex, Xcode, Cursor, VS Code, JetBrains, Windsurf |
-| [Changelog](CHANGELOG.md) | Version history |
-
----
-
-## Troubleshooting
-
-<details>
-<summary>"Command not found" after installation</summary>
-
-Ensure `vestige-mcp` is in your PATH:
-```bash
-which vestige-mcp
-# Or use the full path:
-claude mcp add vestige /usr/local/bin/vestige-mcp -s user
-```
-</details>
-
-<details>
-<summary>Embedding model download fails</summary>
-
-First run downloads ~130MB from Hugging Face. If behind a proxy:
-```bash
-export HTTPS_PROXY=your-proxy:port
-```
-
-Cache: platform user cache directory first, then `./.fastembed_cache` as a fallback. Override with `FASTEMBED_CACHE_PATH`.
-</details>
-
-<details>
-<summary>Dashboard not loading</summary>
-
-Run `vestige dashboard` or set `VESTIGE_DASHBOARD_ENABLED=true`, then check:
-```bash
-curl http://localhost:3927/api/health
-# Should return {"status":"healthy",...}
-```
-</details>
-
-[More troubleshooting ->](docs/FAQ.md#troubleshooting)
-
----
-
-## Contributing
-
-Issues and PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## License
-
-AGPL-3.0 — free to use, modify, and self-host. If you offer Vestige as a network service, you must open-source your modifications.
-
----
-
-<p align="center">
-  <i>Built by <a href="https://github.com/samvallad33">@samvallad33</a></i><br>
-  <sub>80,000+ lines of Rust · 30 cognitive modules · 130 years of memory research · one 22MB binary</sub>
-</p>
+</div>

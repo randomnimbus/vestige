@@ -20,9 +20,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::cognitive::CognitiveEngine;
-use vestige_core::Storage;
+use vestige_core::{CompositionEventRecord, CompositionMemberRecord, Storage};
 
 /// Input schema for deep_reference / cross_reference tool
 pub fn schema() -> Value {
@@ -509,6 +510,7 @@ pub async fn execute(
             "confidence": 0.0,
             "guidance": "No memories found. Use smart_ingest to add memories.",
             "memoriesAnalyzed": 0,
+            "compositionWriteStatus": "skipped_empty",
         }));
     }
 
@@ -652,6 +654,36 @@ pub async fn execute(
                     "preview": weaker.content.chars().take(150).collect::<String>(),
                     "trust": (weaker.trust * 100.0).round() / 100.0,
                     "date": weaker.updated_at.to_rfc3339(),
+                },
+                "topic_overlap": overlap,
+            }));
+        }
+    }
+
+    // ====================================================================
+    // STAGE 5b: CLAIM-vs-MEMORY contradiction (the structural fix).
+    // The original engine only compared stored memory PAIRS — it never tested
+    // the user's QUERY against memory, so "your claim X contradicts stored
+    // memory Y" was invisible (confident silence, the dangerous failure). Here
+    // we test args.query against each analyzed memory so a claim that conflicts
+    // with a high-trust memory surfaces and lowers confidence.
+    let mut claim_conflicts: Vec<Value> = Vec::new();
+    for m in scored.iter() {
+        if m.trust < 0.3 {
+            continue;
+        }
+        let overlap = topic_overlap(&args.query, &m.content);
+        if overlap < 0.4 {
+            continue;
+        }
+        if appears_contradictory(&args.query, &m.content) {
+            claim_conflicts.push(serde_json::json!({
+                "claim": args.query.chars().take(160).collect::<String>(),
+                "conflicting_memory": {
+                    "id": m.id,
+                    "preview": m.content.chars().take(150).collect::<String>(),
+                    "trust": (m.trust * 100.0).round() / 100.0,
+                    "date": m.updated_at.to_rfc3339(),
                 },
                 "topic_overlap": overlap,
             }));
@@ -820,6 +852,7 @@ pub async fn execute(
                 "id": s.id,
                 "preview": s.content.chars().take(200).collect::<String>(),
                 "trust": (s.trust * 100.0).round() / 100.0,
+                "relevanceScore": ((composite(s) * 100.0).round() / 100.0),
                 "date": s.updated_at.to_rfc3339(),
                 "role": if i == 0 { "primary" } else { "supporting" },
             })
@@ -845,10 +878,16 @@ pub async fn execute(
     // function of trust + corpus size alone.
     let base_confidence = recommended.map(composite).unwrap_or(0.0);
     let agreement_boost = (evidence.len() as f64 * 0.03).min(0.2);
-    let contradiction_penalty = contradictions.len() as f64 * 0.1;
+    // A claim that conflicts with a stored memory is the strongest possible signal
+    // to lower confidence (heavier penalty than an inter-memory disagreement).
+    let contradiction_penalty =
+        (contradictions.len() as f64 * 0.1) + (claim_conflicts.len() as f64 * 0.2);
     let confidence = (base_confidence + agreement_boost - contradiction_penalty).clamp(0.0, 1.0);
 
-    let status = if contradictions.is_empty() && confidence > 0.7 {
+    let status = if !claim_conflicts.is_empty() {
+        // The claim itself conflicts with stored memory — never report "resolved".
+        "claim_contradicts_memory"
+    } else if contradictions.is_empty() && confidence > 0.7 {
         "resolved"
     } else if !contradictions.is_empty() {
         "contradictions_found"
@@ -858,7 +897,13 @@ pub async fn execute(
         "partial_evidence"
     };
 
-    let guidance = if let Some(rec) = recommended {
+    let guidance = if !claim_conflicts.is_empty() {
+        format!(
+            "CAUTION: your claim conflicts with {} stored memor{}. Do NOT treat this as resolved — review the conflicting memory(ies) below before acting.",
+            claim_conflicts.len(),
+            if claim_conflicts.len() == 1 { "y" } else { "ies" }
+        )
+    } else if let Some(rec) = recommended {
         if contradictions.is_empty() {
             format!(
                 "High confidence ({:.0}%). Recommended memory (trust {:.0}%, {}) is the most reliable source.",
@@ -900,6 +945,10 @@ pub async fn execute(
         "activationExpanded": activation_expanded,
     });
 
+    if !claim_conflicts.is_empty() {
+        response["claim_conflicts"] = serde_json::json!(claim_conflicts);
+    }
+
     if let Some(rec) = recommended {
         response["recommended"] = serde_json::json!({
             "answer_preview": rec.content.chars().take(300).collect::<String>(),
@@ -925,7 +974,161 @@ pub async fn execute(
         response["related_insights"] = serde_json::json!(related_insights);
     }
 
+    match persist_deep_reference_composition(storage, &args.query, &intent, &response) {
+        Ok(Some(event_id)) => {
+            response["composition_event_id"] = serde_json::json!(event_id);
+            response["compositionWriteStatus"] = serde_json::json!("persisted");
+        }
+        Ok(None) => {
+            response["compositionWriteStatus"] = serde_json::json!("skipped_empty");
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Failed to persist deep_reference composition event: {}",
+                err
+            );
+            response["compositionWriteStatus"] = serde_json::json!("failed");
+        }
+    }
+
     Ok(response)
+}
+
+fn persist_deep_reference_composition(
+    storage: &Arc<Storage>,
+    query: &str,
+    intent: &QueryIntent,
+    response: &Value,
+) -> Result<Option<String>, String> {
+    let event_id = Uuid::new_v4().to_string();
+    let event = CompositionEventRecord {
+        id: event_id.clone(),
+        created_at: Utc::now(),
+        tool: "deep_reference".to_string(),
+        mode: "deep_reference".to_string(),
+        query: Some(query.to_string()),
+        query_hash: Some(query_hash(query)),
+        confidence: response.get("confidence").and_then(|v| v.as_f64()),
+        status: response
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
+        output_preview: response
+            .get("guidance")
+            .and_then(|v| v.as_str())
+            .map(|value| preview_text(value, 280)),
+        metadata: serde_json::json!({
+            "intent": format!("{:?}", intent),
+            "memoriesAnalyzed": response.get("memoriesAnalyzed").and_then(|v| v.as_u64()).unwrap_or(0),
+            "activationExpanded": response.get("activationExpanded").and_then(|v| v.as_u64()).unwrap_or(0),
+            "reasoningPreview": response.get("reasoning").and_then(|v| v.as_str()).map(|value| preview_text(value, 600)),
+        }),
+    };
+
+    let mut members = Vec::new();
+    if let Some(evidence) = response.get("evidence").and_then(|v| v.as_array()) {
+        for (idx, item) in evidence.iter().enumerate() {
+            let Some(memory_id) = item.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let role = item
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or(if idx == 0 { "primary" } else { "supporting" });
+            members.push(CompositionMemberRecord {
+                event_id: event_id.clone(),
+                memory_id: memory_id.to_string(),
+                role: role.to_string(),
+                rank: idx as i32,
+                trust: item.get("trust").and_then(|v| v.as_f64()),
+                score: item
+                    .get("relevanceScore")
+                    .or_else(|| item.get("relevance_score"))
+                    .and_then(|v| v.as_f64()),
+                preview: None,
+                metadata: serde_json::json!({
+                    "roleSource": "deep_reference_evidence",
+                    "evidenceRank": idx,
+                    "date": item.get("date").and_then(|v| v.as_str()),
+                }),
+            });
+        }
+    }
+
+    if let Some(contradictions) = response.get("contradictions").and_then(|v| v.as_array()) {
+        for (idx, contradiction) in contradictions.iter().enumerate() {
+            for side in ["stronger", "weaker"] {
+                let Some(item) = contradiction.get(side) else {
+                    continue;
+                };
+                let Some(memory_id) = item.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                members.push(CompositionMemberRecord {
+                    event_id: event_id.clone(),
+                    memory_id: memory_id.to_string(),
+                    role: "contradicting".to_string(),
+                    rank: idx as i32,
+                    trust: item.get("trust").and_then(|v| v.as_f64()),
+                    score: contradiction.get("topic_overlap").and_then(|v| v.as_f64()),
+                    preview: None,
+                    metadata: serde_json::json!({
+                        "roleSource": "deep_reference_contradiction",
+                        "side": side,
+                        "date": item.get("date").and_then(|v| v.as_str()),
+                    }),
+                });
+            }
+        }
+    }
+
+    if let Some(superseded) = response.get("superseded").and_then(|v| v.as_array()) {
+        for (idx, item) in superseded.iter().enumerate() {
+            let Some(memory_id) = item.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            members.push(CompositionMemberRecord {
+                event_id: event_id.clone(),
+                memory_id: memory_id.to_string(),
+                role: "superseded".to_string(),
+                rank: idx as i32,
+                trust: item.get("trust").and_then(|v| v.as_f64()),
+                score: None,
+                preview: None,
+                metadata: serde_json::json!({
+                    "roleSource": "deep_reference_superseded",
+                    "superseded_by": item.get("superseded_by").and_then(|v| v.as_str()),
+                    "date": item.get("date").and_then(|v| v.as_str()),
+                }),
+            });
+        }
+    }
+
+    if members.is_empty() {
+        return Ok(None);
+    }
+
+    storage
+        .save_composition(&event, &members, &[])
+        .map_err(|e| e.to_string())?;
+    Ok(Some(event_id))
+}
+
+fn query_hash(query: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in query.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn preview_text(value: &str, max: usize) -> String {
+    let collapsed = value.replace('\n', " ");
+    if collapsed.len() <= max {
+        return collapsed;
+    }
+    format!("{}...", &collapsed[..collapsed.floor_char_boundary(max)])
 }
 
 // ============================================================================
@@ -962,6 +1165,7 @@ mod tests {
                 tags: tags.iter().map(|s| s.to_string()).collect(),
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap()
             .id
@@ -1007,6 +1211,99 @@ mod tests {
              discarding the combined_score signal from hybrid_search + reranker.",
             id_a,
             result["recommended"]["memory_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deep_reference_persists_composition_event() {
+        let (storage, _dir) = test_storage().await;
+
+        let primary_id = ingest_one(
+            &storage,
+            "ProtocolGate control-plane composition tracks global invariant local gate bypasses.",
+            &["protocolgate", "boundary-scope"],
+        )
+        .await;
+        let supporting_id = ingest_one(
+            &storage,
+            "ProtocolGate global invariant local gate research used Aave account-global health factor and route-local validation.",
+            &["protocolgate", "boundary-scope"],
+        )
+        .await;
+
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({
+                "query": "ProtocolGate global invariant local gate",
+                "depth": 10
+            })),
+        )
+        .await
+        .expect("execute should succeed");
+
+        let event_id = result["composition_event_id"]
+            .as_str()
+            .expect("deep_reference should return persisted event id");
+        assert_eq!(result["compositionWriteStatus"].as_str(), Some("persisted"));
+
+        let event = storage
+            .get_composition_event(event_id)
+            .unwrap()
+            .expect("composition event should be stored");
+        assert_eq!(event.tool, "deep_reference");
+        assert_eq!(
+            event.query.as_deref(),
+            Some("ProtocolGate global invariant local gate")
+        );
+
+        let members = storage.get_composition_members(event_id).unwrap();
+        assert!(members.iter().any(|member| member.memory_id == primary_id));
+        assert!(
+            members
+                .iter()
+                .any(|member| member.memory_id == supporting_id)
+        );
+        assert!(members.iter().any(|member| member.role == "primary"));
+        assert!(
+            members.iter().any(|member| {
+                member.memory_id == primary_id
+                    && member.score.is_some()
+                    && member.metadata["roleSource"] == "deep_reference_evidence"
+            }),
+            "persisted members should retain relevance score and role source"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deep_reference_skips_empty_composition_event() {
+        let (storage, _dir) = test_storage().await;
+
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({
+                "query": "no memories exist for this query",
+                "depth": 10
+            })),
+        )
+        .await
+        .expect("execute should succeed");
+
+        assert_eq!(
+            result["compositionWriteStatus"].as_str(),
+            Some("skipped_empty")
+        );
+        assert!(
+            result.get("composition_event_id").is_none(),
+            "empty evidence should not create a composition event"
+        );
+        assert!(
+            storage
+                .get_recent_composition_events(10)
+                .unwrap()
+                .is_empty(),
+            "ledger should stay empty when no memories participated"
         );
     }
 
@@ -1113,6 +1410,90 @@ mod tests {
             "Don't use FAISS for vector search in production",
             "Use FAISS for vector search in production always"
         ));
+    }
+
+    // ========================================================================
+    // STAGE 5b AUDIT: a NON-contradicting claim must NOT set
+    // status=claim_contradicts_memory; a contradicting claim MUST.
+    // ========================================================================
+    #[tokio::test]
+    async fn audit_stage5b_noncontradicting_claim_is_not_flagged() {
+        let (storage, _dir) = test_storage().await;
+
+        // High-overlap, AGREEING memory: same subject, same stance.
+        ingest_one(
+            &storage,
+            "Vestige uses USearch HNSW for vector search with cosine similarity \
+             and Matryoshka truncation to 256 dimensions for storage savings.",
+            &["vestige", "vector-search"],
+        )
+        .await;
+
+        // Claim that AGREES (no negation, no correction marker, same subject).
+        let args = serde_json::json!({
+            "query": "Vestige uses USearch HNSW for vector search with cosine \
+                      similarity and Matryoshka truncation to 256 dimensions"
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .expect("execute should succeed");
+
+        // Non-vacuous: the memory MUST have been retrieved (else the assertion
+        // below would pass trivially via the no_memories early-return).
+        assert!(
+            result["memoriesAnalyzed"].as_i64().unwrap_or(0) >= 1,
+            "Expected the agreeing memory to be retrieved (memoriesAnalyzed>=1). Got {:?}",
+            result["memoriesAnalyzed"]
+        );
+        assert_ne!(
+            result["status"].as_str(),
+            Some("claim_contradicts_memory"),
+            "A NON-contradicting (agreeing) claim must not be flagged. Got status={:?}, claim_conflicts={:?}",
+            result["status"],
+            result.get("claim_conflicts")
+        );
+        assert!(
+            result.get("claim_conflicts").is_none(),
+            "No claim_conflicts array should be present for an agreeing claim. Got {:?}",
+            result.get("claim_conflicts")
+        );
+    }
+
+    // STAGE 5b decision predicate, tested directly. The end-to-end `execute`
+    // path cannot surface a genuinely-contradicting claim in a test env with no
+    // embeddings model loaded, because keyword retrieval is implicit-AND and a
+    // contradicting claim by construction carries a stance word the memory
+    // lacks. This asserts the exact gate STAGE 5b applies once a memory is
+    // retrieved: topic_overlap >= 0.4 AND appears_contradictory(query, memory).
+    #[test]
+    fn audit_stage5b_gate_predicate_distinguishes_agree_vs_contradict() {
+        let memory = "USearch HNSW vector search Vestige production cosine similarity \
+                      recall correct should always be enabled because it is fast";
+
+        // Agreeing claim: high overlap, NO stance flip → must NOT trip the gate.
+        let agree = "USearch HNSW vector search Vestige production cosine similarity \
+                     recall correct should always be enabled because it is fast";
+        assert!(
+            topic_overlap(agree, memory) >= 0.4,
+            "agree/memory should share topic"
+        );
+        assert!(
+            !appears_contradictory(agree, memory),
+            "An agreeing claim must NOT be flagged as contradictory (false-positive guard)"
+        );
+
+        // Contradicting claim: same subject + a negation marker ("never"/"avoid")
+        // present in exactly one side → must trip the gate.
+        let contradict = "USearch HNSW vector search Vestige production cosine similarity \
+                          recall avoid never enabled";
+        assert!(
+            topic_overlap(contradict, memory) >= 0.4,
+            "contradict/memory should share topic"
+        );
+        assert!(
+            appears_contradictory(contradict, memory),
+            "A same-subject negated claim MUST be flagged as contradictory"
+        );
     }
 
     #[test]

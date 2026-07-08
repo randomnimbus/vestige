@@ -17,6 +17,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Pin macOS to macos-14 (Sonoma): the rolling `macos-latest` image
+        # The "ld: library 'clang_rt.osx' not found" failure is NOT a flaky
+        # image. It is the linker resolving a clang compiler-rt search path
+        # (Xcode .../clang/<N>/lib/darwin) that no longer exists on the runner,
+        # because a STALE `target/` was restored from the cache after the
+        # runner image's default Xcode moved. The real fix is the cache change
+        # below (we no longer cache `target/`, and the key is bumped to v2 to
+        # discard the poisoned caches), so the runner choice is no longer
+        # load-bearing. macos-latest is fine again with a clean target dir.
         os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
@@ -26,17 +35,20 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo
+      - name: Cache cargo (registry only)
         uses: actions/cache@v4
         with:
+          # Deliberately NOT caching `target/`: a `target/` built against a
+          # different Xcode carries a stale clang compiler-rt search path that
+          # breaks the linker ("clang_rt.osx not found"). Cache only the
+          # download-heavy registry/git dirs; recompiling is cheap and correct.
           path: |
             ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-v2-
 
       - name: Check
         run: cargo check --workspace
@@ -61,13 +73,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
             cargo_flags: ""
           # Intel Mac builds against a system ONNX Runtime via ort-dynamic
           # (ort-sys has no x86_64-apple-darwin prebuilts). Compile-only here;
           # runtime linking is a user concern documented in INSTALL-INTEL-MAC.md.
-          - os: macos-latest
+          - os: macos-14
             target: x86_64-apple-darwin
             cargo_flags: "--no-default-features --features ort-dynamic,vector-search"
           - os: ubuntu-latest
